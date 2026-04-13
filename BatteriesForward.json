@@ -1,0 +1,463 @@
+[
+  {
+    "id": "bat_tab",
+    "type": "tab",
+    "label": "Batteries Forward",
+    "disabled": false,
+    "info": "Forward NMEA 2000 battery data from Signal-K to Venus OS virtual batteries.\nBattery 1 = House, Battery 2 = Bow, Battery 3 = Stern.\nSource: PGN 127506 (SOC/SOH/timeRemaining) + PGN 127508 (voltage/current).",
+    "env": []
+  },
+  {
+    "id": "bat_comment_1",
+    "type": "comment",
+    "z": "bat_tab",
+    "name": "═══ BATTERY 1 — HOUSE ═══",
+    "info": "",
+    "x": 180,
+    "y": 30,
+    "wires": []
+  },
+  {
+    "id": "bat1_sk_voltage",
+    "type": "signalk-subscribe",
+    "z": "bat_tab",
+    "name": "House Voltage",
+    "mode": "sendAll",
+    "flatten": true,
+    "context": "vessels.self",
+    "path": "electrical.batteries.1.voltage",
+    "source": "",
+    "period": 1000,
+    "x": 150,
+    "y": 80,
+    "wires": [
+      [
+        "bat1_assembler"
+      ]
+    ]
+  },
+  {
+    "id": "bat1_sk_current",
+    "type": "signalk-subscribe",
+    "z": "bat_tab",
+    "name": "House Current",
+    "mode": "sendAll",
+    "flatten": true,
+    "context": "vessels.self",
+    "path": "electrical.batteries.1.current",
+    "source": "",
+    "period": 1000,
+    "x": 150,
+    "y": 120,
+    "wires": [
+      [
+        "bat1_assembler"
+      ]
+    ]
+  },
+  {
+    "id": "bat1_sk_soc",
+    "type": "signalk-subscribe",
+    "z": "bat_tab",
+    "name": "House SOC",
+    "mode": "sendAll",
+    "flatten": true,
+    "context": "vessels.self",
+    "path": "electrical.batteries.1.capacity.stateOfCharge",
+    "source": "",
+    "period": 1000,
+    "x": 150,
+    "y": 160,
+    "wires": [
+      [
+        "bat1_assembler"
+      ]
+    ]
+  },
+  {
+    "id": "bat1_assembler",
+    "type": "function",
+    "z": "bat_tab",
+    "name": "House Assembler",
+    "func": "var bat = flow.get('bat1') || {};\nvar path = msg.topic || '';\nvar val = msg.payload;\n\nif (path.indexOf('voltage') >= 0) bat.voltage = val;\nelse if (path.indexOf('current') >= 0) bat.current = val;\nelse if (path.indexOf('stateOfCharge') >= 0) bat.soc = val * 100;\n\nbat._lastUpdate = Date.now();\nflow.set('bat1', bat);\nreturn null;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "flow.set('bat1', {});",
+    "finalize": "",
+    "libs": [],
+    "x": 380,
+    "y": 120,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "bat_comment_2",
+    "type": "comment",
+    "z": "bat_tab",
+    "name": "═══ BATTERY 2 — BOW ═══",
+    "info": "",
+    "x": 170,
+    "y": 230,
+    "wires": []
+  },
+  {
+    "id": "bat2_sk_voltage",
+    "type": "signalk-subscribe",
+    "z": "bat_tab",
+    "name": "Bow Voltage",
+    "mode": "sendAll",
+    "flatten": true,
+    "context": "vessels.self",
+    "path": "electrical.batteries.2.voltage",
+    "source": "",
+    "period": 1000,
+    "x": 150,
+    "y": 280,
+    "wires": [
+      [
+        "bat2_assembler"
+      ]
+    ]
+  },
+  {
+    "id": "bat2_sk_soc",
+    "type": "signalk-subscribe",
+    "z": "bat_tab",
+    "name": "Bow SOC",
+    "mode": "sendAll",
+    "flatten": true,
+    "context": "vessels.self",
+    "path": "electrical.batteries.2.capacity.stateOfCharge",
+    "source": "",
+    "period": 1000,
+    "x": 150,
+    "y": 320,
+    "wires": [
+      [
+        "bat2_assembler"
+      ]
+    ]
+  },
+  {
+    "id": "bat2_assembler",
+    "type": "function",
+    "z": "bat_tab",
+    "name": "Bow Assembler",
+    "func": "var bat = flow.get('bat2') || {};\nvar path = msg.topic || '';\nvar val = msg.payload;\n\nif (path.indexOf('voltage') >= 0) bat.voltage = val;\nelse if (path.indexOf('stateOfCharge') >= 0) bat.soc = val * 100;\n\nbat._lastUpdate = Date.now();\nflow.set('bat2', bat);\nreturn null;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "flow.set('bat2', {});",
+    "finalize": "",
+    "libs": [],
+    "x": 370,
+    "y": 300,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "bat_comment_3",
+    "type": "comment",
+    "z": "bat_tab",
+    "name": "═══ BATTERY 3 — STERN ═══",
+    "info": "",
+    "x": 180,
+    "y": 390,
+    "wires": []
+  },
+  {
+    "id": "bat3_sk_voltage",
+    "type": "signalk-subscribe",
+    "z": "bat_tab",
+    "name": "Stern Voltage",
+    "mode": "sendAll",
+    "flatten": true,
+    "context": "vessels.self",
+    "path": "electrical.batteries.3.voltage",
+    "source": "",
+    "period": 1000,
+    "x": 150,
+    "y": 440,
+    "wires": [
+      [
+        "bat3_assembler"
+      ]
+    ]
+  },
+  {
+    "id": "bat3_sk_soc",
+    "type": "signalk-subscribe",
+    "z": "bat_tab",
+    "name": "Stern SOC",
+    "mode": "sendAll",
+    "flatten": true,
+    "context": "vessels.self",
+    "path": "electrical.batteries.3.capacity.stateOfCharge",
+    "source": "",
+    "period": 1000,
+    "x": 150,
+    "y": 480,
+    "wires": [
+      [
+        "bat3_assembler"
+      ]
+    ]
+  },
+  {
+    "id": "bat3_assembler",
+    "type": "function",
+    "z": "bat_tab",
+    "name": "Stern Assembler",
+    "func": "var bat = flow.get('bat3') || {};\nvar path = msg.topic || '';\nvar val = msg.payload;\n\nif (path.indexOf('voltage') >= 0) bat.voltage = val;\nelse if (path.indexOf('stateOfCharge') >= 0) bat.soc = val * 100;\n\nbat._lastUpdate = Date.now();\nflow.set('bat3', bat);\nreturn null;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "flow.set('bat3', {});",
+    "finalize": "",
+    "libs": [],
+    "x": 380,
+    "y": 460,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "bat_publish_tick",
+    "type": "inject",
+    "z": "bat_tab",
+    "name": "1s Publish Tick",
+    "props": [
+      {
+        "p": "payload",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "1",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "5",
+    "topic": "",
+    "x": 150,
+    "y": 580,
+    "wires": [
+      [
+        "bat_publisher"
+      ]
+    ]
+  },
+  {
+    "id": "bat_publisher",
+    "type": "function",
+    "z": "bat_tab",
+    "name": "Publish All Batteries",
+    "func": "var bat1 = flow.get('bat1') || {};\nvar bat2 = flow.get('bat2') || {};\nvar bat3 = flow.get('bat3') || {};\nvar now = Date.now();\n\nfunction isLive(bat) {\n    return bat._lastUpdate && (now - bat._lastUpdate) <= 10000;\n}\n\nvar msgs = [null, null, null];\n\nif (isLive(bat1)) {\n    msgs[0] = { payload: {\n        \"/Dc/0/Voltage\": bat1.voltage || 0,\n        \"/Dc/0/Current\": bat1.current || 0,\n        \"/Dc/0/Power\": Math.round((bat1.voltage || 0) * (bat1.current || 0) * 10) / 10,\n        \"/Soc\": bat1.soc || 0\n    }};\n}\n\nif (isLive(bat2)) {\n    msgs[1] = { payload: {\n        \"/Dc/0/Voltage\": bat2.voltage || 0,\n        \"/Soc\": bat2.soc || 0\n    }};\n}\n\nif (isLive(bat3)) {\n    msgs[2] = { payload: {\n        \"/Dc/0/Voltage\": bat3.voltage || 0,\n        \"/Soc\": bat3.soc || 0\n    }};\n}\n\nvar labels = ['House', 'Bow', 'Stern'];\nvar parts = [];\nfor (var i = 0; i < 3; i++) {\n    var bat = [bat1, bat2, bat3][i];\n    var live = isLive(bat);\n    parts.push(labels[i] + ': ' + (live ? (bat.voltage || 0).toFixed(1) + 'V' : 'STALE'));\n}\nnode.status({ fill: 'green', shape: 'dot', text: parts.join(' | ') });\n\nreturn msgs;",
+    "outputs": 3,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 400,
+    "y": 580,
+    "wires": [
+      [
+        "bat1_virtual"
+      ],
+      [
+        "bat2_virtual"
+      ],
+      [
+        "bat3_virtual"
+      ]
+    ]
+  },
+  {
+    "id": "bat1_virtual",
+    "type": "victron-virtual",
+    "z": "bat_tab",
+    "name": "House → Venus OS",
+    "outputs": 1,
+    "device": "battery",
+    "default_values": true,
+    "acload_nrofphases": 1,
+    "enable_s2support": false,
+    "battery_capacity": "0",
+    "include_battery_temperature": false,
+    "battery_voltage_preset": "12",
+    "battery_voltage_custom": 12,
+    "generator_type": "ac",
+    "generator_nrofphases": 1,
+    "include_engine_hours": false,
+    "include_starter_voltage": false,
+    "include_history_energy": false,
+    "grid_nrofphases": 1,
+    "include_motor_temp": false,
+    "include_controller_temp": false,
+    "include_coolant_temp": false,
+    "include_motor_rpm": false,
+    "include_motor_direction": false,
+    "position": 0,
+    "pvinverter_nrofphases": 1,
+    "switch_1_type": 1,
+    "switch_1_min": 0,
+    "switch_1_max": "",
+    "switch_1_initial": 0,
+    "switch_1_label": "",
+    "switch_1_unit": "",
+    "switch_1_step": 1,
+    "switch_1_customname": "",
+    "switch_1_group": "",
+    "switch_1_include_measurement": false,
+    "switch_1_rgb_color_wheel": false,
+    "switch_1_cct_wheel": false,
+    "switch_1_rgb_white_dimmer": false,
+    "fluid_type": 0,
+    "include_tank_battery": false,
+    "include_tank_temperature": false,
+    "tank_battery_voltage": 3.3,
+    "tank_capacity": 0.2,
+    "temperature_type": 2,
+    "include_humidity": false,
+    "include_pressure": false,
+    "include_temp_battery": false,
+    "temp_battery_voltage": 3.3,
+    "x": 670,
+    "y": 540,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "bat2_virtual",
+    "type": "victron-virtual",
+    "z": "bat_tab",
+    "name": "Bow → Venus OS",
+    "outputs": 1,
+    "device": "battery",
+    "default_values": true,
+    "acload_nrofphases": 1,
+    "enable_s2support": false,
+    "battery_capacity": "0",
+    "include_battery_temperature": false,
+    "battery_voltage_preset": "12",
+    "battery_voltage_custom": 12,
+    "generator_type": "ac",
+    "generator_nrofphases": 1,
+    "include_engine_hours": false,
+    "include_starter_voltage": false,
+    "include_history_energy": false,
+    "grid_nrofphases": 1,
+    "include_motor_temp": false,
+    "include_controller_temp": false,
+    "include_coolant_temp": false,
+    "include_motor_rpm": false,
+    "include_motor_direction": false,
+    "position": 0,
+    "pvinverter_nrofphases": 1,
+    "switch_1_type": 1,
+    "switch_1_min": 0,
+    "switch_1_max": "",
+    "switch_1_initial": 0,
+    "switch_1_label": "",
+    "switch_1_unit": "",
+    "switch_1_step": 1,
+    "switch_1_customname": "",
+    "switch_1_group": "",
+    "switch_1_include_measurement": false,
+    "switch_1_rgb_color_wheel": false,
+    "switch_1_cct_wheel": false,
+    "switch_1_rgb_white_dimmer": false,
+    "fluid_type": 0,
+    "include_tank_battery": false,
+    "include_tank_temperature": false,
+    "tank_battery_voltage": 3.3,
+    "tank_capacity": 0.2,
+    "temperature_type": 2,
+    "include_humidity": false,
+    "include_pressure": false,
+    "include_temp_battery": false,
+    "temp_battery_voltage": 3.3,
+    "x": 660,
+    "y": 580,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "bat3_virtual",
+    "type": "victron-virtual",
+    "z": "bat_tab",
+    "name": "Stern → Venus OS",
+    "outputs": 1,
+    "device": "battery",
+    "default_values": true,
+    "acload_nrofphases": 1,
+    "enable_s2support": false,
+    "battery_capacity": "0",
+    "include_battery_temperature": false,
+    "battery_voltage_preset": "12",
+    "battery_voltage_custom": 12,
+    "generator_type": "ac",
+    "generator_nrofphases": 1,
+    "include_engine_hours": false,
+    "include_starter_voltage": false,
+    "include_history_energy": false,
+    "grid_nrofphases": 1,
+    "include_motor_temp": false,
+    "include_controller_temp": false,
+    "include_coolant_temp": false,
+    "include_motor_rpm": false,
+    "include_motor_direction": false,
+    "position": 0,
+    "pvinverter_nrofphases": 1,
+    "switch_1_type": 1,
+    "switch_1_min": 0,
+    "switch_1_max": "",
+    "switch_1_initial": 0,
+    "switch_1_label": "",
+    "switch_1_unit": "",
+    "switch_1_step": 1,
+    "switch_1_customname": "",
+    "switch_1_group": "",
+    "switch_1_include_measurement": false,
+    "switch_1_rgb_color_wheel": false,
+    "switch_1_cct_wheel": false,
+    "switch_1_rgb_white_dimmer": false,
+    "fluid_type": 0,
+    "include_tank_battery": false,
+    "include_tank_temperature": false,
+    "tank_battery_voltage": 3.3,
+    "tank_capacity": 0.2,
+    "temperature_type": 2,
+    "include_humidity": false,
+    "include_pressure": false,
+    "include_temp_battery": false,
+    "temp_battery_voltage": 3.3,
+    "x": 660,
+    "y": 620,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "bat_debug",
+    "type": "debug",
+    "z": "bat_tab",
+    "name": "Battery Publish Debug",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "true",
+    "targetType": "full",
+    "statusVal": "payload",
+    "statusType": "auto",
+    "x": 690,
+    "y": 660,
+    "wires": []
+  }
+]

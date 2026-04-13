@@ -1,0 +1,448 @@
+[
+  {
+    "id": "feb92f911e56ae11",
+    "type": "tab",
+    "label": "Flow 2",
+    "disabled": false,
+    "info": "",
+    "env": []
+  },
+  {
+    "id": "bms03a00000000011",
+    "type": "inject",
+    "z": "feb92f911e56ae11",
+    "name": "Start candump",
+    "props": [
+      {
+        "p": "payload",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "3",
+    "topic": "",
+    "x": 260,
+    "y": 260,
+    "wires": [
+      [
+        "bms03a00000000010"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000010",
+    "type": "exec",
+    "z": "feb92f911e56ae11",
+    "command": "candump can0,18FF0000:1FFFF800",
+    "addpay": "",
+    "append": "",
+    "useSpawn": "true",
+    "timer": "",
+    "winHide": false,
+    "oldrc": false,
+    "name": "candump can0",
+    "x": 260,
+    "y": 320,
+    "wires": [
+      [
+        "bms03a00000000015"
+      ],
+      [
+        "bms03d00000000001"
+      ],
+      [
+        "bms03d00000000002"
+      ]
+    ]
+  },
+  {
+    "id": "bms03d00000000001",
+    "type": "debug",
+    "z": "feb92f911e56ae11",
+    "name": "candump stderr",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "payload",
+    "statusType": "auto",
+    "x": 510,
+    "y": 360,
+    "wires": []
+  },
+  {
+    "id": "bms03d00000000002",
+    "type": "debug",
+    "z": "feb92f911e56ae11",
+    "name": "candump exit code",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "payload",
+    "statusType": "auto",
+    "x": 520,
+    "y": 400,
+    "wires": []
+  },
+  {
+    "id": "bms03a00000000015",
+    "type": "function",
+    "z": "feb92f911e56ae11",
+    "name": "candump Line Parser",
+    "func": "var line = msg.payload;\nif (typeof line !== 'string') return null;\n\nvar match = line.match(/\\s+can\\d+\\s+([0-9A-Fa-f]+)\\s+\\[(\\d)\\]\\s+(.+)/);\nif (!match) return null;\n\nvar rawid = parseInt(match[1], 16);\nvar canid = rawid & 0x7FF;\nvar dlc = parseInt(match[2]);\nvar hexBytes = match[3].trim().split(/\\s+/);\nvar data = Buffer.from(hexBytes.map(function(h) { return parseInt(h, 16); }));\n\nmsg.payload = { canid: canid, dlc: dlc, data: data };\nmsg.topic = \"0x\" + canid.toString(16).toUpperCase();\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 500,
+    "y": 320,
+    "wires": [
+      [
+        "bms03a00000000020",
+        "bms03d00000000010"
+      ]
+    ]
+  },
+  {
+    "id": "bms03d00000000010",
+    "type": "debug",
+    "z": "feb92f911e56ae11",
+    "name": "Raw CAN Frames",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "true",
+    "targetType": "full",
+    "statusVal": "topic",
+    "statusType": "auto",
+    "x": 750,
+    "y": 320,
+    "wires": []
+  },
+  {
+    "id": "bms03a00000000020",
+    "type": "function",
+    "z": "feb92f911e56ae11",
+    "name": "CAN Frame Decoder",
+    "func": "var id = msg.payload.canid;\nvar d = msg.payload.data;\n\nif (id < 0x351 || id > 0x404) return null;\n\nvar bms = flow.get(\"bms_live\") || {};\nbms._lastUpdate = Date.now();\nvar decoded = { canId: \"0x\" + id.toString(16).toUpperCase() };\n\nswitch (id) {\n    case 0x351:\n        bms.cvl = d.readUInt16LE(0) / 10;\n        bms.ccl = d.readUInt16LE(2) / 10;\n        bms.dcl = d.readUInt16LE(4) / 10;\n        bms.dvl = d.readUInt16LE(6) / 10;\n        decoded.name = \"Limits\";\n        decoded.cvl = bms.cvl;\n        decoded.ccl = bms.ccl;\n        decoded.dcl = bms.dcl;\n        decoded.dvl = bms.dvl;\n        break;\n\n    case 0x355:\n        bms.soc = d.readUInt16LE(0);\n        bms.soh = d.readUInt16LE(2);\n        if (d.length >= 6) {\n            bms.socHiRes = d.readUInt16LE(4) / 100;\n        }\n        decoded.name = \"SOC/SOH\";\n        decoded.soc = bms.soc;\n        decoded.soh = bms.soh;\n        decoded.socHiRes = bms.socHiRes;\n        break;\n\n    case 0x356:\n        bms.voltage = d.readInt16LE(0) / 100;\n        bms.current = d.readInt16LE(2) / 10;\n        bms.temperature = d.readInt16LE(4) / 10;\n        bms.chargeCycles = d.readUInt16LE(6);\n        decoded.name = \"DC Bus\";\n        decoded.voltage = bms.voltage;\n        decoded.current = bms.current;\n        decoded.temperature = bms.temperature;\n        decoded.power = Math.round(bms.voltage * bms.current * 10) / 10;\n        decoded.chargeCycles = bms.chargeCycles;\n        break;\n\n    case 0x35E:\n        bms.manufacturer = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Manufacturer\";\n        decoded.manufacturer = bms.manufacturer;\n        break;\n\n    case 0x35F:\n        bms.chemistry = d.readUInt8(0);\n        bms.hwVersion = d.readUInt8(2) + '.' + d.readUInt8(3);\n        bms.fwVersion = d.readUInt16LE(4);\n        decoded.name = \"Version Info\";\n        decoded.chemistry = bms.chemistry;\n        decoded.hwVersion = bms.hwVersion;\n        decoded.fwVersion = bms.fwVersion;\n        break;\n\n    case 0x360:\n        bms.forceCharge = d.readUInt8(0) === 0xFF;\n        decoded.name = \"Force Charge\";\n        decoded.forceCharge = bms.forceCharge;\n        break;\n\n    case 0x370:\n        bms.productName = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Product Name\";\n        decoded.productName = bms.productName;\n        break;\n\n    case 0x371:\n        bms.batteryName = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Battery Name\";\n        decoded.batteryName = bms.batteryName;\n        break;\n\n    case 0x372:\n        bms.modulesOnline = d.readUInt16LE(0);\n        bms.modulesBlockingCharge = d.readUInt16LE(2);\n        bms.modulesBlockingDischarge = d.readUInt16LE(4);\n        bms.modulesOffline = d.readUInt16LE(6);\n        bms.nrModules = bms.modulesOnline;\n        decoded.name = \"Module Status\";\n        decoded.modulesOnline = bms.modulesOnline;\n        decoded.modulesBlockingCharge = bms.modulesBlockingCharge;\n        decoded.modulesBlockingDischarge = bms.modulesBlockingDischarge;\n        decoded.modulesOffline = bms.modulesOffline;\n        break;\n\n    case 0x373:\n        bms.minCellV = d.readUInt16LE(0) / 1000;\n        bms.maxCellV = d.readUInt16LE(2) / 1000;\n        bms.minCellT = d.readInt16LE(4) - 273;\n        bms.maxCellT = d.readInt16LE(6) - 273;\n        decoded.name = \"Cell Min/Max\";\n        decoded.minCellV = bms.minCellV;\n        decoded.maxCellV = bms.maxCellV;\n        decoded.cellDeltaMv = Math.round((bms.maxCellV - bms.minCellV) * 1000);\n        decoded.minCellT = bms.minCellT;\n        decoded.maxCellT = bms.maxCellT;\n        break;\n\n    case 0x374: case 0x375: case 0x376: case 0x377:\n        if (!bms.moduleIds) bms.moduleIds = {};\n        var modId = d.toString('ascii').replace(/\\0/g, '');\n        bms.moduleIds[id.toString(16)] = modId;\n        decoded.name = \"Module ID (0x\" + id.toString(16) + \")\";\n        decoded.moduleId = modId;\n        break;\n\n    case 0x379:\n        bms.capacity = d.readUInt16LE(0);\n        decoded.name = \"Capacity\";\n        decoded.capacityAh = bms.capacity;\n        break;\n\n    case 0x380:\n        bms.serial = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Serial Number\";\n        decoded.serial = bms.serial;\n        break;\n\n    case 0x381:\n        bms.alarm381 = d.toJSON().data;\n        decoded.name = \"Alarms Block 2\";\n        decoded.rawBytes = d.toJSON().data;\n        decoded.rawHex = Array.from(d).map(function(b) {\n            return b.toString(16).toUpperCase().padStart(2, '0');\n        }).join(' ');\n        decoded.NOTE = \"NOT YET DECODED — need REC-BMS alarm bit mapping\";\n        break;\n\n    case 0x404:\n        bms.statusByte = d.readUInt8(0);\n        decoded.name = \"BMS Status\";\n        decoded.statusByte = bms.statusByte;\n        decoded.rawHex = Array.from(d).map(function(b) {\n            return b.toString(16).toUpperCase().padStart(2, '0');\n        }).join(' ');\n        break;\n\n    default:\n        return null;\n}\n\nflow.set(\"bms_live\", bms);\n\nvar v = bms.voltage || 0;\nvar i = bms.current || 0;\nvar s = bms.soc || 0;\nnode.status({\n    fill: \"green\", shape: \"dot\",\n    text: decoded.name + \" | \" + v.toFixed(1) + \"V \" +\n          i.toFixed(1) + \"A \" + s + \"%\"\n});\n\nmsg.payload = decoded;\nmsg.topic = decoded.canId + \" \" + decoded.name;\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "flow.set(\"bms_live\", null);",
+    "finalize": "",
+    "libs": [],
+    "x": 750,
+    "y": 460,
+    "wires": [
+      [
+        "bms03d00000000020"
+      ]
+    ]
+  },
+  {
+    "id": "bms03d00000000020",
+    "type": "debug",
+    "z": "feb92f911e56ae11",
+    "name": "Decoded CAN Frames",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "true",
+    "targetType": "full",
+    "statusVal": "topic",
+    "statusType": "auto",
+    "x": 1000,
+    "y": 460,
+    "wires": []
+  },
+  {
+    "id": "bms03d00000000030",
+    "type": "inject",
+    "z": "feb92f911e56ae11",
+    "name": "Dump bms_live",
+    "props": [
+      {
+        "p": "payload",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": "",
+    "topic": "",
+    "x": 270,
+    "y": 560,
+    "wires": [
+      [
+        "bms03d00000000031"
+      ]
+    ]
+  },
+  {
+    "id": "bms03d00000000031",
+    "type": "function",
+    "z": "feb92f911e56ae11",
+    "name": "Read Full BMS State",
+    "func": "var bms = flow.get(\"bms_live\") || {};\nvar eq = flow.get(\"equalization\") || {};\nvar slider = flow.get(\"charge_slider\");\nvar age = bms._lastUpdate ? (Date.now() - bms._lastUpdate) : -1;\nvar now = Date.now();\n\nmsg.payload = {\n    _meta: {\n        lastUpdateAge: age >= 0 ? (age / 1000).toFixed(1) + \"s\" : \"never\",\n        isLive: age >= 0 && age <= 10000\n    },\n\n    equalization: {\n        active: eq.active || false,\n        lastCompleted: eq.lastCompleted ? new Date(eq.lastCompleted).toISOString() : \"never\",\n        lastCompletedAge: eq.lastCompleted ? Math.round((now - eq.lastCompleted) / 3600000) + \"h ago\" : \"never\",\n        startTime: eq.active ? new Date(eq.startTime).toISOString() : null,\n        elapsedMin: eq.active ? Math.round((now - eq.startTime) / 60000) + \"min\" : null,\n        slider: slider !== undefined ? slider + \"%\" : \"unknown\",\n        normalCVL: slider !== undefined ? (54.0 + (slider - 40) / 60 * 7.96).toFixed(2) + \"V\" : \"unknown\",\n        eqCVL: slider !== undefined ? (54.0 + (slider - 40) / 60 * 7.96 + 0.44).toFixed(2) + \"V\" : \"unknown\"\n    },\n\n    limits: {\n        cvl: bms.cvl,\n        ccl: bms.ccl,\n        dcl: bms.dcl,\n        dvl: bms.dvl\n    },\n\n    dcBus: {\n        voltage: bms.voltage,\n        current: bms.current,\n        power: bms.voltage && bms.current ?\n            Math.round(bms.voltage * bms.current * 10) / 10 : null,\n        temperature: bms.temperature\n    },\n\n    stateOfCharge: {\n        soc: bms.soc,\n        soh: bms.soh,\n        socHiRes: bms.socHiRes,\n        capacity: bms.capacity\n    },\n\n    cells: {\n        minVoltage: bms.minCellV,\n        maxVoltage: bms.maxCellV,\n        deltaMv: bms.minCellV && bms.maxCellV ?\n            Math.round((bms.maxCellV - bms.minCellV) * 1000) : null,\n        minTemp: bms.minCellT,\n        maxTemp: bms.maxCellT,\n        nrModules: bms.nrModules,\n        moduleIds: bms.moduleIds\n    },\n\n    identity: {\n        manufacturer: bms.manufacturer,\n        productName: bms.productName,\n        batteryName: bms.batteryName,\n        serial: bms.serial,\n        chemistry: bms.chemistry,\n        hwVersion: bms.hwVersion,\n        fwVersion: bms.fwVersion\n    },\n\n    forceCharge: bms.forceCharge,\n\n    moduleStatus: {\n        online: bms.modulesOnline,\n        blockingCharge: bms.modulesBlockingCharge,\n        blockingDischarge: bms.modulesBlockingDischarge,\n        offline: bms.modulesOffline\n    },\n\n    chargeCycles: bms.chargeCycles,\n\n    status: {\n        frame381_raw: bms.alarm381,\n        statusByte: bms.statusByte,\n        NOTE: \"REC-BMS does not publish alarm state via CAN — no 0x35A frame\"\n    },\n\n    NOT_FORWARDED_TO_DBUS: [\n        \"soh — virtual battery rejects /Soh\",\n        \"socHiRes — could replace /Soc for smoother readings\",\n        \"capacity — virtual battery rejects /Capacity\",\n        \"consumedAmphours — virtual battery rejects /ConsumedAmphours\",\n        \"timeToGo — virtual battery rejects /TimeToGo\",\n        \"hwVersion — virtual battery rejects /HardwareVersion\",\n        \"fwVersion — virtual battery rejects /FirmwareVersion\",\n        \"serial — virtual battery rejects /Serial\",\n        \"minCellV/maxCellV — virtual battery rejects /System/*\",\n        \"minCellT/maxCellT — virtual battery rejects /System/*\",\n        \"nrModules — virtual battery rejects /System/*\",\n        \"alarm360/381 raw — need REC-BMS bit mapping\",\n        \"statusByte — need REC-BMS status mapping\",\n        \"moduleIds — no standard dbus path\",\n        \"chemistry — informational only\"\n    ]\n};\n\nmsg.topic = \"Full BMS State Dump\";\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 500,
+    "y": 560,
+    "wires": [
+      [
+        "bms03d00000000032"
+      ]
+    ]
+  },
+  {
+    "id": "bms03d00000000032",
+    "type": "debug",
+    "z": "feb92f911e56ae11",
+    "name": "BMS State Dump",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 730,
+    "y": 560,
+    "wires": []
+  },
+  {
+    "id": "bms03a00000000062",
+    "type": "inject",
+    "z": "feb92f911e56ae11",
+    "name": "Init slider → 100%",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"/SwitchableOutput/output_1/Value\":100}",
+        "vt": "json"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "4",
+    "topic": "",
+    "x": 280,
+    "y": 840,
+    "wires": [
+      [
+        "bms03a00000000060"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000060",
+    "type": "victron-virtual-switch",
+    "z": "feb92f911e56ae11",
+    "name": "Charge Limit Slider",
+    "outputs": 2,
+    "switch_1_type": "7",
+    "switch_1_min": "40",
+    "switch_1_max": "100",
+    "switch_1_initial": 100,
+    "switch_1_label": "Max Charge %",
+    "switch_1_unit": "%",
+    "switch_1_step": 5,
+    "switch_1_customname": "Max Charge",
+    "switch_1_group": "BMS",
+    "switch_1_include_measurement": false,
+    "switch_1_rgb_color_wheel": false,
+    "switch_1_cct_wheel": false,
+    "switch_1_rgb_white_dimmer": false,
+    "x": 280,
+    "y": 900,
+    "wires": [
+      [],
+      [
+        "bms03a00000000065"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000065",
+    "type": "function",
+    "z": "feb92f911e56ae11",
+    "name": "Capture Slider Value",
+    "func": "var val = msg.payload;\nif (typeof val !== 'number' || val < 40 || val > 100) return null;\n\nflow.set(\"charge_slider\", val);\n\nvar voltage = 54.0 + (val - 40) / 60 * 7.96;\nnode.status({\n    fill: \"blue\", shape: \"dot\",\n    text: val + \"% → \" + voltage.toFixed(2) + \"V CVL\"\n});\n\nreturn null;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "flow.set(\"charge_slider\", 100);",
+    "finalize": "",
+    "libs": [],
+    "x": 550,
+    "y": 900,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "bms03a00000000030",
+    "type": "inject",
+    "z": "feb92f911e56ae11",
+    "name": "1s Publish Tick",
+    "props": [
+      {
+        "p": "payload",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "1",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "5",
+    "topic": "",
+    "x": 270,
+    "y": 680,
+    "wires": [
+      [
+        "bms03a00000000040"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000040",
+    "type": "function",
+    "z": "feb92f911e56ae11",
+    "name": "State Assembler + Staged Fallback + CVL Control",
+    "func": "var bms = flow.get(\"bms_live\") || {};\nvar age = Date.now() - (bms._lastUpdate || 0);\nvar now = Date.now();\nvar live = bms._lastUpdate && (age <= 10000);\n\n// =============================================\n// STAGED FALLBACK\n// =============================================\nvar phase, phaseName, fb;\n\nif (live) {\n    phase = 0;\n    phaseName = \"LIVE\";\n} else if (age <= 30000) {\n    phase = 1;\n    phaseName = \"ALERT\";\n} else if (age <= 300000) {\n    phase = 2;\n    phaseName = \"RESTRICT\";\n} else {\n    phase = 3;\n    phaseName = \"SURVIVAL\";\n}\n\nvar fallback = [\n    { ccl: null, dcl: null, dvl: null },\n    { ccl: 0, dcl: 100, dvl: 52.0 },\n    { ccl: 0, dcl: 30,  dvl: 53.0 },\n    { ccl: 0, dcl: 15,  dvl: 54.0 }\n];\nfb = fallback[phase];\n\nvar safe = {\n    cvl: 62.7, ccl: 0, dcl: 15, dvl: 54.0,\n    voltage: 54.0, current: 0, temperature: 20,\n    soc: 50, capacity: 1440,\n    minCellV: 3.375, maxCellV: 3.375,\n    nrModules: 6, minCellT: 20, maxCellT: 20\n};\n\nfunction v(key) {\n    if (!live) return safe[key];\n    return (bms[key] !== undefined && bms[key] !== null)\n        ? bms[key] : safe[key];\n}\n\n// =============================================\n// CVL CONTROL: SLIDER + WEEKLY EQ\n// =============================================\nvar slider = flow.get(\"charge_slider\");\nif (slider === undefined || slider === null) slider = 100;\n\nvar sliderCVL = 54.0 + (slider - 40) / 60 * 7.96;\n\nvar eq = flow.get(\"equalization\") || {\n    lastCompleted: 0, active: false, startTime: 0\n};\n\nvar SEVEN_DAYS  = 7 * 24 * 3600 * 1000;\nvar ONE_HOUR    = 3600 * 1000;\nvar EQ_BOOST    = 0.44;\nvar eqEligible  = live && (phase === 0);\nvar eqDue       = (now - eq.lastCompleted) >= SEVEN_DAYS;\nvar eqLabel     = \"\";\nvar finalCVL;\n\nif (eq.active) {\n    var eqElapsed = now - eq.startTime;\n    if (eqElapsed >= ONE_HOUR) {\n        eq.active = false;\n        eq.lastCompleted = now;\n        eqLabel = \"EQ done\";\n        finalCVL = sliderCVL;\n    } else if (!eqEligible) {\n        eq.active = false;\n        eqLabel = \"EQ aborted\";\n        finalCVL = sliderCVL;\n    } else {\n        var minsLeft = Math.ceil((ONE_HOUR - eqElapsed) / 60000);\n        eqLabel = \"EQ \" + minsLeft + \"min left\";\n        finalCVL = sliderCVL + EQ_BOOST;\n    }\n} else if (eqEligible && eqDue) {\n    eq.active = true;\n    eq.startTime = now;\n    eqLabel = \"EQ starting\";\n    finalCVL = sliderCVL + EQ_BOOST;\n} else {\n    finalCVL = sliderCVL;\n    if (eqEligible && !eqDue) {\n        var nextEqHours = Math.round(\n            (SEVEN_DAYS - (now - eq.lastCompleted)) / 3600000\n        );\n        eqLabel = \"next EQ ~\" + nextEqHours + \"h\";\n    }\n}\n\nflow.set(\"equalization\", eq);\n\nvar bmsCVL = live ? v(\"cvl\") : safe.cvl;\nfinalCVL = Math.min(finalCVL, bmsCVL);\n\n// =============================================\n// RESOLVE FINAL VALUES\n// =============================================\nvar ccl, dcl, dvl, cvl;\nif (live) {\n    ccl = v(\"ccl\");\n    dcl = v(\"dcl\");\n    dvl = v(\"dvl\");\n    cvl = finalCVL;\n} else {\n    ccl = fb.ccl;\n    dcl = fb.dcl;\n    dvl = fb.dvl;\n    cvl = finalCVL;\n}\n\nvar volts   = v(\"voltage\");\nvar amps    = live ? v(\"current\") : 0;\nvar cap     = v(\"capacity\");\nvar soc     = v(\"soc\");\nvar cellMin = v(\"minCellV\");\nvar cellMax = v(\"maxCellV\");\n\nmsg.payload = {\n    \"/Info/MaxChargeVoltage\":    cvl,\n    \"/Info/MaxChargeCurrent\":    ccl,\n    \"/Info/MaxDischargeCurrent\": dcl,\n    \"/Info/BatteryLowVoltage\":   dvl,\n\n    \"/Dc/0/Voltage\":     volts,\n    \"/Dc/0/Current\":     amps,\n    \"/Dc/0/Power\":       Math.round(volts * amps * 10) / 10,\n    \"/Dc/0/Temperature\": v(\"temperature\"),\n\n    \"/Soc\":              soc,\n\n    \"/Alarms/LowVoltage\":           0,\n    \"/Alarms/HighVoltage\":          0,\n    \"/Alarms/LowTemperature\":       0,\n    \"/Alarms/HighTemperature\":      0,\n    \"/Alarms/LowSoc\":               (soc < 10) ? 2 : (soc < 20) ? 1 : 0,\n    \"/Alarms/HighChargeCurrent\":    live ? ((bms.modulesBlockingCharge || 0) > 0 ? 1 : 0) : 0,\n    \"/Alarms/HighDischargeCurrent\": live ? ((bms.modulesBlockingDischarge || 0) > 0 ? 1 : 0) : 0,\n    \"/Alarms/CellImbalance\":\n        live ? (((cellMax - cellMin) > 0.100) ? 2 :\n               ((cellMax - cellMin) > 0.050) ? 1 : 0) : 0,\n    \"/Alarms/InternalFailure\":      (phase >= 1) ? 2 : ((bms.modulesOffline || 0) > 0 ? 2 : 0)\n};\n\n// =============================================\n// NODE STATUS\n// =============================================\nvar color = [\"green\", \"yellow\", \"blue\", \"red\"][phase];\nif (eq.active) color = \"purple\";\nvar shape = (phase === 0) ? \"dot\" : \"ring\";\n\nvar parts = [\n    phaseName,\n    volts.toFixed(1) + \"V\",\n    amps.toFixed(1) + \"A\",\n    soc + \"%\",\n    \"CVL=\" + cvl.toFixed(1) + \"V\",\n    \"(\" + slider + \"%)\",\n    \"CCL=\" + ccl + \"A\",\n    \"DCL=\" + dcl + \"A\"\n];\nif (eqLabel) parts.push(eqLabel);\nif (phase >= 1) parts.push(\"CAN lost \" + Math.round(age/1000) + \"s\");\n\nnode.status({ fill: color, shape: shape, text: parts.join(\" | \") });\n\nmsg.topic = \"dbus_publish\";\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "var eq = flow.get(\"equalization\") || { lastCompleted: 0, active: false, startTime: 0 };\neq.active = false;\nflow.set(\"equalization\", eq);",
+    "finalize": "",
+    "libs": [],
+    "x": 600,
+    "y": 680,
+    "wires": [
+      [
+        "bms03a00000000045",
+        "bms03d00000000040"
+      ]
+    ]
+  },
+  {
+    "id": "bms03d00000000040",
+    "type": "debug",
+    "z": "feb92f911e56ae11",
+    "name": "dbus Publish Payload",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 910,
+    "y": 740,
+    "wires": []
+  },
+  {
+    "id": "bms03a00000000045",
+    "type": "function",
+    "z": "feb92f911e56ae11",
+    "name": "Path Filter",
+    "func": "var allowed = [\n    \"/Info/MaxChargeVoltage\",\n    \"/Info/MaxChargeCurrent\",\n    \"/Info/MaxDischargeCurrent\",\n    \"/Info/BatteryLowVoltage\",\n    \"/Dc/0/Voltage\",\n    \"/Dc/0/Current\",\n    \"/Dc/0/Power\",\n    \"/Dc/0/Temperature\",\n    \"/Soc\",\n    \"/Alarms/LowVoltage\",\n    \"/Alarms/HighVoltage\",\n    \"/Alarms/LowTemperature\",\n    \"/Alarms/HighTemperature\",\n    \"/Alarms/LowSoc\",\n    \"/Alarms/HighChargeCurrent\",\n    \"/Alarms/HighDischargeCurrent\",\n    \"/Alarms/CellImbalance\",\n    \"/Alarms/InternalFailure\"\n];\n\nvar filtered = {};\nvar rejected = {};\nvar p = msg.payload;\n\nfor (var key in p) {\n    if (allowed.indexOf(key) >= 0) {\n        filtered[key] = p[key];\n    } else {\n        rejected[key] = p[key];\n    }\n}\n\nvar rejKeys = Object.keys(rejected);\nif (rejKeys.length > 0) {\n    var logged = flow.get(\"_rejectedLogged\") || false;\n    if (!logged) {\n        node.warn(\"Filtered out paths: \" + rejKeys.join(\", \"));\n        flow.set(\"_rejectedLogged\", true);\n    }\n}\n\nvar aCount = Object.keys(filtered).length;\nvar rCount = rejKeys.length;\nnode.status({\n    fill: rCount > 0 ? \"yellow\" : \"green\",\n    shape: \"dot\",\n    text: aCount + \" passed, \" + rCount + \" filtered\"\n});\n\nmsg.payload = filtered;\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "flow.set(\"_rejectedLogged\", false);",
+    "finalize": "",
+    "libs": [],
+    "x": 910,
+    "y": 640,
+    "wires": [
+      [
+        "bms03a00000000050"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000050",
+    "type": "victron-virtual",
+    "z": "feb92f911e56ae11",
+    "name": "REC-BMS → Venus OS",
+    "outputs": 1,
+    "device": "battery",
+    "default_values": true,
+    "acload_nrofphases": 1,
+    "enable_s2support": false,
+    "battery_capacity": "1440",
+    "include_battery_temperature": true,
+    "battery_voltage_preset": "48",
+    "battery_voltage_custom": 24,
+    "generator_type": "ac",
+    "generator_nrofphases": 1,
+    "include_engine_hours": false,
+    "include_starter_voltage": false,
+    "include_history_energy": false,
+    "grid_nrofphases": 1,
+    "include_motor_temp": false,
+    "include_controller_temp": false,
+    "include_coolant_temp": false,
+    "include_motor_rpm": true,
+    "include_motor_direction": true,
+    "position": 0,
+    "pvinverter_nrofphases": 1,
+    "switch_1_type": 1,
+    "switch_1_min": 0,
+    "switch_1_max": "",
+    "switch_1_initial": 0,
+    "switch_1_label": "",
+    "switch_1_unit": "",
+    "switch_1_step": 1,
+    "switch_1_customname": "",
+    "switch_1_group": "",
+    "switch_1_include_measurement": false,
+    "switch_1_rgb_color_wheel": false,
+    "switch_1_cct_wheel": false,
+    "switch_1_rgb_white_dimmer": false,
+    "fluid_type": 0,
+    "include_tank_battery": false,
+    "include_tank_temperature": false,
+    "tank_battery_voltage": 3.3,
+    "tank_capacity": 0.2,
+    "temperature_type": 2,
+    "include_humidity": false,
+    "include_pressure": false,
+    "include_temp_battery": false,
+    "temp_battery_voltage": 3.3,
+    "x": 1150,
+    "y": 640,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "6c45530c9845f8fb",
+    "type": "global-config",
+    "env": [],
+    "modules": {
+      "@victronenergy/node-red-contrib-victron": "1.6.60"
+    }
+  }
+]
