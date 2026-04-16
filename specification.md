@@ -125,6 +125,50 @@ Reads 12V battery data from Signal-K and publishes to 3 Victron virtual battery 
 - **1s publish tick** with 10-second staleness check
 - **3 virtual battery outputs**: House, Bow, Stern (12V preset)
 
+### Solar Priority (`SolarPriority.json`)
+
+Automatically uses solar power instead of shore power when solar production can cover AC loads. Prevents energy waste when the boat is idle with the charge slider set below 100% (which otherwise stops solar production while shore powers all loads).
+
+**Problem**: When the battery sits at the CVL ceiling (e.g., 60% slider), MPPTs produce nothing — so there is no PV power reading to compare against load. The flow solves this by estimating available solar capacity from the panel open-circuit voltage (Voc), which is always readable even when MPPTs are idle.
+
+**Mechanism**: Controls the Quattro's `IgnoreAcIn1` D-Bus path. When solar is estimated to be sufficient, AC input is ignored → Quattro inverts from battery → battery SOC dips below CVL → MPPTs ramp up → solar effectively powers loads. No backfeed risk (AC input is simply disconnected, not reversed).
+
+**Power estimation from Voc**:
+- Linear model: `P_est = P_rated × max(0, (Voc - VOC_ZERO) / (VOC_FULL - VOC_ZERO)) × gain`
+- `VOC_ZERO` (default 30V): panel voltage below which power is negligible
+- `VOC_FULL` (default 80V): panel voltage at full sun
+- `P_rated`: total rated panel wattage (configurable via VRM slider, default 500W)
+- `gain`: self-tuning correction factor (starts at 1.0, adjusts after each probe)
+
+**Self-tuning**: After each probe, the flow compares the Voc-based estimate against measured PV power and adjusts the gain: `gain = 0.85 × gain + 0.15 × (actual / estimated)`, clamped to [0.3, 3.0]. Over multiple cycles this converges to an accurate mapping for the specific panel installation, accounting for orientation, shading, temperature, and aging.
+
+**Load averaging**: AC consumption is smoothed with a 60-second rolling average to avoid reacting to transient spikes.
+
+**Data inputs**:
+- `com.victronenergy.solarcharger` `/Pv/V` — panel open-circuit voltage (V), from one MPPT
+- `com.victronenergy.system` `/Dc/Pv/Power` — total DC-coupled PV power (W), sum of all MPPTs
+- `com.victronenergy.system` `/Ac/Consumption/L1/Power` — AC consumption phase 1 (W)
+- `com.victronenergy.system` `/Dc/Battery/Soc` — battery state of charge (%)
+
+**Control output** (`com.victronenergy.vebus`):
+- `/Ac/Control/IgnoreAcIn1` — 0 = accept shore, 1 = ignore shore
+
+**State machine** (three states: `shore`, `probe`, `solar`):
+- **Shore → Probe**: estimated PV ≥ avg load × 1.2 AND est ≥ 100W AND SOC ≥ 40% AND cooldown elapsed → disconnect shore
+- **Probe (60s)**: MPPTs ramp up; after 60s, evaluate actual PV power
+  - **Probe → Solar**: actual PV ≥ avg load × 1.2 → stay on solar (self-tune gain)
+  - **Probe → Shore**: actual PV < required → reconnect shore (self-tune gain)
+- **Solar → Shore**: avg load > actual PV for 15 continuous seconds, OR SOC < 40%
+- **Emergency reconnect**: SOC < 30% → immediate shore from any state, no delay
+- **Cooldown**: 5 minutes minimum between any transitions (anti-cycling)
+- **Disabled/missing data**: always defaults to shore (safe state)
+
+**VRM dashboard** ("Solar" group):
+- "Solar Priority" on/off toggle (disabled by default)
+- "PV Capacity" slider (100–2000W, step 50W) — set to total rated panel wattage
+
+**Setup required**: After import, (1) open "PV Voltage" node and select an MPPT solar charger, (2) open "AC Input Control" node and select the Quattro.
+
 ## Key Technical Notes
 
 - The Cerbo's VE.Can `can0` port (sun4i_can driver) only passes 29-bit extended CAN frames to userspace. 11-bit standard frames are filtered at the hardware/kernel level. This is why the YDNB-07 must repackage BMS frames.

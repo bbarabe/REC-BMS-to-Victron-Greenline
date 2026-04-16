@@ -950,11 +950,11 @@
     "wires": []
   },
   {
-    "id": "dfbcfeb89c77f7bd",
+    "id": "a54f7416998731c5",
     "type": "global-config",
     "env": [],
     "modules": {
-      "@signalk/node-red-embedded": "2.18.1",
+      "@signalk/node-red-embedded": "2.20.0",
       "@victronenergy/node-red-contrib-victron": "1.7.7"
     }
   }

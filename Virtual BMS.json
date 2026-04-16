@@ -235,7 +235,9 @@
     "props": [
       {
         "p": "payload",
-        "v": "{\"/SwitchableOutput/output_1/Value\":100}",
+        "v": {
+          "/SwitchableOutput/output_1/Value": 100
+        },
         "vt": "json"
       }
     ],
@@ -438,11 +440,11 @@
     ]
   },
   {
-    "id": "6c45530c9845f8fb",
+    "id": "934119bf28688370",
     "type": "global-config",
     "env": [],
     "modules": {
-      "@victronenergy/node-red-contrib-victron": "1.6.60"
+      "@victronenergy/node-red-contrib-victron": "1.7.7"
     }
   }
 ]

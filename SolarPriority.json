@@ -1,0 +1,374 @@
+[
+  {
+    "id": "sp_tab_001",
+    "type": "tab",
+    "label": "Solar Priority",
+    "disabled": false,
+    "info": "Automatically uses solar instead of shore power when panels can cover AC loads.\nUses PV open-circuit voltage to estimate available solar capacity (even when MPPTs are idle),\nthen probes by disconnecting shore to confirm. Self-tunes the estimate over time.\n\nStates: shore -> probe (60s MPPT ramp) -> solar -> shore\nSee SETUP comment node for configuration.",
+    "env": []
+  },
+  {
+    "id": "sp_comment_setup",
+    "type": "comment",
+    "z": "sp_tab_001",
+    "name": "SETUP — read me after import",
+    "info": "After importing this flow:\n\n1. Open 'PV Voltage' node: select one of your MPPT solar chargers from the Service dropdown.\n   (Pick whichever MPPT has the larger panel array, or either if they're identical.)\n2. Open 'AC Input Control' node: select your Quattro from the Service dropdown.\n3. Verify the 3 'victron-input-system' nodes auto-discovered (PV Power, AC Load, SOC).\n   If not, open each and select 'Venus system'.\n4. Deploy.\n5. Set 'PV Capacity' slider on VRM (Solar group) to your total rated panel wattage.\n6. Toggle 'Solar Priority' ON via VRM dashboard (Solar group).\n\nTunable thresholds are at the top of the 'Decision Logic' function node:\n  VOC_ZERO (30V) — PV voltage below which power is ~0\n  VOC_FULL (80V) — PV voltage at full sun (adjust to your panels' Voc)\n  SOLAR_MARGIN (1.2) — PV must beat load by 20%\n  RAMP_TIME_MS (60000) — 60s for MPPTs to reach full output during probe\n  LOAD_EXCEED_MS (15000) — 15s grace before switching back to shore\n  COOLDOWN_MS (300000) — 5 min anti-cycling between transitions\n  MIN_SOC (40%) — won't probe below this\n  SOC_EMERGENCY (30%) — immediate shore reconnect\n\nThe self-tune 'gain' factor adjusts automatically after each probe.\nIt starts at 1.0 and converges to the real ratio between your Voc curve\nand actual power output. Visible in the Decision Logic node status.",
+    "x": 360,
+    "y": 40,
+    "wires": []
+  },
+  {
+    "id": "sp_switch_001",
+    "type": "victron-virtual-switch",
+    "z": "sp_tab_001",
+    "name": "Solar Priority Toggle",
+    "outputs": 2,
+    "switch_1_type": "0",
+    "switch_1_initial": 0,
+    "switch_1_label": "Enable",
+    "switch_1_customname": "Solar Priority",
+    "switch_1_group": "Solar",
+    "switch_1_include_measurement": false,
+    "switch_1_rgb_color_wheel": false,
+    "switch_1_cct_wheel": false,
+    "switch_1_rgb_white_dimmer": false,
+    "x": 160,
+    "y": 120,
+    "wires": [
+      [],
+      [
+        "sp_enable_handler"
+      ]
+    ]
+  },
+  {
+    "id": "sp_enable_handler",
+    "type": "function",
+    "z": "sp_tab_001",
+    "name": "Store Enable",
+    "func": "var on = (msg.payload === 1 || msg.payload === true);\nflow.set(\"sp_enabled\", on);\nnode.status({\n    fill: on ? \"green\" : \"grey\",\n    shape: \"dot\",\n    text: on ? \"ENABLED\" : \"DISABLED\"\n});\nif (!on) {\n    flow.set(\"sp_load_exceed_start\", 0);\n}\nreturn null;",
+    "outputs": 0,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "flow.set(\"sp_enabled\", false);",
+    "finalize": "",
+    "libs": [],
+    "x": 440,
+    "y": 120,
+    "wires": []
+  },
+  {
+    "id": "sp_rated_switch",
+    "type": "victron-virtual-switch",
+    "z": "sp_tab_001",
+    "name": "PV Capacity Slider",
+    "outputs": 2,
+    "switch_1_type": "7",
+    "switch_1_min": "100",
+    "switch_1_max": "2000",
+    "switch_1_initial": 500,
+    "switch_1_label": "Rated PV (W)",
+    "switch_1_unit": "W",
+    "switch_1_step": 50,
+    "switch_1_customname": "PV Capacity",
+    "switch_1_group": "Solar",
+    "switch_1_include_measurement": false,
+    "switch_1_rgb_color_wheel": false,
+    "switch_1_cct_wheel": false,
+    "switch_1_rgb_white_dimmer": false,
+    "x": 160,
+    "y": 200,
+    "wires": [
+      [],
+      [
+        "sp_rated_handler"
+      ]
+    ]
+  },
+  {
+    "id": "sp_rated_handler",
+    "type": "function",
+    "z": "sp_tab_001",
+    "name": "Store Rated Power",
+    "func": "var val = msg.payload;\nif (typeof val !== 'number' || val < 100 || val > 2000) return null;\nflow.set(\"sp_p_rated\", val);\nnode.status({fill: \"blue\", shape: \"dot\", text: val + \"W rated\"});\nreturn null;",
+    "outputs": 0,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "flow.set(\"sp_p_rated\", 500);",
+    "finalize": "",
+    "libs": [],
+    "x": 440,
+    "y": 200,
+    "wires": []
+  },
+  {
+    "id": "sp_pv_v_input",
+    "type": "victron-input-solarcharger",
+    "z": "sp_tab_001",
+    "service": "",
+    "path": "/Pv/V",
+    "serviceObj": null,
+    "pathObj": {
+      "path": "/Pv/V",
+      "type": "float",
+      "name": "PV voltage (V)"
+    },
+    "name": "PV Voltage",
+    "onlyChanges": false,
+    "roundValues": "1",
+    "x": 150,
+    "y": 290,
+    "wires": [
+      [
+        "sp_voc_handler"
+      ]
+    ]
+  },
+  {
+    "id": "sp_voc_handler",
+    "type": "function",
+    "z": "sp_tab_001",
+    "name": "Store Voc & Estimate",
+    "func": "var v = Number(msg.payload) || 0;\nflow.set(\"sp_pv_voltage\", v);\n\n// --- Estimation model ---\n// Linear interpolation: ratio = (Voc - VOC_ZERO) / (VOC_FULL - VOC_ZERO)\n// P_est = P_RATED * ratio * gain\n// Adjust VOC_ZERO and VOC_FULL to match your panels.\nvar VOC_ZERO = 30;  // V below which power is negligible\nvar VOC_FULL = 80;  // V at full sun (peak Voc from your graph)\n\nvar pRated = flow.get(\"sp_p_rated\") || 500;\nvar gain   = flow.get(\"sp_gain\")    || 1.0;\n\nvar ratio = Math.max(0, Math.min(1, (v - VOC_ZERO) / (VOC_FULL - VOC_ZERO)));\nvar pEst  = pRated * ratio * gain;\n\nflow.set(\"sp_pv_estimated\", pEst);\nflow.set(\"sp_voc_ratio\", ratio);\n\nnode.status({\n    fill: v > VOC_ZERO ? \"yellow\" : \"grey\",\n    shape: \"dot\",\n    text: v.toFixed(1) + \"V -> ~\" + pEst.toFixed(0) + \"W (gain:\" + gain.toFixed(2) + \")\"\n});\nreturn null;",
+    "outputs": 0,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "flow.set(\"sp_gain\", 1.0);",
+    "finalize": "",
+    "libs": [],
+    "x": 440,
+    "y": 290,
+    "wires": []
+  },
+  {
+    "id": "sp_pv_input",
+    "type": "victron-input-system",
+    "z": "sp_tab_001",
+    "service": "com.victronenergy.system",
+    "path": "/Dc/Pv/Power",
+    "serviceObj": {
+      "service": "com.victronenergy.system",
+      "name": "Venus system"
+    },
+    "pathObj": {
+      "path": "/Dc/Pv/Power",
+      "type": "float",
+      "name": "PV - DC-coupled power (W)"
+    },
+    "name": "PV Power",
+    "onlyChanges": false,
+    "roundValues": "0",
+    "x": 140,
+    "y": 370,
+    "wires": [
+      [
+        "sp_pv_handler"
+      ]
+    ]
+  },
+  {
+    "id": "sp_pv_handler",
+    "type": "function",
+    "z": "sp_tab_001",
+    "name": "Store PV Power",
+    "func": "var w = Number(msg.payload) || 0;\nflow.set(\"sp_pv_power\", w);\nnode.status({fill: \"yellow\", shape: \"dot\", text: w.toFixed(0) + \" W actual\"});\nreturn null;",
+    "outputs": 0,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 440,
+    "y": 370,
+    "wires": []
+  },
+  {
+    "id": "sp_ac_input",
+    "type": "victron-input-system",
+    "z": "sp_tab_001",
+    "service": "com.victronenergy.system",
+    "path": "/Ac/Consumption/L1/Power",
+    "serviceObj": {
+      "service": "com.victronenergy.system",
+      "name": "Venus system"
+    },
+    "pathObj": {
+      "path": "/Ac/Consumption/L1/Power",
+      "type": "float",
+      "name": "AC Consumption L1 (W)"
+    },
+    "name": "AC Load",
+    "onlyChanges": false,
+    "roundValues": "0",
+    "x": 140,
+    "y": 450,
+    "wires": [
+      [
+        "sp_ac_handler"
+      ]
+    ]
+  },
+  {
+    "id": "sp_ac_handler",
+    "type": "function",
+    "z": "sp_tab_001",
+    "name": "Store AC Load (avg)",
+    "func": "var w = Number(msg.payload) || 0;\nflow.set(\"sp_ac_load\", w);\n\n// Rolling average over last 60 samples (~60s at 1 update/sec)\nvar samples = flow.get(\"sp_ac_samples\") || [];\nsamples.push(w);\nif (samples.length > 60) samples.shift();\nflow.set(\"sp_ac_samples\", samples);\n\nvar sum = 0;\nfor (var i = 0; i < samples.length; i++) sum += samples[i];\nvar avg = sum / samples.length;\nflow.set(\"sp_ac_load_avg\", avg);\n\nnode.status({\n    fill: \"blue\", shape: \"dot\",\n    text: w.toFixed(0) + \"W (avg:\" + avg.toFixed(0) + \"W, \" + samples.length + \"s)\"\n});\nreturn null;",
+    "outputs": 0,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "flow.set(\"sp_ac_samples\", []);",
+    "finalize": "",
+    "libs": [],
+    "x": 440,
+    "y": 450,
+    "wires": []
+  },
+  {
+    "id": "sp_soc_input",
+    "type": "victron-input-system",
+    "z": "sp_tab_001",
+    "service": "com.victronenergy.system",
+    "path": "/Dc/Battery/Soc",
+    "serviceObj": {
+      "service": "com.victronenergy.system",
+      "name": "Venus system"
+    },
+    "pathObj": {
+      "path": "/Dc/Battery/Soc",
+      "type": "float",
+      "name": "Battery SOC (%)"
+    },
+    "name": "Battery SOC",
+    "onlyChanges": false,
+    "roundValues": "1",
+    "x": 150,
+    "y": 530,
+    "wires": [
+      [
+        "sp_soc_handler"
+      ]
+    ]
+  },
+  {
+    "id": "sp_soc_handler",
+    "type": "function",
+    "z": "sp_tab_001",
+    "name": "Store SOC",
+    "func": "var pct = Number(msg.payload);\nif (isNaN(pct)) return null;\nflow.set(\"sp_soc\", pct);\nvar fill = pct > 50 ? \"green\" : (pct > 30 ? \"yellow\" : \"red\");\nnode.status({fill: fill, shape: \"dot\", text: pct.toFixed(1) + \"%\"});\nreturn null;",
+    "outputs": 0,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 440,
+    "y": 530,
+    "wires": []
+  },
+  {
+    "id": "sp_safe_start",
+    "type": "inject",
+    "z": "sp_tab_001",
+    "name": "Safe Start (shore)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "0",
+        "vt": "num"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "3",
+    "topic": "",
+    "x": 170,
+    "y": 640,
+    "wires": [
+      [
+        "sp_ac_control"
+      ]
+    ]
+  },
+  {
+    "id": "sp_tick",
+    "type": "inject",
+    "z": "sp_tab_001",
+    "name": "1s Decision Tick",
+    "props": [
+      {
+        "p": "payload",
+        "v": "",
+        "vt": "date"
+      }
+    ],
+    "repeat": "1",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "5",
+    "topic": "",
+    "x": 170,
+    "y": 720,
+    "wires": [
+      [
+        "sp_decision"
+      ]
+    ]
+  },
+  {
+    "id": "sp_decision",
+    "type": "function",
+    "z": "sp_tab_001",
+    "name": "Decision Logic",
+    "func": "// === Solar Priority — 3-State Decision Logic ===\n//\n// SHORE:  Voc-estimated power vs avg load -> probe if solar looks sufficient\n// PROBE:  Disconnect shore, wait for MPPT ramp, measure actual PV\n//         -> SOLAR if confirmed, -> SHORE if not (+ self-tune gain)\n// SOLAR:  Actual PV vs avg load -> SHORE after 15s grace if overloaded\n//\n// Self-tuning: after each probe, compares estimated vs actual power\n// and adjusts 'gain' factor so future estimates improve.\n\n// ---- Tunable thresholds ----\nvar SOLAR_MARGIN   = 1.2;      // PV must exceed load by 20%\nvar MIN_EST_W      = 100;      // Min estimated watts to trigger probe\nvar RAMP_TIME_MS   = 60000;    // 60s for MPPTs to reach output\nvar LOAD_EXCEED_MS = 15000;    // 15s grace before returning to shore\nvar COOLDOWN_MS    = 300000;   // 5 min between transitions\nvar MIN_SOC        = 40;       // Won't probe below this SOC %\nvar SOC_EMERGENCY  = 30;       // Immediate shore reconnect\n\n// ---- Read inputs ----\nvar enabled    = flow.get(\"sp_enabled\") || false;\nvar pvVoc      = flow.get(\"sp_pv_voltage\");\nvar pvEst      = flow.get(\"sp_pv_estimated\");\nvar pvPower    = flow.get(\"sp_pv_power\");\nvar acLoadAvg  = flow.get(\"sp_ac_load_avg\");\nvar soc        = flow.get(\"sp_soc\");\n\n// ---- Persisted state ----\nvar state           = flow.get(\"sp_state\") || \"shore\";\nvar lastTransition  = flow.get(\"sp_last_transition\") || 0;\nvar probeStart      = flow.get(\"sp_probe_start\") || 0;\nvar probeEstimate   = flow.get(\"sp_probe_estimate\") || 0;\nvar loadExceedStart = flow.get(\"sp_load_exceed_start\") || 0;\nvar gain            = flow.get(\"sp_gain\") || 1.0;\n\nvar now = Date.now();\nvar command = null;   // null=no change, 0=shore, 1=ignore-AC\nvar statusText = \"\";\nvar statusFill = \"grey\";\n\n// Helper: return to shore\nfunction goShore(reason) {\n    command = 0;\n    state = \"shore\";\n    lastTransition = now;\n    loadExceedStart = 0;\n    probeStart = 0;\n    statusText = \"-> SHORE (\" + reason + \")\";\n}\n\n// Helper: update gain with a new observation\nfunction updateGain(estimated, actual) {\n    if (estimated <= 0 || actual <= 0) return;\n    var sample = actual / estimated;\n    gain = 0.85 * gain + 0.15 * sample;\n    gain = Math.max(0.3, Math.min(3.0, gain)); // clamp\n    flow.set(\"sp_gain\", gain);\n}\n\nvar hasData = pvVoc !== undefined && pvVoc !== null &&\n              acLoadAvg !== undefined && acLoadAvg !== null &&\n              soc !== undefined && soc !== null;\n\nif (!enabled) {\n    // ---- DISABLED ----\n    if (state !== \"shore\") goShore(\"disabled\");\n    else statusText = \"DISABLED\";\n    statusFill = \"grey\";\n\n} else if (!hasData) {\n    // ---- MISSING DATA ----\n    if (state !== \"shore\") goShore(\"no data\");\n    else statusText = \"Waiting for data\";\n    statusFill = \"red\";\n\n} else {\n    var cooldownOk   = (now - lastTransition) >= COOLDOWN_MS;\n    var cooldownLeft  = Math.max(0, Math.ceil((COOLDOWN_MS - (now - lastTransition)) / 1000));\n    var load = acLoadAvg;\n\n    // ======== SHORE ========\n    if (state === \"shore\") {\n        var est = pvEst || 0;\n        if (cooldownOk &&\n            est >= MIN_EST_W &&\n            est >= load * SOLAR_MARGIN &&\n            soc >= MIN_SOC) {\n            // Start probe\n            command = 1;\n            state = \"probe\";\n            probeStart = now;\n            probeEstimate = est;\n            lastTransition = now;\n            loadExceedStart = 0;\n            statusFill = \"yellow\";\n            statusText = \"-> PROBE (est:\" + est.toFixed(0) + \"W > load:\" + load.toFixed(0) + \"W)\";\n        } else {\n            statusFill = \"blue\";\n            statusText = \"SHORE | Est:\" + est.toFixed(0) + \"W Load:\" + load.toFixed(0) + \"W\" +\n                         \" Voc:\" + (pvVoc||0).toFixed(0) + \"V SOC:\" + soc.toFixed(0) + \"%\" +\n                         \" g:\" + gain.toFixed(2);\n            if (!cooldownOk) statusText += \" [CD:\" + cooldownLeft + \"s]\";\n        }\n\n    // ======== PROBE ========\n    } else if (state === \"probe\") {\n        var elapsed = now - probeStart;\n\n        if (soc < SOC_EMERGENCY) {\n            goShore(\"emergency SOC:\" + soc.toFixed(0) + \"%\");\n            statusFill = \"red\";\n\n        } else if (elapsed < RAMP_TIME_MS) {\n            // Still ramping — just wait\n            var rampLeft = Math.ceil((RAMP_TIME_MS - elapsed) / 1000);\n            var pv = pvPower || 0;\n            statusFill = \"yellow\";\n            statusText = \"PROBE | Ramping \" + rampLeft + \"s  PV:\" + pv.toFixed(0) + \"W\" +\n                         \" Load:\" + load.toFixed(0) + \"W\";\n\n        } else {\n            // Ramp done — evaluate actual production\n            var actual = pvPower || 0;\n\n            // Self-tune regardless of outcome\n            updateGain(probeEstimate, actual);\n\n            if (actual >= load * SOLAR_MARGIN) {\n                // Probe succeeded\n                state = \"solar\";\n                loadExceedStart = 0;\n                statusFill = \"green\";\n                statusText = \"-> SOLAR (PV:\" + actual.toFixed(0) + \"W > load:\" + load.toFixed(0) + \"W\" +\n                             \" g:\" + gain.toFixed(2) + \")\";\n            } else {\n                // Probe failed\n                goShore(\"probe: PV \" + actual.toFixed(0) + \"W < \" +\n                        (load * SOLAR_MARGIN).toFixed(0) + \"W needed, g:\" + gain.toFixed(2));\n                statusFill = \"blue\";\n            }\n        }\n\n    // ======== SOLAR ========\n    } else {\n        var actual = pvPower || 0;\n        var overloaded = load > actual || soc < MIN_SOC;\n\n        if (soc < SOC_EMERGENCY) {\n            goShore(\"emergency SOC:\" + soc.toFixed(0) + \"%\");\n            statusFill = \"red\";\n\n        } else if (overloaded) {\n            if (loadExceedStart === 0) loadExceedStart = now;\n            var elapsed = now - loadExceedStart;\n            if (elapsed >= LOAD_EXCEED_MS) {\n                goShore(\"load exceeded \" + (LOAD_EXCEED_MS / 1000) + \"s\");\n                statusFill = \"blue\";\n            } else {\n                var remaining = Math.ceil((LOAD_EXCEED_MS - elapsed) / 1000);\n                statusFill = \"yellow\";\n                statusText = \"SOLAR ! PV:\" + actual.toFixed(0) + \"W < Load:\" + load.toFixed(0) + \"W\" +\n                             \" [shore in \" + remaining + \"s]\";\n            }\n        } else {\n            loadExceedStart = 0;\n            statusFill = \"green\";\n            statusText = \"SOLAR | PV:\" + actual.toFixed(0) + \"W Load:\" + load.toFixed(0) + \"W\" +\n                         \" SOC:\" + soc.toFixed(0) + \"% g:\" + gain.toFixed(2);\n        }\n    }\n}\n\n// ---- Persist ----\nflow.set(\"sp_state\", state);\nflow.set(\"sp_last_transition\", lastTransition);\nflow.set(\"sp_probe_start\", probeStart);\nflow.set(\"sp_probe_estimate\", probeEstimate);\nflow.set(\"sp_load_exceed_start\", loadExceedStart);\n\nnode.status({ fill: statusFill, shape: \"dot\", text: statusText });\n\nif (command !== null) {\n    return { payload: command };\n}\nreturn null;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "// Safe defaults on deploy/restart\nflow.set(\"sp_state\", \"shore\");\nflow.set(\"sp_last_transition\", 0);\nflow.set(\"sp_probe_start\", 0);\nflow.set(\"sp_probe_estimate\", 0);\nflow.set(\"sp_load_exceed_start\", 0);\n// Preserve gain across restarts if already set\nif (!flow.get(\"sp_gain\")) flow.set(\"sp_gain\", 1.0);",
+    "finalize": "",
+    "libs": [],
+    "x": 440,
+    "y": 720,
+    "wires": [
+      [
+        "sp_ac_control",
+        "sp_debug"
+      ]
+    ]
+  },
+  {
+    "id": "sp_ac_control",
+    "type": "victron-output-vebus",
+    "z": "sp_tab_001",
+    "service": "",
+    "path": "/Ac/Control/IgnoreAcIn1",
+    "serviceObj": null,
+    "pathObj": {
+      "path": "/Ac/Control/IgnoreAcIn1",
+      "type": "float",
+      "name": "Ignore AC input 1 (0=accept, 1=ignore)"
+    },
+    "name": "AC Input Control",
+    "x": 760,
+    "y": 700,
+    "wires": []
+  },
+  {
+    "id": "sp_debug",
+    "type": "debug",
+    "z": "sp_tab_001",
+    "name": "Solar Priority transitions",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 760,
+    "y": 780,
+    "wires": []
+  }
+]
