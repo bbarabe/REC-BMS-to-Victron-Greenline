@@ -4,241 +4,168 @@
     "type": "tab",
     "label": "CZone Control",
     "disabled": false,
-    "info": "CZone digital switching via Victron Virtual Switches.\nBidirectional via can0:\n  • Commands (VRM → CZone): PGN 127502 instance 10 (VICTRON Switch Bank PGN Control)\n  • State    (CZone → VRM): PGN 127501 instance 1  (CZone Output Interface)\nv5: Latching on/off for lights; horn + bilge pumps unchanged."
+    "info": "CZone digital switching via Victron Virtual Switches. v6.1 — no Signal-K.\nBidirectional via can0:\n  • State    (CZone → VRM): candump PGN 127501 instance 1 (CZone Output Interface)\n  • Commands (VRM → CZone): cansend PGN 127502 instance 10 (direct set-state, <10ms apply)\nKey behaviors (see specification.md):\n  • Decoder ignores 127501 frames with bank instance ≠ 1 — an unidentified device\n    (src 0x0C) spams instance 0 \"all OFF\" at 5Hz; ingesting it strobed the lights (v6.0 bug).\n  • Keep-alive: CZone reverts a bank-10 commanded output ~10s after the last command\n    frame, so confirmed VRM-commanded ONs are re-asserted every 1s until released.\n  • Confirm-and-retry: resend after 500ms (max 3 tx), revert virtual switch after 5s.\n  • Echo defenses: 12s deploy guard, fresh-state dedupe (<10s), revert-echo guard."
   },
   {
-    "id": "cz_comment_monitor",
+    "id": "cz6_comment_state",
     "type": "comment",
     "z": "czone_tab_v3",
-    "name": "═══ SIGNAL K STATE MONITOR → VIRTUAL SWITCH SYNC ═══",
-    "info": "SK subscribe nodes track CZone state (bank 1) via PGN 127501.\nBank 1 reflects physical output state regardless of which input drove it.\nState Tracker stores state + syncs to virtual switches.\n2-second suppression window after commands to prevent virtual-switch feedback loops.",
-    "x": 280,
-    "y": 30,
+    "name": "═══ CAN STATE MONITOR (candump 127501) → VIRTUAL SWITCH SYNC ═══",
+    "info": "candump can0,01F20D00:03FFFF00 captures PGN 127501 from any source/priority.\nWatchdog pattern from Virtual BMS: pkill stale capture before start, chunk-safe\nline parser, restart 5s after candump exits.\nDecoder trusts ONLY bank instance 1 (the CZone Output Interface). Device 0x0C\nbroadcasts instance 0 all-OFF at 5Hz and must be ignored.",
+    "x": 320,
+    "y": 40,
     "wires": []
   },
   {
-    "id": "cz_sk_sw1",
-    "type": "signalk-subscribe",
+    "id": "cz6_inject_start",
+    "type": "inject",
     "z": "czone_tab_v3",
-    "name": "Sw1 Bilge1",
-    "mode": "sendAll",
-    "flatten": true,
-    "context": "vessels.self",
-    "path": "electrical.switches.bank.1.1.state",
-    "source": "",
-    "period": 1000,
+    "name": "Start candump",
+    "props": [
+      {
+        "p": "payload",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "2",
+    "topic": "",
     "x": 140,
-    "y": 80,
+    "y": 100,
     "wires": [
       [
-        "cz_state_tracker"
+        "cz6_exec_pkill"
       ]
     ]
   },
   {
-    "id": "cz_sk_sw2",
-    "type": "signalk-subscribe",
+    "id": "cz6_exec_pkill",
+    "type": "exec",
     "z": "czone_tab_v3",
-    "name": "Sw2 Bilge2",
-    "mode": "sendAll",
-    "flatten": true,
-    "context": "vessels.self",
-    "path": "electrical.switches.bank.1.2.state",
-    "source": "",
-    "period": 1000,
-    "x": 140,
-    "y": 120,
+    "command": "pkill -f '[c]andump can0,01F20D00:03FFFF00'",
+    "addpay": "",
+    "append": "",
+    "useSpawn": "false",
+    "timer": "",
+    "winHide": false,
+    "oldrc": false,
+    "name": "Kill stale candump",
+    "x": 330,
+    "y": 100,
     "wires": [
+      [],
+      [],
       [
-        "cz_state_tracker"
+        "cz6_exec_candump"
       ]
     ]
   },
   {
-    "id": "cz_sk_sw3",
-    "type": "signalk-subscribe",
+    "id": "cz6_exec_candump",
+    "type": "exec",
     "z": "czone_tab_v3",
-    "name": "Sw3 Horn",
-    "mode": "sendAll",
-    "flatten": true,
-    "context": "vessels.self",
-    "path": "electrical.switches.bank.1.3.state",
-    "source": "",
-    "period": 1000,
-    "x": 130,
+    "command": "candump can0,01F20D00:03FFFF00",
+    "addpay": "",
+    "append": "",
+    "useSpawn": "true",
+    "timer": "",
+    "winHide": false,
+    "oldrc": false,
+    "name": "candump 127501",
+    "x": 340,
     "y": 160,
     "wires": [
       [
-        "cz_state_tracker"
+        "cz6_line_parser"
+      ],
+      [],
+      [
+        "cz6_watchdog"
       ]
     ]
   },
   {
-    "id": "cz_sk_sw4",
-    "type": "signalk-subscribe",
+    "id": "cz6_watchdog",
+    "type": "function",
     "z": "czone_tab_v3",
-    "name": "Sw4 Helm",
-    "mode": "sendAll",
-    "flatten": true,
-    "context": "vessels.self",
-    "path": "electrical.switches.bank.1.4.state",
-    "source": "",
-    "period": 1000,
-    "x": 130,
+    "name": "candump Watchdog",
+    "func": "var n = (flow.get('candump_restarts') || 0) + 1;\nflow.set('candump_restarts', n);\n\nvar rc = (typeof msg.payload === 'object') ? JSON.stringify(msg.payload) : msg.payload;\nnode.warn('czone candump exited (rc ' + rc + ') — restart #' + n + ' in 5s');\nnode.status({ fill: 'red', shape: 'ring', text: 'candump exited — restart #' + n });\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 570,
     "y": 200,
     "wires": [
       [
-        "cz_state_tracker"
+        "cz6_delay_restart"
       ]
     ]
   },
   {
-    "id": "cz_sk_sw5",
-    "type": "signalk-subscribe",
+    "id": "cz6_delay_restart",
+    "type": "delay",
     "z": "czone_tab_v3",
-    "name": "Sw5 Nav",
-    "mode": "sendAll",
-    "flatten": true,
-    "context": "vessels.self",
-    "path": "electrical.switches.bank.1.5.state",
-    "source": "",
-    "period": 1000,
-    "x": 130,
+    "name": "5s restart delay",
+    "pauseType": "delay",
+    "timeout": "5",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "outputs": 1,
+    "x": 340,
     "y": 240,
     "wires": [
       [
-        "cz_state_tracker"
+        "cz6_exec_pkill"
       ]
     ]
   },
   {
-    "id": "cz_sk_sw6",
-    "type": "signalk-subscribe",
-    "z": "czone_tab_v3",
-    "name": "Sw6 Anchor",
-    "mode": "sendAll",
-    "flatten": true,
-    "context": "vessels.self",
-    "path": "electrical.switches.bank.1.6.state",
-    "source": "",
-    "period": 1000,
-    "x": 140,
-    "y": 280,
-    "wires": [
-      [
-        "cz_state_tracker"
-      ]
-    ]
-  },
-  {
-    "id": "cz_sk_sw7",
-    "type": "signalk-subscribe",
-    "z": "czone_tab_v3",
-    "name": "Sw7 Red",
-    "mode": "sendAll",
-    "flatten": true,
-    "context": "vessels.self",
-    "path": "electrical.switches.bank.1.7.state",
-    "source": "",
-    "period": 1000,
-    "x": 130,
-    "y": 320,
-    "wires": [
-      [
-        "cz_state_tracker"
-      ]
-    ]
-  },
-  {
-    "id": "cz_sk_sw8",
-    "type": "signalk-subscribe",
-    "z": "czone_tab_v3",
-    "name": "Sw8 Fly",
-    "mode": "sendAll",
-    "flatten": true,
-    "context": "vessels.self",
-    "path": "electrical.switches.bank.1.8.state",
-    "source": "",
-    "period": 1000,
-    "x": 130,
-    "y": 360,
-    "wires": [
-      [
-        "cz_state_tracker"
-      ]
-    ]
-  },
-  {
-    "id": "cz_sk_sw9",
-    "type": "signalk-subscribe",
-    "z": "czone_tab_v3",
-    "name": "Sw9 Underwater",
-    "mode": "sendAll",
-    "flatten": true,
-    "context": "vessels.self",
-    "path": "electrical.switches.bank.1.9.state",
-    "source": "",
-    "period": 1000,
-    "x": 150,
-    "y": 400,
-    "wires": [
-      [
-        "cz_state_tracker"
-      ]
-    ]
-  },
-  {
-    "id": "cz_sk_sw10",
-    "type": "signalk-subscribe",
-    "z": "czone_tab_v3",
-    "name": "Sw10 Bow1",
-    "mode": "sendAll",
-    "flatten": true,
-    "context": "vessels.self",
-    "path": "electrical.switches.bank.1.10.state",
-    "source": "",
-    "period": 1000,
-    "x": 140,
-    "y": 440,
-    "wires": [
-      [
-        "cz_state_tracker"
-      ]
-    ]
-  },
-  {
-    "id": "cz_sk_sw11",
-    "type": "signalk-subscribe",
-    "z": "czone_tab_v3",
-    "name": "Sw11 Bow2",
-    "mode": "sendAll",
-    "flatten": true,
-    "context": "vessels.self",
-    "path": "electrical.switches.bank.1.11.state",
-    "source": "",
-    "period": 1000,
-    "x": 140,
-    "y": 480,
-    "wires": [
-      [
-        "cz_state_tracker"
-      ]
-    ]
-  },
-  {
-    "id": "cz_state_tracker",
+    "id": "cz6_line_parser",
     "type": "function",
     "z": "czone_tab_v3",
-    "name": "State Tracker (11 out)",
-    "func": "// Extract switch number from SK path\nvar path = msg.topic || '';\nvar m = path.match(/bank\\.1\\.(\\d+)\\.state/);\nif (!m) return null;\n\nvar sw = parseInt(m[1]);\nif (sw < 1 || sw > 11) return null;\n\nvar states = flow.get('switchStates') || {};\nvar oldState = states[sw];\nvar newState = (msg.payload === 1 || msg.payload === '1' || msg.payload === true) ? 1 : 0;\n\n// Always store the real CZone state\nstates[sw] = newState;\nflow.set('switchStates', states);\n\n// Only push to virtual switch when state actually changed.\n// Idempotent D-Bus writes saturate the bus and starve user clicks.\nif (oldState === newState) return null;\n\nvar names = {1:'Bilge1',2:'Bilge2',3:'Horn',4:'Helm',5:'Nav',6:'Anchor',7:'Red',8:'Fly',9:'Underwater',10:'Bow1',11:'Bow2'};\nnode.status({fill: newState ? 'green' : 'grey', shape: 'dot',\n    text: names[sw] + ': ' + (newState ? 'ON' : 'OFF') + ' @' + new Date().toLocaleTimeString()});\n\n// Build sync message for virtual switch\nvar syncMsg = {payload: {}};\nsyncMsg.payload['/SwitchableOutput/output_1/State'] = newState;\nsyncMsg._czoneSync = true;\n\n// Route to correct output (0=sw1 ... 10=sw11)\nvar outputs = [null,null,null,null,null,null,null,null,null,null,null];\noutputs[sw - 1] = syncMsg;\n\nreturn outputs;",
+    "name": "candump Line Parser",
+    "func": "// exec stdout arrives in chunks, not lines: reassemble and decode every line\nvar chunk = msg.payload;\nif (Buffer.isBuffer(chunk)) chunk = chunk.toString('utf8');\nif (typeof chunk !== 'string') return null;\n\nchunk = (context.get('partial') || '') + chunk;\nvar lines = chunk.split('\\n');\ncontext.set('partial', lines.pop());\n\nvar msgs = [];\nfor (var n = 0; n < lines.length; n++) {\n    var match = lines[n].match(/\\scan\\d+\\s+([0-9A-Fa-f]+)\\s+\\[(\\d+)\\]\\s+([0-9A-Fa-f\\s]+)/);\n    if (!match) continue;\n\n    var canid = parseInt(match[1], 16); // full 29-bit ID\n    var hexBytes = match[3].trim().split(/\\s+/);\n    msgs.push({\n        payload: {\n            canid: canid,\n            src: canid & 0xFF,\n            dlc: parseInt(match[2], 10),\n            data: Buffer.from(hexBytes.map(function (h) { return parseInt(h, 16); }))\n        }\n    });\n}\n\nreturn [msgs];",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 580,
+    "y": 160,
+    "wires": [
+      [
+        "cz6_decoder"
+      ]
+    ]
+  },
+  {
+    "id": "cz6_decoder",
+    "type": "function",
+    "z": "czone_tab_v3",
+    "name": "127501 State Decoder (11 out)",
+    "func": "// PGN 127501 (Binary Switch Bank Status) decoder.\n// Trust ONLY bank instance 1 (the CZone Output Interface): another device on the\n// bus (src 0x0C) spams 127501 instance 0 \"all OFF\" at 5Hz — ingesting those flips\n// the tracked state several times a second and strobes the lights (the v6.0 bug).\nvar f = msg.payload;\nif (!f || !f.data || f.data.length < 4) return null;\nif (((f.canid >> 8) & 0x3FFFF) !== 0x1F20D) return null; // 127501 only\nvar d = f.data;\nif (d[0] !== 0x01) return null; // bank instance 1 only\n\nvar now = Date.now();\nvar states = flow.get('czState') || {};\nvar names = {1:'Bilge1',2:'Bilge2',3:'Horn',4:'Helm',5:'Nav',6:'Anchor',7:'Red',8:'Fly',9:'Underwater',10:'Bow1',11:'Bow2'};\nvar outputs = [null,null,null,null,null,null,null,null,null,null,null];\nvar changed = [];\n\nfor (var sw = 1; sw <= 11; sw++) {\n    var v = (d[Math.floor((sw-1)/4)+1] >> (((sw-1)%4)*2)) & 0x03;\n    if (v > 1) continue; // 2/3 = error/unavailable\n    var prev = states[sw];\n    states[sw] = {state: v, ts: now};\n    if (prev && prev.state === v) continue;\n    // Push to virtual switch only on change: idempotent D-Bus writes saturate\n    // the bus and starve user clicks.\n    var m = {payload: {}, _czoneSync: true};\n    m.payload['/SwitchableOutput/output_1/State'] = v;\n    outputs[sw-1] = m;\n    changed.push(names[sw] + (v ? ' ON' : ' OFF'));\n}\nflow.set('czState', states);\n\nif (!changed.length) return null;\nnode.status({fill: 'green', shape: 'dot',\n    text: changed.join(', ') + ' @' + new Date().toLocaleTimeString()});\nreturn outputs;",
     "outputs": 11,
     "timeout": "",
     "noerr": 0,
-    "initialize": "flow.set('switchStates', {});\nflow.set('pendingCmd', {});",
+    "initialize": "flow.set('czState', {});",
     "finalize": "",
     "libs": [],
-    "x": 400,
-    "y": 280,
+    "x": 850,
+    "y": 160,
     "wires": [
       [
         "cz_vs_sw1"
@@ -276,6 +203,31 @@
     ]
   },
   {
+    "id": "cz6_inject_isoreq",
+    "type": "inject",
+    "z": "czone_tab_v3",
+    "name": "ISO Request 127501 (60s)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "cansend can0 18EAFFFE#0DF201",
+        "vt": "str"
+      }
+    ],
+    "repeat": "60",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "4",
+    "topic": "",
+    "x": 170,
+    "y": 300,
+    "wires": [
+      [
+        "cz_exec_send"
+      ]
+    ]
+  },
+  {
     "id": "cz_inject_read",
     "type": "inject",
     "z": "czone_tab_v3",
@@ -299,7 +251,7 @@
     "type": "function",
     "z": "czone_tab_v3",
     "name": "Show All States",
-    "func": "var states = flow.get('switchStates') || {};\nvar names = {1:'Bilge Pump 1',2:'Bilge Pump 2',3:'Horn',4:'Illumination Helm',5:'Navigation Lights',6:'Anchor Light',7:'Red Light',8:'Illumination Fly',9:'Underwater Light',10:'Bow light 1',11:'Bow light 2'};\nvar lines = [];\nfor (var i = 1; i <= 11; i++) {\n    var s = states[i];\n    var st = (s === 1) ? 'ON ' : (s === 0) ? 'OFF' : '???';\n    lines.push('Sw' + (i<10?' ':'') + i + ' ' + st + '  ' + names[i]);\n}\nmsg.payload = lines.join('\\n');\nreturn msg;",
+    "func": "var states = flow.get('czState') || {};\nvar pending = flow.get('czPending') || {};\nvar holds = flow.get('czHolds') || {};\nvar names = {1:'Bilge Pump 1',2:'Bilge Pump 2',3:'Horn',4:'Illumination Helm',5:'Navigation Lights',6:'Anchor Light',7:'Red Light',8:'Illumination Fly',9:'Underwater Light',10:'Bow light 1',11:'Bow light 2'};\nvar now = Date.now();\nvar lines = [];\nfor (var i = 1; i <= 11; i++) {\n    var s = states[i];\n    var st = s ? ((s.state === 1 ? 'ON ' : 'OFF') + ' ' + Math.round((now - s.ts)/1000) + 's ago') : '???';\n    var flags = (pending[i] ? ' [pending ' + (pending[i].target ? 'ON' : 'OFF') + ']' : '') + (holds[i] ? ' [held]' : '');\n    lines.push('Sw' + (i<10?' ':'') + i + ' ' + st + '  ' + names[i] + flags);\n}\nmsg.payload = lines.join('\\n');\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -331,7 +283,7 @@
     "type": "comment",
     "z": "czone_tab_v3",
     "name": "═══ VIRTUAL SWITCHES (VRM UI) ═══",
-    "info": "Input sets state from CZone. Output 2 sends commands to CZone.\n_czoneSync flag prevents feedback loops.",
+    "info": "Input sets state from CZone. Output 2 sends commands to CZone.\nNOTE: the victron-virtual-switch node does NOT preserve message properties from\ninput to output — a state write echoes out the command side without _czoneSync.\nThe engine's deploy guard, fresh-state dedupe and revert-echo guard stop these\nechoes from becoming commands.",
     "x": 230,
     "y": 540,
     "wires": []
@@ -835,9 +787,9 @@
     "id": "cz_comment_engine",
     "type": "comment",
     "z": "czone_tab_v3",
-    "name": "═══ CONTROL ENGINE ═══",
-    "info": "Builds PGN 127502 CAN frames (instance 10 = bank 10).\nSets suppression window to prevent virtual-switch feedback loops.",
-    "x": 590,
+    "name": "═══ CONTROL ENGINE + CONFIRM / RETRY / KEEP-ALIVE ═══",
+    "info": "Control Engine builds PGN 127502 instance 10 frames and registers them pending.\nConfirm & Keep-alive engine (250ms tick):\n  • confirms pending commands against 127501 state newer than the command\n  • resends after 500ms, max 3 transmissions, reverts the virtual switch after 5s\n  • re-asserts confirmed VRM-commanded ONs every 1s (CZone reverts bank-10\n    commands ~10s after the last frame — measured 2026-07-02)\nHolds live in flow context: a redeploy drops them and VRM-lit circuits turn off\n~10s later (accepted limitation).",
+    "x": 680,
     "y": 540,
     "wires": []
   },
@@ -860,16 +812,117 @@
     "type": "function",
     "z": "czone_tab_v3",
     "name": "Control Engine",
-    "func": "// CZone Control Engine v5\n// Input: { switch: 1-11, action: 'on'|'off'|'toggle' }\n// Bank 10: all circuits accept direct on/off via PGN 127502.\n// Sets brief suppression window to prevent virtual-switch feedback loops.\n\nvar cmd = msg.payload;\nif (!cmd || !cmd.switch || !cmd.action) {\n    node.warn('Need {switch: 1-11, action: on|off|toggle}');\n    return null;\n}\n\nvar sw = parseInt(cmd.switch);\nvar action = cmd.action.toLowerCase();\nif (sw < 1 || sw > 11) { node.warn('Switch must be 1-11'); return null; }\n\nvar states = flow.get('switchStates') || {};\nvar cur = states[sw];\nvar isOn = (cur === 1);\nvar known = (cur !== undefined);\n\nvar names = {1:'Bilge Pump 1',2:'Bilge Pump 2',3:'Horn',4:'Helm Lights',5:'Nav Lights',6:'Anchor Light',7:'Red Light',8:'Flybridge Lights',9:'Underwater Light',10:'Bow Light 1',11:'Bow Light 2'};\n\nvar sendValue = -1;\nvar reason = '';\n\nif (action === 'on') {\n    if (known && isOn) { node.status({fill:'yellow',shape:'ring',text:names[sw]+' already ON'}); return null; }\n    sendValue = 1; reason = 'ON';\n} else if (action === 'off') {\n    if (known && !isOn) { node.status({fill:'yellow',shape:'ring',text:names[sw]+' already OFF'}); return null; }\n    sendValue = 0; reason = 'OFF';\n} else if (action === 'toggle') {\n    sendValue = isOn ? 0 : 1;\n    reason = isOn ? 'toggle→OFF' : 'toggle→ON';\n}\n\nif (sendValue < 0) return null;\n\n// Set suppression window: State Tracker will ignore SK syncs\n// for this switch briefly to prevent virtual-switch feedback loops\nvar pending = flow.get('pendingCmd') || {};\npending[sw] = Date.now();\nflow.set('pendingCmd', pending);\n\n// Build PGN 127502: byte 0 = instance 10, bytes 1-7 = switch commands\n// 2 bits per switch: 00=Off, 01=On, 11=NoChange (0xFF = all NoChange)\nvar data = [0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];\nvar byteIdx = Math.floor((sw - 1) / 4) + 1;\nvar bitPos = ((sw - 1) % 4) * 2;\nvar mask = ~(0x03 << bitPos) & 0xFF;\ndata[byteIdx] = (data[byteIdx] & mask) | (sendValue << bitPos);\n\nvar hex = data.map(function(b) { return ('0'+b.toString(16).toUpperCase()).slice(-2); }).join('');\n\nmsg.payload = 'cansend can0 09F20EFE#' + hex;\nmsg.switchNum = sw;\nmsg.switchName = names[sw];\nmsg.reason = reason;\n\nnode.status({fill:'blue',shape:'dot',text:names[sw]+' '+reason+' @'+new Date().toLocaleTimeString()});\nreturn msg;",
+    "func": "// CZone Control Engine v6.1\n// Input: { switch: 1-11, action: 'on'|'off'|'toggle' }\n// Sends PGN 127502 instance 10 — direct set-state (confirmed by bus capture\n// 2026-07-06: CZone applies bank-10 commands in <10ms, accepts source 0xFE).\n// Confirmation, retry and keep-alive run in the Confirm & Keep-alive engine.\n\nvar now = Date.now();\n\n// Deploy-echo guard: on (re)deploy every virtual switch emits its initial OFF\n// out the command side before any 127501 has been decoded. Drop everything for\n// 12s — by then candump is running and real state is synced into the switches.\nvar deployTs = flow.get('deployTs') || 0;\nif (now - deployTs < 12000) {\n    node.status({fill:'grey', shape:'ring', text:'deploy guard (' + Math.ceil((12000 - (now - deployTs))/1000) + 's left)'});\n    return null;\n}\n\nvar cmd = msg.payload;\nif (!cmd || !cmd.switch || !cmd.action) {\n    node.warn('Need {switch: 1-11, action: on|off|toggle}');\n    return null;\n}\n\nvar sw = parseInt(cmd.switch);\nvar action = String(cmd.action).toLowerCase();\nif (!(sw >= 1 && sw <= 11)) { node.warn('Switch must be 1-11'); return null; }\n\nvar names = {1:'Bilge Pump 1',2:'Bilge Pump 2',3:'Horn',4:'Helm Lights',5:'Nav Lights',6:'Anchor Light',7:'Red Light',8:'Flybridge Lights',9:'Underwater Light',10:'Bow Light 1',11:'Bow Light 2'};\n\nvar states = flow.get('czState') || {};\nvar st = states[sw];\nvar fresh = st && (now - st.ts < 10000); // stale state never blocks a command\n\nvar target;\nif (action === 'on') target = 1;\nelse if (action === 'off') target = 0;\nelse if (action === 'toggle') target = (st && st.state === 1) ? 0 : 1;\nelse return null;\n\n// Revert-echo guard: the virtual-switch node strips _czoneSync, so a revert\n// write echoes back out the command side. Drop commands mirroring a recent revert.\nvar rr = (flow.get('czRecentRevert') || {})[sw];\nif (rr && rr.value === target && now - rr.ts < 3000) {\n    node.status({fill:'grey', shape:'ring', text:names[sw] + ' revert echo dropped'});\n    return null;\n}\n\n// Fresh-state dedupe: stops sync echoes from becoming commands. Also correct for\n// keypad-lit circuits: CZone latches those natively, no hold needed.\nif (fresh && st.state === target) {\n    node.status({fill:'yellow', shape:'ring', text:names[sw] + ' already ' + (target ? 'ON' : 'OFF')});\n    return null;\n}\n\nvar pending = flow.get('czPending') || {};\nvar p = pending[sw];\nif (p && p.target === target) {\n    node.status({fill:'yellow', shape:'ring', text:names[sw] + ' already pending'});\n    return null;\n}\npending[sw] = {target: target, cmdTs: now, lastSend: now, sends: 1};\nflow.set('czPending', pending);\n\n// An OFF releases the keep-alive hold immediately so it can't fight the command\nif (target === 0) {\n    var holds = flow.get('czHolds') || {};\n    if (holds[sw]) { delete holds[sw]; flow.set('czHolds', holds); }\n}\n\n// Build PGN 127502 instance 10: 2 bits per switch, 00=Off 01=On 11=NoChange\nvar data = [0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];\nvar byteIdx = Math.floor((sw - 1) / 4) + 1;\nvar bitPos = ((sw - 1) % 4) * 2;\ndata[byteIdx] = (data[byteIdx] & (~(0x03 << bitPos) & 0xFF)) | (target << bitPos);\nvar hex = data.map(function(b) { return ('0' + b.toString(16).toUpperCase()).slice(-2); }).join('');\n\nmsg.payload = 'cansend can0 09F20EFE#' + hex;\nmsg.switchNum = sw;\nmsg.switchName = names[sw];\nmsg.reason = target ? 'ON' : 'OFF';\n\nnode.status({fill:'blue', shape:'dot', text:names[sw] + ' ' + msg.reason + ' @' + new Date().toLocaleTimeString()});\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
+    "initialize": "flow.set('deployTs', Date.now());\nflow.set('czPending', {});\nflow.set('czHolds', {});\nflow.set('czRecentRevert', {});",
+    "finalize": "",
+    "libs": [],
     "x": 590,
     "y": 600,
     "wires": [
       [
         "cz_exec_send",
         "cz_debug_cmd"
+      ]
+    ]
+  },
+  {
+    "id": "cz6_tick",
+    "type": "inject",
+    "z": "czone_tab_v3",
+    "name": "250ms tick",
+    "props": [
+      {
+        "p": "payload",
+        "v": "",
+        "vt": "date"
+      }
+    ],
+    "repeat": "0.25",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "1",
+    "topic": "",
+    "x": 130,
+    "y": 380,
+    "wires": [
+      [
+        "cz6_confirm"
+      ]
+    ]
+  },
+  {
+    "id": "cz6_confirm",
+    "type": "function",
+    "z": "czone_tab_v3",
+    "name": "Confirm & Keep-alive Engine",
+    "func": "// Runs every 250ms.\n// 1) Confirm pending commands against 127501 state newer than the command;\n//    resend after 500ms (max 3 transmissions); give up and revert after 5s.\n// 2) Keep-alive: CZone reverts a bank-10 commanded output ~10s after the last\n//    command frame (measured 2026-07-02), so confirmed VRM-commanded ONs are\n//    re-asserted every 1s. A hold is released when an OFF is commanded or the\n//    output is observed OFF with no command in flight (keypad/CZone turned it\n//    off). Keypad-lit circuits are never held: CZone latches those natively.\n\nvar now = Date.now();\nvar states = flow.get('czState') || {};\nvar pending = flow.get('czPending') || {};\nvar holds = flow.get('czHolds') || {};\nvar names = {1:'Bilge Pump 1',2:'Bilge Pump 2',3:'Horn',4:'Helm Lights',5:'Nav Lights',6:'Anchor Light',7:'Red Light',8:'Flybridge Lights',9:'Underwater Light',10:'Bow Light 1',11:'Bow Light 2'};\n\nfunction frame(sw, val) {\n    var data = [0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];\n    var byteIdx = Math.floor((sw - 1) / 4) + 1;\n    var bitPos = ((sw - 1) % 4) * 2;\n    data[byteIdx] = (data[byteIdx] & (~(0x03 << bitPos) & 0xFF)) | (val << bitPos);\n    return 'cansend can0 09F20EFE#' + data.map(function(b) { return ('0' + b.toString(16).toUpperCase()).slice(-2); }).join('');\n}\n\nvar sends = [];\nvar reverts = [];\n\nObject.keys(pending).forEach(function(k) {\n    var sw = parseInt(k), p = pending[k];\n    var st = states[sw];\n    if (st && st.ts >= p.cmdTs && st.state === p.target) {\n        // Confirmed. VRM-commanded ONs get a keep-alive hold.\n        delete pending[k];\n        if (p.target === 1) holds[sw] = {lastAssert: now};\n        return;\n    }\n    if (now - p.cmdTs > 5000) {\n        // Give up: revert the virtual switch to the last real CZone state.\n        delete pending[k];\n        var rv = st ? st.state : 0;\n        var rr = flow.get('czRecentRevert') || {};\n        rr[sw] = {value: rv, ts: now};\n        flow.set('czRecentRevert', rr);\n        reverts.push({sw: sw, state: rv});\n        node.warn('CZone: ' + names[sw] + ' ' + (p.target ? 'ON' : 'OFF') + ' unconfirmed after 5s (' + p.sends + ' tx) — reverting virtual switch');\n        return;\n    }\n    if (now - p.lastSend >= 500 && p.sends < 3) {\n        sends.push({payload: frame(sw, p.target)});\n        p.lastSend = now;\n        p.sends++;\n    }\n});\n\nObject.keys(holds).forEach(function(k) {\n    var sw = parseInt(k), h = holds[k];\n    if (pending[sw]) return; // a command in flight owns this switch\n    var st = states[sw];\n    if (st && st.state === 0 && st.ts > h.lastAssert) {\n        // Observed OFF newer than our last assert: keypad/CZone turned it off.\n        // The decoder already synced the virtual switch; just release the hold.\n        delete holds[k];\n        return;\n    }\n    if (now - h.lastAssert >= 1000) {\n        sends.push({payload: frame(sw, 1)});\n        h.lastAssert = now;\n    }\n});\n\nflow.set('czPending', pending);\nflow.set('czHolds', holds);\n\nvar held = Object.keys(holds);\nvar nPend = Object.keys(pending).length;\nnode.status({fill: (held.length || nPend) ? 'blue' : 'grey', shape: 'dot',\n    text: (nPend ? nPend + ' pending, ' : '') + (held.length ? 'holding: ' + held.map(function(k) { return names[k]; }).join(', ') : 'idle')});\n\nreturn [sends, reverts];",
+    "outputs": 2,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 360,
+    "y": 380,
+    "wires": [
+      [
+        "cz_exec_send"
+      ],
+      [
+        "cz6_vs_router"
+      ]
+    ]
+  },
+  {
+    "id": "cz6_vs_router",
+    "type": "function",
+    "z": "czone_tab_v3",
+    "name": "Revert → VS Router (11 out)",
+    "func": "// Route {sw, state} revert messages to the right virtual switch input\nvar sw = msg.sw;\nif (!(sw >= 1 && sw <= 11)) return null;\nvar outputs = [null,null,null,null,null,null,null,null,null,null,null];\nvar m = {payload: {}, _czoneSync: true};\nm.payload['/SwitchableOutput/output_1/State'] = msg.state;\noutputs[sw - 1] = m;\nreturn outputs;",
+    "outputs": 11,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 640,
+    "y": 420,
+    "wires": [
+      [
+        "cz_vs_sw1"
+      ],
+      [
+        "cz_vs_sw2"
+      ],
+      [
+        "cz_vs_sw3"
+      ],
+      [
+        "cz_vs_sw4"
+      ],
+      [
+        "cz_vs_sw5"
+      ],
+      [
+        "cz_vs_sw6"
+      ],
+      [
+        "cz_vs_sw7"
+      ],
+      [
+        "cz_vs_sw8"
+      ],
+      [
+        "cz_vs_sw9"
+      ],
+      [
+        "cz_vs_sw10"
+      ],
+      [
+        "cz_vs_sw11"
       ]
     ]
   },
@@ -925,7 +978,7 @@
     "finalize": "",
     "libs": [],
     "x": 870,
-    "y": 640,
+    "y": 660,
     "wires": [
       [
         "cz_debug_err"
@@ -946,7 +999,7 @@
     "statusVal": "payload",
     "statusType": "auto",
     "x": 970,
-    "y": 640,
+    "y": 700,
     "wires": []
   },
   {

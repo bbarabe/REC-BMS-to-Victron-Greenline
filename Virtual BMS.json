@@ -28,7 +28,7 @@
     "y": 260,
     "wires": [
       [
-        "bms03a00000000010"
+        "bms03a00000000012"
       ]
     ]
   },
@@ -54,7 +54,8 @@
         "bms03d00000000001"
       ],
       [
-        "bms03d00000000002"
+        "bms03d00000000002",
+        "bms03a00000000013"
       ]
     ]
   },
@@ -97,7 +98,7 @@
     "type": "function",
     "z": "feb92f911e56ae11",
     "name": "candump Line Parser",
-    "func": "var line = msg.payload;\nif (typeof line !== 'string') return null;\n\nvar match = line.match(/\\s+can\\d+\\s+([0-9A-Fa-f]+)\\s+\\[(\\d)\\]\\s+(.+)/);\nif (!match) return null;\n\nvar rawid = parseInt(match[1], 16);\nvar canid = rawid & 0x7FF;\nvar dlc = parseInt(match[2]);\nvar hexBytes = match[3].trim().split(/\\s+/);\nvar data = Buffer.from(hexBytes.map(function(h) { return parseInt(h, 16); }));\n\nmsg.payload = { canid: canid, dlc: dlc, data: data };\nmsg.topic = \"0x\" + canid.toString(16).toUpperCase();\nreturn msg;",
+    "func": "// exec stdout arrives in chunks, not lines: reassemble and decode every line\nvar chunk = msg.payload;\nif (Buffer.isBuffer(chunk)) chunk = chunk.toString('utf8');\nif (typeof chunk !== 'string') return null;\n\nchunk = (context.get('partial') || '') + chunk;\nvar lines = chunk.split('\\n');\ncontext.set('partial', lines.pop());\n\nvar msgs = [];\nfor (var n = 0; n < lines.length; n++) {\n    var match = lines[n].match(/\\scan\\d+\\s+([0-9A-Fa-f]+)\\s+\\[(\\d+)\\]\\s+([0-9A-Fa-f\\s]+)/);\n    if (!match) continue;\n\n    var rawid = parseInt(match[1], 16);\n    var canid = rawid & 0x7FF;\n    var dlc = parseInt(match[2], 10);\n    var hexBytes = match[3].trim().split(/\\s+/);\n    var data = Buffer.from(hexBytes.map(function (h) { return parseInt(h, 16); }));\n\n    msgs.push({\n        payload: { canid: canid, dlc: dlc, data: data },\n        topic: '0x' + canid.toString(16).toUpperCase()\n    });\n}\n\nreturn [msgs];",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -135,7 +136,7 @@
     "type": "function",
     "z": "feb92f911e56ae11",
     "name": "CAN Frame Decoder",
-    "func": "var id = msg.payload.canid;\nvar d = msg.payload.data;\n\nif (id < 0x351 || id > 0x404) return null;\n\nvar bms = flow.get(\"bms_live\") || {};\nbms._lastUpdate = Date.now();\nvar decoded = { canId: \"0x\" + id.toString(16).toUpperCase() };\n\nswitch (id) {\n    case 0x351:\n        bms.cvl = d.readUInt16LE(0) / 10;\n        bms.ccl = d.readUInt16LE(2) / 10;\n        bms.dcl = d.readUInt16LE(4) / 10;\n        bms.dvl = d.readUInt16LE(6) / 10;\n        decoded.name = \"Limits\";\n        decoded.cvl = bms.cvl;\n        decoded.ccl = bms.ccl;\n        decoded.dcl = bms.dcl;\n        decoded.dvl = bms.dvl;\n        break;\n\n    case 0x355:\n        bms.soc = d.readUInt16LE(0);\n        bms.soh = d.readUInt16LE(2);\n        if (d.length >= 6) {\n            bms.socHiRes = d.readUInt16LE(4) / 100;\n        }\n        decoded.name = \"SOC/SOH\";\n        decoded.soc = bms.soc;\n        decoded.soh = bms.soh;\n        decoded.socHiRes = bms.socHiRes;\n        break;\n\n    case 0x356:\n        bms.voltage = d.readInt16LE(0) / 100;\n        bms.current = d.readInt16LE(2) / 10;\n        bms.temperature = d.readInt16LE(4) / 10;\n        bms.chargeCycles = d.readUInt16LE(6);\n        decoded.name = \"DC Bus\";\n        decoded.voltage = bms.voltage;\n        decoded.current = bms.current;\n        decoded.temperature = bms.temperature;\n        decoded.power = Math.round(bms.voltage * bms.current * 10) / 10;\n        decoded.chargeCycles = bms.chargeCycles;\n        break;\n\n    case 0x35E:\n        bms.manufacturer = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Manufacturer\";\n        decoded.manufacturer = bms.manufacturer;\n        break;\n\n    case 0x35F:\n        bms.chemistry = d.readUInt8(0);\n        bms.hwVersion = d.readUInt8(2) + '.' + d.readUInt8(3);\n        bms.fwVersion = d.readUInt16LE(4);\n        decoded.name = \"Version Info\";\n        decoded.chemistry = bms.chemistry;\n        decoded.hwVersion = bms.hwVersion;\n        decoded.fwVersion = bms.fwVersion;\n        break;\n\n    case 0x360:\n        bms.forceCharge = d.readUInt8(0) === 0xFF;\n        decoded.name = \"Force Charge\";\n        decoded.forceCharge = bms.forceCharge;\n        break;\n\n    case 0x370:\n        bms.productName = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Product Name\";\n        decoded.productName = bms.productName;\n        break;\n\n    case 0x371:\n        bms.batteryName = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Battery Name\";\n        decoded.batteryName = bms.batteryName;\n        break;\n\n    case 0x372:\n        bms.modulesOnline = d.readUInt16LE(0);\n        bms.modulesBlockingCharge = d.readUInt16LE(2);\n        bms.modulesBlockingDischarge = d.readUInt16LE(4);\n        bms.modulesOffline = d.readUInt16LE(6);\n        bms.nrModules = bms.modulesOnline;\n        decoded.name = \"Module Status\";\n        decoded.modulesOnline = bms.modulesOnline;\n        decoded.modulesBlockingCharge = bms.modulesBlockingCharge;\n        decoded.modulesBlockingDischarge = bms.modulesBlockingDischarge;\n        decoded.modulesOffline = bms.modulesOffline;\n        break;\n\n    case 0x373:\n        bms.minCellV = d.readUInt16LE(0) / 1000;\n        bms.maxCellV = d.readUInt16LE(2) / 1000;\n        bms.minCellT = d.readInt16LE(4) - 273;\n        bms.maxCellT = d.readInt16LE(6) - 273;\n        decoded.name = \"Cell Min/Max\";\n        decoded.minCellV = bms.minCellV;\n        decoded.maxCellV = bms.maxCellV;\n        decoded.cellDeltaMv = Math.round((bms.maxCellV - bms.minCellV) * 1000);\n        decoded.minCellT = bms.minCellT;\n        decoded.maxCellT = bms.maxCellT;\n        break;\n\n    case 0x374: case 0x375: case 0x376: case 0x377:\n        if (!bms.moduleIds) bms.moduleIds = {};\n        var modId = d.toString('ascii').replace(/\\0/g, '');\n        bms.moduleIds[id.toString(16)] = modId;\n        decoded.name = \"Module ID (0x\" + id.toString(16) + \")\";\n        decoded.moduleId = modId;\n        break;\n\n    case 0x379:\n        bms.capacity = d.readUInt16LE(0);\n        decoded.name = \"Capacity\";\n        decoded.capacityAh = bms.capacity;\n        break;\n\n    case 0x380:\n        bms.serial = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Serial Number\";\n        decoded.serial = bms.serial;\n        break;\n\n    case 0x381:\n        bms.alarm381 = d.toJSON().data;\n        decoded.name = \"Alarms Block 2\";\n        decoded.rawBytes = d.toJSON().data;\n        decoded.rawHex = Array.from(d).map(function(b) {\n            return b.toString(16).toUpperCase().padStart(2, '0');\n        }).join(' ');\n        decoded.NOTE = \"NOT YET DECODED — need REC-BMS alarm bit mapping\";\n        break;\n\n    case 0x404:\n        bms.statusByte = d.readUInt8(0);\n        decoded.name = \"BMS Status\";\n        decoded.statusByte = bms.statusByte;\n        decoded.rawHex = Array.from(d).map(function(b) {\n            return b.toString(16).toUpperCase().padStart(2, '0');\n        }).join(' ');\n        break;\n\n    default:\n        return null;\n}\n\nflow.set(\"bms_live\", bms);\n\nvar v = bms.voltage || 0;\nvar i = bms.current || 0;\nvar s = bms.soc || 0;\nnode.status({\n    fill: \"green\", shape: \"dot\",\n    text: decoded.name + \" | \" + v.toFixed(1) + \"V \" +\n          i.toFixed(1) + \"A \" + s + \"%\"\n});\n\nmsg.payload = decoded;\nmsg.topic = decoded.canId + \" \" + decoded.name;\nreturn msg;",
+    "func": "var id = msg.payload.canid;\nvar d = msg.payload.data;\n\nif (id < 0x351 || id > 0x404) return null;\n\n// Minimum data length per frame (guards buffer reads against short/corrupt frames)\nvar MIN_LEN = {\n    0x351: 8, 0x355: 4, 0x356: 8, 0x35E: 1, 0x35F: 6, 0x360: 1,\n    0x370: 1, 0x371: 1, 0x372: 8, 0x373: 8, 0x374: 1, 0x375: 1,\n    0x376: 1, 0x377: 1, 0x379: 2, 0x380: 1, 0x381: 1, 0x404: 1\n};\nif (MIN_LEN[id] === undefined) return null;\nif (!Buffer.isBuffer(d) || d.length < MIN_LEN[id]) {\n    var lastWarn = context.get('lastShortWarn') || 0;\n    if (Date.now() - lastWarn > 60000) {\n        node.warn('Dropped short/invalid frame 0x' + id.toString(16).toUpperCase() +\n                  ' (len ' + (Buffer.isBuffer(d) ? d.length : 'n/a') + ', need ' + MIN_LEN[id] + ')');\n        context.set('lastShortWarn', Date.now());\n    }\n    return null;\n}\n\nvar bms = flow.get(\"bms_live\") || {};\nvar decoded = { canId: \"0x\" + id.toString(16).toUpperCase() };\n\nswitch (id) {\n    case 0x351:\n        bms.cvl = d.readUInt16LE(0) / 10;\n        bms.ccl = d.readUInt16LE(2) / 10;\n        bms.dcl = d.readUInt16LE(4) / 10;\n        bms.dvl = d.readUInt16LE(6) / 10;\n        decoded.name = \"Limits\";\n        decoded.cvl = bms.cvl;\n        decoded.ccl = bms.ccl;\n        decoded.dcl = bms.dcl;\n        decoded.dvl = bms.dvl;\n        break;\n\n    case 0x355:\n        bms.soc = d.readUInt16LE(0);\n        bms.soh = d.readUInt16LE(2);\n        if (d.length >= 6) {\n            bms.socHiRes = d.readUInt16LE(4) / 100;\n        }\n        decoded.name = \"SOC/SOH\";\n        decoded.soc = bms.soc;\n        decoded.soh = bms.soh;\n        decoded.socHiRes = bms.socHiRes;\n        break;\n\n    case 0x356:\n        bms.voltage = d.readInt16LE(0) / 100;\n        bms.current = d.readInt16LE(2) / 10;\n        bms.temperature = d.readInt16LE(4) / 10;\n        bms.chargeCycles = d.readUInt16LE(6);\n        decoded.name = \"DC Bus\";\n        decoded.voltage = bms.voltage;\n        decoded.current = bms.current;\n        decoded.temperature = bms.temperature;\n        decoded.power = Math.round(bms.voltage * bms.current * 10) / 10;\n        decoded.chargeCycles = bms.chargeCycles;\n        break;\n\n    case 0x35E:\n        bms.manufacturer = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Manufacturer\";\n        decoded.manufacturer = bms.manufacturer;\n        break;\n\n    case 0x35F:\n        bms.chemistry = d.readUInt8(0);\n        bms.hwVersion = d.readUInt8(2) + '.' + d.readUInt8(3);\n        bms.fwVersion = d.readUInt16LE(4);\n        decoded.name = \"Version Info\";\n        decoded.chemistry = bms.chemistry;\n        decoded.hwVersion = bms.hwVersion;\n        decoded.fwVersion = bms.fwVersion;\n        break;\n\n    case 0x360:\n        bms.forceCharge = d.readUInt8(0) === 0xFF;\n        decoded.name = \"Force Charge\";\n        decoded.forceCharge = bms.forceCharge;\n        break;\n\n    case 0x370:\n        bms.productName = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Product Name\";\n        decoded.productName = bms.productName;\n        break;\n\n    case 0x371:\n        bms.batteryName = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Battery Name\";\n        decoded.batteryName = bms.batteryName;\n        break;\n\n    case 0x372:\n        bms.modulesOnline = d.readUInt16LE(0);\n        bms.modulesBlockingCharge = d.readUInt16LE(2);\n        bms.modulesBlockingDischarge = d.readUInt16LE(4);\n        bms.modulesOffline = d.readUInt16LE(6);\n        bms.nrModules = bms.modulesOnline;\n        decoded.name = \"Module Status\";\n        decoded.modulesOnline = bms.modulesOnline;\n        decoded.modulesBlockingCharge = bms.modulesBlockingCharge;\n        decoded.modulesBlockingDischarge = bms.modulesBlockingDischarge;\n        decoded.modulesOffline = bms.modulesOffline;\n        break;\n\n    case 0x373:\n        bms.minCellV = d.readUInt16LE(0) / 1000;\n        bms.maxCellV = d.readUInt16LE(2) / 1000;\n        bms.minCellT = d.readInt16LE(4) - 273;\n        bms.maxCellT = d.readInt16LE(6) - 273;\n        decoded.name = \"Cell Min/Max\";\n        decoded.minCellV = bms.minCellV;\n        decoded.maxCellV = bms.maxCellV;\n        decoded.cellDeltaMv = Math.round((bms.maxCellV - bms.minCellV) * 1000);\n        decoded.minCellT = bms.minCellT;\n        decoded.maxCellT = bms.maxCellT;\n        break;\n\n    case 0x374: case 0x375: case 0x376: case 0x377:\n        if (!bms.moduleIds) bms.moduleIds = {};\n        var modId = d.toString('ascii').replace(/\\0/g, '');\n        bms.moduleIds[id.toString(16)] = modId;\n        decoded.name = \"Module ID (0x\" + id.toString(16) + \")\";\n        decoded.moduleId = modId;\n        break;\n\n    case 0x379:\n        bms.capacity = d.readUInt16LE(0);\n        decoded.name = \"Capacity\";\n        decoded.capacityAh = bms.capacity;\n        break;\n\n    case 0x380:\n        bms.serial = d.toString('ascii').replace(/\\0/g, '');\n        decoded.name = \"Serial Number\";\n        decoded.serial = bms.serial;\n        break;\n\n    case 0x381:\n        bms.alarm381 = d.toJSON().data;\n        decoded.name = \"Alarms Block 2\";\n        decoded.rawBytes = d.toJSON().data;\n        decoded.rawHex = Array.from(d).map(function(b) {\n            return b.toString(16).toUpperCase().padStart(2, '0');\n        }).join(' ');\n        decoded.NOTE = \"NOT YET DECODED — need REC-BMS alarm bit mapping\";\n        break;\n\n    case 0x404:\n        bms.statusByte = d.readUInt8(0);\n        decoded.name = \"BMS Status\";\n        decoded.statusByte = bms.statusByte;\n        decoded.rawHex = Array.from(d).map(function(b) {\n            return b.toString(16).toUpperCase().padStart(2, '0');\n        }).join(' ');\n        break;\n\n    default:\n        return null;\n}\n\n// Only successfully decoded frames refresh staleness\nbms._lastUpdate = Date.now();\nflow.set(\"bms_live\", bms);\n\nvar v = bms.voltage || 0;\nvar i = bms.current || 0;\nvar s = bms.soc || 0;\nnode.status({\n    fill: \"green\", shape: \"dot\",\n    text: decoded.name + \" | \" + v.toFixed(1) + \"V \" +\n          i.toFixed(1) + \"A \" + s + \"%\"\n});\n\nmsg.payload = decoded;\nmsg.topic = decoded.canId + \" \" + decoded.name;\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -197,7 +198,7 @@
     "type": "function",
     "z": "feb92f911e56ae11",
     "name": "Read Full BMS State",
-    "func": "var bms = flow.get(\"bms_live\") || {};\nvar eq = flow.get(\"equalization\") || {};\nvar slider = flow.get(\"charge_slider\");\nvar age = bms._lastUpdate ? (Date.now() - bms._lastUpdate) : -1;\nvar now = Date.now();\n\nmsg.payload = {\n    _meta: {\n        lastUpdateAge: age >= 0 ? (age / 1000).toFixed(1) + \"s\" : \"never\",\n        isLive: age >= 0 && age <= 10000\n    },\n\n    equalization: {\n        active: eq.active || false,\n        lastCompleted: eq.lastCompleted ? new Date(eq.lastCompleted).toISOString() : \"never\",\n        lastCompletedAge: eq.lastCompleted ? Math.round((now - eq.lastCompleted) / 3600000) + \"h ago\" : \"never\",\n        startTime: eq.active ? new Date(eq.startTime).toISOString() : null,\n        elapsedMin: eq.active ? Math.round((now - eq.startTime) / 60000) + \"min\" : null,\n        slider: slider !== undefined ? slider + \"%\" : \"unknown\",\n        normalCVL: slider !== undefined ? (54.0 + (slider - 40) / 60 * 7.96).toFixed(2) + \"V\" : \"unknown\",\n        eqCVL: slider !== undefined ? (54.0 + (slider - 40) / 60 * 7.96 + 0.44).toFixed(2) + \"V\" : \"unknown\"\n    },\n\n    limits: {\n        cvl: bms.cvl,\n        ccl: bms.ccl,\n        dcl: bms.dcl,\n        dvl: bms.dvl\n    },\n\n    dcBus: {\n        voltage: bms.voltage,\n        current: bms.current,\n        power: bms.voltage && bms.current ?\n            Math.round(bms.voltage * bms.current * 10) / 10 : null,\n        temperature: bms.temperature\n    },\n\n    stateOfCharge: {\n        soc: bms.soc,\n        soh: bms.soh,\n        socHiRes: bms.socHiRes,\n        capacity: bms.capacity\n    },\n\n    cells: {\n        minVoltage: bms.minCellV,\n        maxVoltage: bms.maxCellV,\n        deltaMv: bms.minCellV && bms.maxCellV ?\n            Math.round((bms.maxCellV - bms.minCellV) * 1000) : null,\n        minTemp: bms.minCellT,\n        maxTemp: bms.maxCellT,\n        nrModules: bms.nrModules,\n        moduleIds: bms.moduleIds\n    },\n\n    identity: {\n        manufacturer: bms.manufacturer,\n        productName: bms.productName,\n        batteryName: bms.batteryName,\n        serial: bms.serial,\n        chemistry: bms.chemistry,\n        hwVersion: bms.hwVersion,\n        fwVersion: bms.fwVersion\n    },\n\n    forceCharge: bms.forceCharge,\n\n    moduleStatus: {\n        online: bms.modulesOnline,\n        blockingCharge: bms.modulesBlockingCharge,\n        blockingDischarge: bms.modulesBlockingDischarge,\n        offline: bms.modulesOffline\n    },\n\n    chargeCycles: bms.chargeCycles,\n\n    status: {\n        frame381_raw: bms.alarm381,\n        statusByte: bms.statusByte,\n        NOTE: \"REC-BMS does not publish alarm state via CAN — no 0x35A frame\"\n    },\n\n    NOT_FORWARDED_TO_DBUS: [\n        \"soh — virtual battery rejects /Soh\",\n        \"socHiRes — could replace /Soc for smoother readings\",\n        \"capacity — virtual battery rejects /Capacity\",\n        \"consumedAmphours — virtual battery rejects /ConsumedAmphours\",\n        \"timeToGo — virtual battery rejects /TimeToGo\",\n        \"hwVersion — virtual battery rejects /HardwareVersion\",\n        \"fwVersion — virtual battery rejects /FirmwareVersion\",\n        \"serial — virtual battery rejects /Serial\",\n        \"minCellV/maxCellV — virtual battery rejects /System/*\",\n        \"minCellT/maxCellT — virtual battery rejects /System/*\",\n        \"nrModules — virtual battery rejects /System/*\",\n        \"alarm360/381 raw — need REC-BMS bit mapping\",\n        \"statusByte — need REC-BMS status mapping\",\n        \"moduleIds — no standard dbus path\",\n        \"chemistry — informational only\"\n    ]\n};\n\nmsg.topic = \"Full BMS State Dump\";\nreturn msg;",
+    "func": "var bms = flow.get(\"bms_live\") || {};\nvar eq = flow.get(\"equalization\") || {};\nvar slider = flow.get(\"charge_slider\");\nvar age = bms._lastUpdate ? (Date.now() - bms._lastUpdate) : -1;\nvar now = Date.now();\n\nmsg.payload = {\n    _meta: {\n        lastUpdateAge: age >= 0 ? (age / 1000).toFixed(1) + \"s\" : \"never\",\n        isLive: age >= 0 && age <= 60000\n    },\n\n    equalization: {\n        active: eq.active || false,\n        lastCompleted: eq.lastCompleted ? new Date(eq.lastCompleted).toISOString() : \"never\",\n        lastCompletedAge: eq.lastCompleted ? Math.round((now - eq.lastCompleted) / 3600000) + \"h ago\" : \"never\",\n        startTime: eq.active ? new Date(eq.startTime).toISOString() : null,\n        elapsedMin: eq.active ? Math.round((now - eq.startTime) / 60000) + \"min\" : null,\n        slider: slider !== undefined ? slider + \"%\" : \"unknown\",\n        normalCVL: slider !== undefined ? (54.0 + (slider - 40) / 60 * 7.96).toFixed(2) + \"V\" : \"unknown\",\n        eqCVL: slider !== undefined ? (54.0 + (slider - 40) / 60 * 7.96 + 0.44).toFixed(2) + \"V\" : \"unknown\"\n    },\n\n    limits: {\n        cvl: bms.cvl,\n        ccl: bms.ccl,\n        dcl: bms.dcl,\n        dvl: bms.dvl\n    },\n\n    dcBus: {\n        voltage: bms.voltage,\n        current: bms.current,\n        power: bms.voltage && bms.current ?\n            Math.round(bms.voltage * bms.current * 10) / 10 : null,\n        temperature: bms.temperature\n    },\n\n    stateOfCharge: {\n        soc: bms.soc,\n        soh: bms.soh,\n        socHiRes: bms.socHiRes,\n        capacity: bms.capacity\n    },\n\n    cells: {\n        minVoltage: bms.minCellV,\n        maxVoltage: bms.maxCellV,\n        deltaMv: bms.minCellV && bms.maxCellV ?\n            Math.round((bms.maxCellV - bms.minCellV) * 1000) : null,\n        minTemp: bms.minCellT,\n        maxTemp: bms.maxCellT,\n        nrModules: bms.nrModules,\n        moduleIds: bms.moduleIds\n    },\n\n    identity: {\n        manufacturer: bms.manufacturer,\n        productName: bms.productName,\n        batteryName: bms.batteryName,\n        serial: bms.serial,\n        chemistry: bms.chemistry,\n        hwVersion: bms.hwVersion,\n        fwVersion: bms.fwVersion\n    },\n\n    forceCharge: bms.forceCharge,\n\n    moduleStatus: {\n        online: bms.modulesOnline,\n        blockingCharge: bms.modulesBlockingCharge,\n        blockingDischarge: bms.modulesBlockingDischarge,\n        offline: bms.modulesOffline\n    },\n\n    chargeCycles: bms.chargeCycles,\n\n    status: {\n        frame381_raw: bms.alarm381,\n        statusByte: bms.statusByte,\n        NOTE: \"REC-BMS does not publish alarm state via CAN — no 0x35A frame\"\n    },\n\n    NOT_FORWARDED_TO_DBUS: [\n        \"soh — virtual battery rejects /Soh\",\n        \"socHiRes — could replace /Soc for smoother readings\",\n        \"capacity — virtual battery rejects /Capacity\",\n        \"consumedAmphours — virtual battery rejects /ConsumedAmphours\",\n        \"timeToGo — virtual battery rejects /TimeToGo\",\n        \"hwVersion — virtual battery rejects /HardwareVersion\",\n        \"fwVersion — virtual battery rejects /FirmwareVersion\",\n        \"serial — virtual battery rejects /Serial\",\n        \"minCellV/maxCellV — virtual battery rejects /System/*\",\n        \"minCellT/maxCellT — virtual battery rejects /System/*\",\n        \"nrModules — virtual battery rejects /System/*\",\n        \"alarm360/381 raw — need REC-BMS bit mapping\",\n        \"statusByte — need REC-BMS status mapping\",\n        \"moduleIds — no standard dbus path\",\n        \"chemistry — informational only\"\n    ]\n};\n\nmsg.topic = \"Full BMS State Dump\";\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -226,33 +227,6 @@
     "x": 730,
     "y": 560,
     "wires": []
-  },
-  {
-    "id": "bms03a00000000062",
-    "type": "inject",
-    "z": "feb92f911e56ae11",
-    "name": "Init slider → 100%",
-    "props": [
-      {
-        "p": "payload",
-        "v": {
-          "/SwitchableOutput/output_1/Value": 100
-        },
-        "vt": "json"
-      }
-    ],
-    "repeat": "",
-    "crontab": "",
-    "once": true,
-    "onceDelay": "4",
-    "topic": "",
-    "x": 280,
-    "y": 840,
-    "wires": [
-      [
-        "bms03a00000000060"
-      ]
-    ]
   },
   {
     "id": "bms03a00000000060",
@@ -287,7 +261,7 @@
     "type": "function",
     "z": "feb92f911e56ae11",
     "name": "Capture Slider Value",
-    "func": "var val = msg.payload;\nif (typeof val !== 'number' || val < 40 || val > 100) return null;\n\nflow.set(\"charge_slider\", val);\n\nvar voltage = 54.0 + (val - 40) / 60 * 7.96;\nnode.status({\n    fill: \"blue\", shape: \"dot\",\n    text: val + \"% → \" + voltage.toFixed(2) + \"V CVL\"\n});\n\nreturn null;",
+    "func": "var val = msg.payload;\nif (typeof val !== 'number' || val < 40 || val > 100) return null;\n\nflow.set(\"charge_slider\", val);\n\nvar voltage = 54.0 + (val - 40) / 60 * 7.96;\nnode.status({\n    fill: \"blue\", shape: \"dot\",\n    text: val + \"% → \" + voltage.toFixed(2) + \"V CVL\"\n});\n\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -297,7 +271,9 @@
     "x": 550,
     "y": 900,
     "wires": [
-      []
+      [
+        "bms03a00000000073"
+      ]
     ]
   },
   {
@@ -315,7 +291,7 @@
     "repeat": "1",
     "crontab": "",
     "once": true,
-    "onceDelay": "5",
+    "onceDelay": "8",
     "topic": "",
     "x": 270,
     "y": 680,
@@ -330,8 +306,8 @@
     "type": "function",
     "z": "feb92f911e56ae11",
     "name": "State Assembler + Staged Fallback + CVL Control",
-    "func": "var bms = flow.get(\"bms_live\") || {};\nvar age = Date.now() - (bms._lastUpdate || 0);\nvar now = Date.now();\nvar live = bms._lastUpdate && (age <= 10000);\n\n// =============================================\n// STAGED FALLBACK\n// =============================================\nvar phase, phaseName, fb;\n\nif (live) {\n    phase = 0;\n    phaseName = \"LIVE\";\n} else if (age <= 30000) {\n    phase = 1;\n    phaseName = \"ALERT\";\n} else if (age <= 300000) {\n    phase = 2;\n    phaseName = \"RESTRICT\";\n} else {\n    phase = 3;\n    phaseName = \"SURVIVAL\";\n}\n\nvar fallback = [\n    { ccl: null, dcl: null, dvl: null },\n    { ccl: 0, dcl: 100, dvl: 52.0 },\n    { ccl: 0, dcl: 30,  dvl: 53.0 },\n    { ccl: 0, dcl: 15,  dvl: 54.0 }\n];\nfb = fallback[phase];\n\nvar safe = {\n    cvl: 62.7, ccl: 0, dcl: 15, dvl: 54.0,\n    voltage: 54.0, current: 0, temperature: 20,\n    soc: 50, capacity: 1440,\n    minCellV: 3.375, maxCellV: 3.375,\n    nrModules: 6, minCellT: 20, maxCellT: 20\n};\n\nfunction v(key) {\n    if (!live) return safe[key];\n    return (bms[key] !== undefined && bms[key] !== null)\n        ? bms[key] : safe[key];\n}\n\n// =============================================\n// CVL CONTROL: SLIDER + WEEKLY EQ\n// =============================================\nvar slider = flow.get(\"charge_slider\");\nif (slider === undefined || slider === null) slider = 100;\n\nvar sliderCVL = 54.0 + (slider - 40) / 60 * 7.96;\n\nvar eq = flow.get(\"equalization\") || {\n    lastCompleted: 0, active: false, startTime: 0\n};\n\nvar SEVEN_DAYS  = 7 * 24 * 3600 * 1000;\nvar ONE_HOUR    = 3600 * 1000;\nvar EQ_BOOST    = 0.44;\nvar eqEligible  = live && (phase === 0);\nvar eqDue       = (now - eq.lastCompleted) >= SEVEN_DAYS;\nvar eqLabel     = \"\";\nvar finalCVL;\n\nif (eq.active) {\n    var eqElapsed = now - eq.startTime;\n    if (eqElapsed >= ONE_HOUR) {\n        eq.active = false;\n        eq.lastCompleted = now;\n        eqLabel = \"EQ done\";\n        finalCVL = sliderCVL;\n    } else if (!eqEligible) {\n        eq.active = false;\n        eqLabel = \"EQ aborted\";\n        finalCVL = sliderCVL;\n    } else {\n        var minsLeft = Math.ceil((ONE_HOUR - eqElapsed) / 60000);\n        eqLabel = \"EQ \" + minsLeft + \"min left\";\n        finalCVL = sliderCVL + EQ_BOOST;\n    }\n} else if (eqEligible && eqDue) {\n    eq.active = true;\n    eq.startTime = now;\n    eqLabel = \"EQ starting\";\n    finalCVL = sliderCVL + EQ_BOOST;\n} else {\n    finalCVL = sliderCVL;\n    if (eqEligible && !eqDue) {\n        var nextEqHours = Math.round(\n            (SEVEN_DAYS - (now - eq.lastCompleted)) / 3600000\n        );\n        eqLabel = \"next EQ ~\" + nextEqHours + \"h\";\n    }\n}\n\nflow.set(\"equalization\", eq);\n\nvar bmsCVL = live ? v(\"cvl\") : safe.cvl;\nfinalCVL = Math.min(finalCVL, bmsCVL);\n\n// =============================================\n// RESOLVE FINAL VALUES\n// =============================================\nvar ccl, dcl, dvl, cvl;\nif (live) {\n    ccl = v(\"ccl\");\n    dcl = v(\"dcl\");\n    dvl = v(\"dvl\");\n    cvl = finalCVL;\n} else {\n    ccl = fb.ccl;\n    dcl = fb.dcl;\n    dvl = fb.dvl;\n    cvl = finalCVL;\n}\n\nvar volts   = v(\"voltage\");\nvar amps    = live ? v(\"current\") : 0;\nvar cap     = v(\"capacity\");\nvar soc     = v(\"soc\");\nvar cellMin = v(\"minCellV\");\nvar cellMax = v(\"maxCellV\");\n\nmsg.payload = {\n    \"/Info/MaxChargeVoltage\":    cvl,\n    \"/Info/MaxChargeCurrent\":    ccl,\n    \"/Info/MaxDischargeCurrent\": dcl,\n    \"/Info/BatteryLowVoltage\":   dvl,\n\n    \"/Dc/0/Voltage\":     volts,\n    \"/Dc/0/Current\":     amps,\n    \"/Dc/0/Power\":       Math.round(volts * amps * 10) / 10,\n    \"/Dc/0/Temperature\": v(\"temperature\"),\n\n    \"/Soc\":              soc,\n\n    \"/Alarms/LowVoltage\":           0,\n    \"/Alarms/HighVoltage\":          0,\n    \"/Alarms/LowTemperature\":       0,\n    \"/Alarms/HighTemperature\":      0,\n    \"/Alarms/LowSoc\":               (soc < 10) ? 2 : (soc < 20) ? 1 : 0,\n    \"/Alarms/HighChargeCurrent\":    live ? ((bms.modulesBlockingCharge || 0) > 0 ? 1 : 0) : 0,\n    \"/Alarms/HighDischargeCurrent\": live ? ((bms.modulesBlockingDischarge || 0) > 0 ? 1 : 0) : 0,\n    \"/Alarms/CellImbalance\":\n        live ? (((cellMax - cellMin) > 0.100) ? 2 :\n               ((cellMax - cellMin) > 0.050) ? 1 : 0) : 0,\n    \"/Alarms/InternalFailure\":      (phase >= 1) ? 2 : ((bms.modulesOffline || 0) > 0 ? 2 : 0)\n};\n\n// =============================================\n// NODE STATUS\n// =============================================\nvar color = [\"green\", \"yellow\", \"blue\", \"red\"][phase];\nif (eq.active) color = \"purple\";\nvar shape = (phase === 0) ? \"dot\" : \"ring\";\n\nvar parts = [\n    phaseName,\n    volts.toFixed(1) + \"V\",\n    amps.toFixed(1) + \"A\",\n    soc + \"%\",\n    \"CVL=\" + cvl.toFixed(1) + \"V\",\n    \"(\" + slider + \"%)\",\n    \"CCL=\" + ccl + \"A\",\n    \"DCL=\" + dcl + \"A\"\n];\nif (eqLabel) parts.push(eqLabel);\nif (phase >= 1) parts.push(\"CAN lost \" + Math.round(age/1000) + \"s\");\n\nnode.status({ fill: color, shape: shape, text: parts.join(\" | \") });\n\nmsg.topic = \"dbus_publish\";\nreturn msg;",
-    "outputs": 1,
+    "func": "var bms = flow.get(\"bms_live\") || {};\nvar age = Date.now() - (bms._lastUpdate || 0);\nvar now = Date.now();\nvar live = bms._lastUpdate && (age <= 60000);\nvar restored = flow.get(\"state_restored\") === true;\n\n// =============================================\n// STAGED FALLBACK\n// =============================================\nvar phase, phaseName, fb;\n\nif (live) {\n    phase = 0;\n    phaseName = \"LIVE\";\n} else if (age <= 120000) {\n    phase = 1;\n    phaseName = \"ALERT\";\n} else if (age <= 300000) {\n    phase = 2;\n    phaseName = \"RESTRICT\";\n} else {\n    phase = 3;\n    phaseName = \"SURVIVAL\";\n}\n\nvar fallback = [\n    { ccl: null, dcl: null, dvl: null },\n    { ccl: 0, dcl: 100, dvl: 52.0 },\n    { ccl: 0, dcl: 30,  dvl: 53.0 },\n    { ccl: 0, dcl: 15,  dvl: 54.0 }\n];\nfb = fallback[phase];\n\nvar safe = {\n    cvl: 62.7, ccl: 0, dcl: 15, dvl: 54.0,\n    voltage: 54.0, current: 0, temperature: 20,\n    soc: 50, capacity: 1440,\n    minCellV: 3.375, maxCellV: 3.375,\n    nrModules: 6, minCellT: 20, maxCellT: 20\n};\n\n// External voltage from Quattro (independent of BMS CAN)\nvar extV = flow.get(\"ext_voltage\");\nvar extVFresh = extV && (now - extV.ts) <= 30000;\n\nfunction v(key) {\n    if (live) {\n        return (bms[key] !== undefined && bms[key] !== null)\n            ? bms[key] : safe[key];\n    }\n    // Stale: prefer external voltage, else last-known BMS value, else safe\n    if (key === \"voltage\" && extVFresh) return extV.v;\n    if (bms[key] !== undefined && bms[key] !== null) return bms[key];\n    return safe[key];\n}\n\n// =============================================\n// CVL CONTROL: SLIDER + WEEKLY EQ\n// =============================================\nvar slider = flow.get(\"charge_slider\");\nif (slider === undefined || slider === null) slider = 100;\n\nvar sliderCVL = 54.0 + (slider - 40) / 60 * 7.96;\n\nvar eq = flow.get(\"equalization\") || {\n    lastCompleted: 0, active: false, startTime: 0\n};\n\nvar SEVEN_DAYS  = 7 * 24 * 3600 * 1000;\nvar ONE_HOUR    = 3600 * 1000;\nvar EQ_BOOST    = 0.44;\nvar eqEligible  = live && (phase === 0);\nvar eqDue       = (now - eq.lastCompleted) >= SEVEN_DAYS;\nvar eqLabel     = \"\";\nvar eqCompleted = false;\nvar finalCVL;\n\nif (eq.active) {\n    var eqElapsed = now - eq.startTime;\n    if (eqElapsed >= ONE_HOUR) {\n        eq.active = false;\n        eq.lastCompleted = now;\n        eqCompleted = true;\n        eqLabel = \"EQ done\";\n        finalCVL = sliderCVL;\n    } else if (!eqEligible) {\n        eq.active = false;\n        eqLabel = \"EQ aborted\";\n        finalCVL = sliderCVL;\n    } else {\n        var minsLeft = Math.ceil((ONE_HOUR - eqElapsed) / 60000);\n        eqLabel = \"EQ \" + minsLeft + \"min left\";\n        finalCVL = sliderCVL + EQ_BOOST;\n    }\n} else if (eqEligible && eqDue && restored) {\n    eq.active = true;\n    eq.startTime = now;\n    eqLabel = \"EQ starting\";\n    finalCVL = sliderCVL + EQ_BOOST;\n} else {\n    finalCVL = sliderCVL;\n    if (eqEligible && !eqDue) {\n        var nextEqHours = Math.round(\n            (SEVEN_DAYS - (now - eq.lastCompleted)) / 3600000\n        );\n        eqLabel = \"next EQ ~\" + nextEqHours + \"h\";\n    }\n}\n\nflow.set(\"equalization\", eq);\n\nvar bmsCVL = live ? v(\"cvl\") : safe.cvl;\nfinalCVL = Math.min(finalCVL, bmsCVL);\n\n// =============================================\n// RESOLVE FINAL VALUES\n// =============================================\nvar ccl, dcl, dvl, cvl;\nif (live) {\n    ccl = v(\"ccl\");\n    dcl = v(\"dcl\");\n    dvl = v(\"dvl\");\n    cvl = finalCVL;\n} else {\n    ccl = fb.ccl;\n    dcl = fb.dcl;\n    dvl = fb.dvl;\n    cvl = finalCVL;\n}\n\nvar volts   = v(\"voltage\");\nvar amps    = live ? v(\"current\") : 0;\nvar cap     = v(\"capacity\");\nvar soc     = v(\"soc\");\nvar cellMin = v(\"minCellV\");\nvar cellMax = v(\"maxCellV\");\nvar cellMinT = v(\"minCellT\");\nvar cellMaxT = v(\"maxCellT\");\n\nmsg.payload = {\n    \"/Info/MaxChargeVoltage\":    cvl,\n    \"/Info/MaxChargeCurrent\":    ccl,\n    \"/Info/MaxDischargeCurrent\": dcl,\n    \"/Info/BatteryLowVoltage\":   dvl,\n\n    \"/Dc/0/Voltage\":     volts,\n    \"/Dc/0/Current\":     amps,\n    \"/Dc/0/Power\":       Math.round(volts * amps * 10) / 10,\n    \"/Dc/0/Temperature\": v(\"temperature\"),\n\n    \"/Soc\":              soc,\n\n    \"/Alarms/LowVoltage\":           live ? ((cellMin < 3.00) ? 2 : (cellMin < 3.30) ? 1 : 0) : 0,\n    \"/Alarms/HighVoltage\":          live ? ((cellMax > 4.25) ? 2 : (cellMax > 4.20) ? 1 : 0) : 0,\n    \"/Alarms/LowTemperature\":       live ? ((cellMinT < 0) ? 2 : (cellMinT < 5) ? 1 : 0) : 0,\n    \"/Alarms/HighTemperature\":      live ? ((cellMaxT > 50) ? 2 : (cellMaxT > 45) ? 1 : 0) : 0,\n    \"/Alarms/LowSoc\":               (soc < 10) ? 2 : (soc < 20) ? 1 : 0,\n    \"/Alarms/HighChargeCurrent\":    live ? ((bms.modulesBlockingCharge || 0) > 0 ? 1 : 0) : 0,\n    \"/Alarms/HighDischargeCurrent\": live ? ((bms.modulesBlockingDischarge || 0) > 0 ? 1 : 0) : 0,\n    \"/Alarms/CellImbalance\":\n        live ? (((cellMax - cellMin) > 0.100) ? 2 :\n               ((cellMax - cellMin) > 0.050) ? 1 : 0) : 0,\n    \"/Alarms/InternalFailure\":      (phase >= 1) ? 2 : ((bms.modulesOffline || 0) > 0 ? 2 : 0)\n};\n\n// =============================================\n// NODE STATUS\n// =============================================\nvar color = [\"green\", \"yellow\", \"blue\", \"red\"][phase];\nif (eq.active) color = \"purple\";\nvar shape = (phase === 0) ? \"dot\" : \"ring\";\n\nvar parts = [\n    phaseName,\n    volts.toFixed(1) + \"V\",\n    amps.toFixed(1) + \"A\",\n    soc + \"%\",\n    \"CVL=\" + cvl.toFixed(1) + \"V\",\n    \"(\" + slider + \"%)\",\n    \"CCL=\" + ccl + \"A\",\n    \"DCL=\" + dcl + \"A\"\n];\nif (eqLabel) parts.push(eqLabel);\nif (phase >= 1) parts.push(\"CAN lost \" + Math.round(age/1000) + \"s\");\n\nnode.status({ fill: color, shape: shape, text: parts.join(\" | \") });\n\nmsg.topic = \"dbus_publish\";\nreturn [msg, eqCompleted ? { payload: \"eq_completed\", topic: \"persist\" } : null];",
+    "outputs": 2,
     "timeout": "",
     "noerr": 0,
     "initialize": "var eq = flow.get(\"equalization\") || { lastCompleted: 0, active: false, startTime: 0 };\neq.active = false;\nflow.set(\"equalization\", eq);",
@@ -343,6 +319,9 @@
       [
         "bms03a00000000045",
         "bms03d00000000040"
+      ],
+      [
+        "bms03a00000000073"
       ]
     ]
   },
@@ -440,7 +419,290 @@
     ]
   },
   {
-    "id": "934119bf28688370",
+    "id": "bms_extv_input",
+    "type": "victron-input-vebus",
+    "z": "feb92f911e56ae11",
+    "service": "com.victronenergy.vebus/276",
+    "path": "/Dc/0/Voltage",
+    "serviceObj": {
+      "service": "com.victronenergy.vebus/276",
+      "name": "Quattro",
+      "communityTag": "vebus"
+    },
+    "pathObj": {
+      "path": "/Dc/0/Voltage",
+      "type": "float",
+      "name": "Battery voltage (V)"
+    },
+    "name": "Quattro Battery Voltage",
+    "onlyChanges": false,
+    "roundValues": "2",
+    "conditionalMode": false,
+    "outputTrue": "",
+    "outputFalse": "",
+    "debounce": "",
+    "x": 260,
+    "y": 460,
+    "wires": [
+      [
+        "bms_extv_handler"
+      ]
+    ]
+  },
+  {
+    "id": "bms_extv_handler",
+    "type": "function",
+    "z": "feb92f911e56ae11",
+    "name": "Store External Voltage",
+    "func": "var v = Number(msg.payload);\nif (!isFinite(v) || v < 20 || v > 80) return null;\nflow.set(\"ext_voltage\", { v: v, ts: Date.now() });\nnode.status({ fill: \"grey\", shape: \"dot\", text: v.toFixed(2) + \"V (Quattro)\" });\nreturn null;",
+    "outputs": 0,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 520,
+    "y": 460,
+    "wires": []
+  },
+  {
+    "id": "bms03a00000000012",
+    "type": "exec",
+    "z": "feb92f911e56ae11",
+    "command": "pkill -f '[c]andump can0,18FF0000:1FFFF800'",
+    "addpay": "",
+    "append": "",
+    "useSpawn": "false",
+    "timer": "",
+    "winHide": false,
+    "oldrc": false,
+    "name": "Kill stale candump",
+    "x": 440,
+    "y": 260,
+    "wires": [
+      [],
+      [],
+      [
+        "bms03a00000000010"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000013",
+    "type": "function",
+    "z": "feb92f911e56ae11",
+    "name": "candump Watchdog",
+    "func": "var n = (flow.get('candump_restarts') || 0) + 1;\nflow.set('candump_restarts', n);\n\nvar rc = (typeof msg.payload === 'object') ? JSON.stringify(msg.payload) : msg.payload;\nnode.warn('candump exited (rc ' + rc + ') — restart #' + n + ' in 5s');\nnode.status({ fill: 'red', shape: 'ring', text: 'candump exited (rc ' + rc + ') — restart #' + n });\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 750,
+    "y": 220,
+    "wires": [
+      [
+        "bms03a00000000014"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000014",
+    "type": "delay",
+    "z": "feb92f911e56ae11",
+    "name": "5s restart delay",
+    "pauseType": "delay",
+    "timeout": "5",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "outputs": 1,
+    "x": 560,
+    "y": 180,
+    "wires": [
+      [
+        "bms03a00000000012"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000070",
+    "type": "inject",
+    "z": "feb92f911e56ae11",
+    "name": "Load persisted state",
+    "props": [
+      {
+        "p": "payload",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "6",
+    "topic": "",
+    "x": 260,
+    "y": 780,
+    "wires": [
+      [
+        "bms03a00000000071"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000071",
+    "type": "exec",
+    "z": "feb92f911e56ae11",
+    "command": "sh -c 'for d in \"$HOME/.node-red\" \"$HOME\" /data; do [ -d \"$d\" ] && [ -w \"$d\" ] && break; done; echo \"$d\"; cat \"$d/virtual-bms-state.json\" 2>/dev/null'",
+    "addpay": "",
+    "append": "",
+    "useSpawn": "false",
+    "timer": "",
+    "winHide": false,
+    "oldrc": false,
+    "name": "Read state file",
+    "x": 460,
+    "y": 780,
+    "wires": [
+      [
+        "bms03a00000000072"
+      ],
+      [],
+      []
+    ]
+  },
+  {
+    "id": "bms03a00000000072",
+    "type": "function",
+    "z": "feb92f911e56ae11",
+    "name": "Restore Persisted State",
+    "func": "// Payload: first line = writable state dir (discovered by the shell,\n// running as the same user as Node-RED), rest = saved JSON (may be empty)\nvar raw = String(msg.payload);\nvar nl = raw.indexOf('\\n');\nvar dir = (nl >= 0 ? raw.slice(0, nl) : raw).trim();\nvar rest = nl >= 0 ? raw.slice(nl + 1) : '';\nif (dir) flow.set('state_dir', dir);\n\nvar s = {};\ntry { s = JSON.parse(rest); } catch (e) { }\n\nvar now = Date.now();\n\nvar slider = 100;\nif (typeof s.chargeSlider === 'number' && s.chargeSlider >= 40 && s.chargeSlider <= 100) {\n    slider = s.chargeSlider;\n}\n\n// First run (no saved state): baseline the EQ schedule from now so the\n// first equalization runs 7 days after install, not immediately.\nvar lastEq = now;\nvar hadSaved = false;\nif (typeof s.eqLastCompleted === 'number' && s.eqLastCompleted > 0 && s.eqLastCompleted <= now) {\n    lastEq = s.eqLastCompleted;\n    hadSaved = true;\n}\n\nflow.set('charge_slider', slider);\nvar eq = flow.get('equalization') || {};\neq.active = false;\neq.startTime = 0;\neq.lastCompleted = lastEq;\nflow.set('equalization', eq);\nflow.set('state_restored', true);\n\nnode.status({\n    fill: 'blue', shape: 'dot',\n    text: 'slider ' + slider + '% | last EQ ' +\n        (hadSaved ? new Date(lastEq).toISOString().slice(0, 10) : 'baselined (first run)') +\n        ' | ' + dir\n});\n\nreturn [\n    { payload: { '/SwitchableOutput/output_1/Value': slider } },\n    { payload: 'restored' }\n];",
+    "outputs": 2,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "// Reset on every deploy: saves stay blocked until this deploy's\n// discovery + restore have run (flow context survives redeploys).\nflow.set('state_restored', false);\nflow.set('state_dir', '');",
+    "finalize": "",
+    "libs": [],
+    "x": 690,
+    "y": 780,
+    "wires": [
+      [
+        "bms03a00000000060"
+      ],
+      [
+        "bms03a00000000073"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000073",
+    "type": "function",
+    "z": "feb92f911e56ae11",
+    "name": "Persist State",
+    "func": "// Never save before restore has run — a startup slider echo would\n// otherwise overwrite the state file with defaults.\nif (flow.get('state_restored') !== true) return null;\n\nvar eq = flow.get('equalization') || {};\nvar slider = flow.get('charge_slider');\n\n// Only save once the startup discovery has found a writable dir — never guess\nvar dir = flow.get('state_dir');\nif (!dir) return null;\nmsg.filename = dir + '/virtual-bms-state.json';\n\nmsg.payload = JSON.stringify({\n    chargeSlider: (typeof slider === 'number') ? slider : 100,\n    eqLastCompleted: eq.lastCompleted || 0,\n    savedAt: new Date().toISOString()\n}, null, 2);\n\nnode.status({ fill: 'grey', shape: 'dot', text: 'saved ' + msg.filename });\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 830,
+    "y": 860,
+    "wires": [
+      [
+        "bms03a00000000074"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000074",
+    "type": "file",
+    "z": "feb92f911e56ae11",
+    "name": "Write state file",
+    "filename": "filename",
+    "filenameType": "msg",
+    "appendNewline": false,
+    "createDir": false,
+    "overwriteFile": "true",
+    "encoding": "none",
+    "x": 1030,
+    "y": 860,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "bms03a00000000075",
+    "type": "catch",
+    "z": "feb92f911e56ae11",
+    "name": "Slider set failed",
+    "scope": [
+      "bms03a00000000060"
+    ],
+    "uncaught": false,
+    "x": 260,
+    "y": 840,
+    "wires": [
+      [
+        "bms03a00000000076"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000076",
+    "type": "function",
+    "z": "feb92f911e56ae11",
+    "name": "Retry restore (max 5)",
+    "func": "var n = (flow.get('restore_retries') || 0) + 1;\nif (n > 5) {\n    node.status({ fill: 'red', shape: 'ring', text: 'gave up after 5 retries' });\n    return null;\n}\nflow.set('restore_retries', n);\nnode.status({ fill: 'yellow', shape: 'ring', text: 'slider set failed — retry ' + n + '/5 in 3s' });\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "flow.set('restore_retries', 0);",
+    "finalize": "",
+    "libs": [],
+    "x": 480,
+    "y": 840,
+    "wires": [
+      [
+        "bms03a00000000077"
+      ]
+    ]
+  },
+  {
+    "id": "bms03a00000000077",
+    "type": "delay",
+    "z": "feb92f911e56ae11",
+    "name": "3s retry delay",
+    "pauseType": "delay",
+    "timeout": "3",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "outputs": 1,
+    "x": 680,
+    "y": 840,
+    "wires": [
+      [
+        "bms03a00000000071"
+      ]
+    ]
+  },
+  {
+    "id": "c7bfda6a5eb99145",
     "type": "global-config",
     "env": [],
     "modules": {

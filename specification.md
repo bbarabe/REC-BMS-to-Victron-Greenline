@@ -40,7 +40,7 @@ Manual: `ydnb07.md` / `ydnb07.pdf`
 ### Cerbo GX (Venus OS)
 
 - **can0**: VE.Can port, 250 kbps, `sun4i_can` driver
-- Runs Node-Red with `@victronenergy/node-red-contrib-victron` v1.6.60 and `@signalk/node-red-embedded` v2.18.1
+- Runs Node-Red with `@victronenergy/node-red-contrib-victron` v1.7.7 and `@signalk/node-red-embedded` v2.18.1
 - Signal-K server decodes NMEA 2000 PGNs into Signal-K paths
 
 ## Battery Systems
@@ -96,25 +96,48 @@ Reads repackaged BMS CAN frames from `can0` via `candump`, decodes them, and pub
 **Data path**: candump can0 (filter `18FF0000:1FFFF800`) -> Line Parser (strips 29-bit wrapper: `rawid & 0x7FF`) -> CAN Frame Decoder -> State Assembler -> Path Filter -> victron-virtual battery
 
 Key features:
-- **Staged fallback**: If CAN data goes stale, progressively restricts charge/discharge limits (LIVE -> ALERT 30s -> RESTRICT 5min -> SURVIVAL)
+- **candump watchdog**: Before every start, `pkill -f '[c]andump can0,18FF0000:1FFFF800'` clears any stale capture process (prevents duplicates after a hard Node-Red restart or manual re-trigger). The pattern matches this flow's exact command line — filter argument included — so manually-run or other-purpose candump processes are never touched. If candump exits for any reason, a watchdog restarts it after 5 seconds (restart count kept in flow context).
+- **Chunk-safe line parsing**: exec stdout arrives in chunks, not lines. The parser buffers partial lines across chunks, splits on newlines, and emits one message per CAN frame — no frames are lost when the pipe coalesces multiple lines.
+- **Frame length guard**: Each CAN ID has a minimum-length requirement; short/corrupt frames are dropped (with a rate-limited warning, max 1/min) instead of throwing mid-decode. Only successfully decoded frames refresh the staleness timestamp.
+- **Staged fallback**: If CAN data goes stale, progressively restricts charge/discharge limits (LIVE ≤60s → ALERT ≤2min → RESTRICT ≤5min → SURVIVAL). When BMS is stale, pack voltage is sourced from the Quattro's `/Dc/0/Voltage` (independent measurement), with fallback to last-known BMS voltage if the Quattro reading is also stale (>30s).
 - **CVL control**: "Max Charge" slider (40-100%) exposed on VRM dashboard (BMS group), maps linearly to CVL range (61.96-62.4V at 100%)
-- **Weekly equalization**: Every 7 days, adds +0.44V boost to the current slider CVL for 1 hour. Works at any slider position, not just 100%.
-- **Synthetic alarms** (since BMS does not send 0x35A):
+- **Weekly equalization**: Every 7 days, adds +0.44V boost to the current slider CVL for 1 hour. Works at any slider position, not just 100%. EQ start is gated on persisted state having been restored; on first install the schedule is baselined so the first EQ runs 7 days later, not immediately.
+- **Persistent state** (`virtual-bms-state.json`): The slider position and last-equalization timestamp survive Node-Red restarts, redeploys, and reboots. Node-Red on Venus OS runs as a restricted user that cannot write to `/data` directly, so the startup exec discovers a writable directory (first writable of `$HOME/.node-red`, `$HOME`, `/data` — the Node-Red user dir is always writable since flows are saved there), reports it on the first line of its output, and the flow stores it in flow context (`state_dir`) for all subsequent writes. The "Restore Persisted State" node status shows the directory in use. State is restored 6s after startup (giving the virtual switch time to register on D-Bus, then the slider is pushed back to the VRM switch) and saved on every slider change and EQ completion. If pushing the slider value fails (switch not yet registered), a catch node re-runs the restore up to 5 times at 3s intervals. Saves are blocked until restore has run, so a startup echo can't clobber the file. If the file is missing, defaults are slider 100% and EQ baselined to now.
+- **Synthetic alarms** (since BMS does not send 0x35A; all thresholds from 0x373 cell extremes unless noted, and all report 0 when CAN is stale):
   - `/Alarms/LowSoc`: warning at SOC < 20%, alarm at SOC < 10%
-  - `/Alarms/HighVoltage` / `/Alarms/LowVoltage`: alarm when cell delta > 100mV (imbalance)
+  - `/Alarms/CellImbalance`: warning at cell delta > 50mV, alarm at > 100mV
+  - `/Alarms/LowVoltage`: warning at min cell < 3.30V, alarm at < 3.00V
+  - `/Alarms/HighVoltage`: warning at max cell > 4.20V, alarm at > 4.25V
+  - `/Alarms/LowTemperature`: warning at min cell < 5°C, alarm at < 0°C (NMC charging below freezing causes lithium plating)
+  - `/Alarms/HighTemperature`: warning at max cell > 45°C, alarm at > 50°C
   - `/Alarms/HighChargeCurrent`: warning when modules are blocking charge (from 0x372)
   - `/Alarms/HighDischargeCurrent`: warning when modules are blocking discharge (from 0x372)
   - `/Alarms/InternalFailure`: alarm on CAN staleness (ALERT phase+) or modules offline (from 0x372)
 
 ### CZone Control (`CZoneProxy.json`)
 
-Bidirectional control of CZone digital switching outputs via Victron Virtual Switches.
+Bidirectional control of CZone digital switching outputs via Victron Virtual Switches. v6 removed Signal-K from the loop entirely — state is read directly from `can0`. (The Signal-K path added 1-2s of latency and, worse, when the Signal-K server wedged the frozen state cache silently blocked all commands until reboot.) v6.0 was rolled back in production because it strobed the lights; v6.1 is the rebuild with the root cause fixed (see instance filter below).
 
-- **State monitoring**: Signal-K subscribe to `electrical.switches.bank.1.{1-11}.state` (PGN 127501, CZone instance 1)
-- **Command sending**: `cansend can0` with PGN 127502 instance 10 to toggle CZone outputs
+**Bus behavior (measured from candump captures, 2026-07-06):**
+- The CZone output interface (src `0x02`) broadcasts PGN 127501 every 2s and within ~10ms of any output change, twice per cycle: once as bank instance 1 and once as instance 10 (identical payloads).
+- MFD/keypad commands (src `0x20`) use PGN 127502 **instance 1** with *momentary* semantics: `ON` frames stream at ~250ms while the button is held, one `OFF` on release, and the CZone circuit logic toggles its latched output on the rising edge. Instance-1 127502 is therefore *not* set-state and must not be imitated.
+- Bank-10 127502 commands *are* direct set-state: applied in <10ms, confirmed via 127501, and accepted from the unclaimed source address `0xFE`.
+- An unidentified device at src `0x0C` broadcasts 127501 **instance 0** ("all OFF") at 5 Hz, with occasional single-frame blips of switch 1 ON. To identify it: `cansend can0 18EA0CFE#00EE00 && candump -td can0,18EEFF0C:1FFFFFFF -n 1`.
+
+Flow features:
+- **State monitoring**: `candump can0,01F20D00:03FFFF00` captures PGN 127501 directly — the filter masks the PGN field (CAN ID bits 8-25) so any priority/source matches. Same watchdog pattern as Virtual BMS: pkill stale capture before start, chunk-safe line parser, auto-restart 5s after candump exits. The decoder stores per-switch `{state, ts}` in flow context and pushes to the virtual switches only on change.
+- **Instance filter (the v6.0 strobing bug)**: the decoder ignores any 127501 frame whose bank instance byte (data byte 0) is not `0x01`. Without this, the `0x0C` device's 5 Hz instance-0 all-OFF spam flips the tracked state several times a second; the resulting virtual-switch syncs echo out the command side and strobe the physical lights.
+- **State request**: ISO Request (PGN 59904) for 127501 is broadcast at startup and every 60s (`cansend can0 18EAFFFE#0DF201`) so state is known right after a deploy even if CZone only transmits on change.
+- **Command sending**: `cansend can0` with PGN 127502 instance 10 to set CZone outputs
+- **Confirm-and-retry**: every command is registered as pending; a 250ms tick checks whether a 127501 reading *newer than the command* reports the target state. Unconfirmed commands are resent after 500ms (max 3 transmissions); if still unconfirmed after 5s the virtual switch is reverted to the last real CZone state and a warning is logged.
+- **Keep-alive** (measured empirically 2026-07-02): CZone reverts a 127502-commanded bank-10 state ~10s after the last command frame — a single fire-and-forget command turns the output on for only a few seconds. Confirmed ONs commanded from VRM are therefore re-asserted in a single 127502 frame every ~1s. A hold is released when the output is observed OFF with no command in flight (keypad or CZone turned it off) or when an OFF is commanded; keypad-lit circuits are never held since CZone latches those natively. Note: holds live in flow context, so a Node-RED redeploy drops them and any VRM-lit circuits turn off ~10s later.
+- **Virtual switch caveat**: the `victron-virtual-switch` node does *not* preserve message properties from input to output — a state write echoes out the command side without the `_czoneSync` flag. The engine's fresh-state dedupe is what actually stops these echoes from becoming commands.
+- **Revert-echo guard**: a revert write (after a 5s unconfirmed command) also echoes out the command side, and if CZone is unresponsive the fresh-state dedupe can't stop it — state is stale — so it would re-command and re-revert in a ~5s loop. The engine records each revert (`czRecentRevert`) and drops any command that mirrors a revert made in the last 3s.
+- **Deploy-echo guard**: on (re)deploy every virtual switch emits its initial OFF out the command side before any 127501 has been decoded, which would otherwise blast OFF commands to all 11 circuits (and kill keypad-lit lights). The engine drops all commands for the first 12s after deploy — by then candump is running and real state has been synced into the switches.
+- **Stale-state safety**: the "already ON/OFF" dedupe only applies when the 127501 reading is <10s old — stale state never blocks a command.
 - **11 switches**: Bilge1, Bilge2, Horn, Helm, Nav, Anchor, Red, Fly, Underwater, Bow1, Bow2
 - **Latching logic**: Lights use on/off toggle; horn and bilge pumps are momentary
-- **2-second suppression**: After sending a command, ignores state feedback to prevent loops
+- **Feedback-loop protection**: `_czoneSync` flag on virtual-switch writes, plus the fresh-state dedupe in the command engine as second line of defense
 
 ### Batteries Forward (`BatteriesForward.json`)
 
