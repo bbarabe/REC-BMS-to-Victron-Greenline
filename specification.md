@@ -75,17 +75,19 @@ CAN frame map (all 8-byte DLC unless noted):
 
 Full decode: `Decoded.md`, raw capture: `BatteryCAN.md`
 
-### 12V Batteries (via NMEA 2000 PGN 127506/127508)
+### 12V Batteries
 
-Five 12V batteries monitored by an NMEA 2000 device at address 16. Three are currently integrated; two (port/starboard engine) are not yet connected.
+Three 12V batteries are monitored by an NMEA 2000 device at address 16 (PGN 127506/127508). The two engine batteries are not on that monitor — their voltage comes from the Yanmar gateways' PGN 127489 (Engine Parameters, Dynamic) *Alternator Potential* field (0.01V resolution, ~2 Hz, transmitted even with engines off; confirmed against known battery voltages 2026-07-07). 127489 carries no SOC or current.
 
-| Signal-K Instance | Name | Available Data | Status |
-|-------------------|------|---------------|--------|
-| electrical.batteries.1 | House | Voltage, current, SOC, SOH, time remaining | Active |
-| electrical.batteries.2 | Bow | Voltage, SOC, SOH, time remaining | Active |
-| electrical.batteries.3 | Stern | Voltage, SOC, SOH, time remaining | Active |
-| electrical.batteries.4? | Port Engine | TBD | Not yet connected |
-| electrical.batteries.5? | Starboard Engine | TBD | Not yet connected |
+| Signal-K Path | Name | Source | Available Data |
+|---------------|------|--------|---------------|
+| electrical.batteries.1 | House | Addr 16, PGN 127506/127508 | Voltage, current, SOC, SOH, time remaining |
+| electrical.batteries.2 | Bow | Addr 16, PGN 127506/127508 | Voltage, SOC, SOH, time remaining |
+| electrical.batteries.3 | Stern | Addr 16, PGN 127506/127508 | Voltage, SOC, SOH, time remaining |
+| propulsion.port.alternatorVoltage | Port Engine | Src 141 (0x8D), PGN 127489, engine instance 0 | Voltage only |
+| propulsion.starboard.alternatorVoltage | Starboard Engine | Src 142 (0x8E), PGN 127489, engine instance 1 | Voltage only |
+
+The 127489 messages also carry engine hours (~208h port / ~209h starboard as of 2026-07-07) and engine temperature; oil temp, coolant pressure, and fuel pressure are not populated (0xFFFF) by these gateways.
 
 ## Node-Red Flows
 
@@ -100,6 +102,7 @@ Key features:
 - **Chunk-safe line parsing**: exec stdout arrives in chunks, not lines. The parser buffers partial lines across chunks, splits on newlines, and emits one message per CAN frame — no frames are lost when the pipe coalesces multiple lines.
 - **Frame length guard**: Each CAN ID has a minimum-length requirement; short/corrupt frames are dropped (with a rate-limited warning, max 1/min) instead of throwing mid-decode. Only successfully decoded frames refresh the staleness timestamp.
 - **Staged fallback**: If CAN data goes stale, progressively restricts charge/discharge limits (LIVE ≤60s → ALERT ≤2min → RESTRICT ≤5min → SURVIVAL). When BMS is stale, pack voltage is sourced from the Quattro's `/Dc/0/Voltage` (independent measurement), with fallback to last-known BMS voltage if the Quattro reading is also stale (>30s).
+- **Startup grace (cold-boot fix)**: A cold boot is not treated as CAN loss. Until the first frame ever decodes, the staleness clock is anchored to flow start (not epoch 0) and the flow holds a benign STARTUP phase for up to 3 minutes: CCL 0 (no blind charging), DCL 100A (inverter keeps running), DVL 52.0V (below resting pack voltage, so no low-battery cutoff), all alarms 0. Previously the first publish tick computed `age = now − 0`, jumped straight to SURVIVAL, and pushed DVL 54.0V — above the pack's resting ~53V — which tripped the Quattro's low-battery shutdown and raised a low-voltage alarm on every boot off shore power. If the grace window expires with still no frame, the normal ALERT → RESTRICT → SURVIVAL escalation proceeds from flow start. The virtual battery node's `default_values` is also off, so the service no longer flashes 48V/50% in the seconds before the first publish tick.
 - **CVL control**: "Max Charge" slider (40-100%) exposed on VRM dashboard (BMS group), maps linearly to CVL range (61.96-62.4V at 100%)
 - **Weekly equalization**: Every 7 days, adds +0.44V boost to the current slider CVL for 1 hour. Works at any slider position, not just 100%. EQ start is gated on persisted state having been restored; on first install the schedule is baselined so the first EQ runs 7 days later, not immediately.
 - **Persistent state** (`virtual-bms-state.json`): The slider position and last-equalization timestamp survive Node-Red restarts, redeploys, and reboots. Node-Red on Venus OS runs as a restricted user that cannot write to `/data` directly, so the startup exec discovers a writable directory (first writable of `$HOME/.node-red`, `$HOME`, `/data` — the Node-Red user dir is always writable since flows are saved there), reports it on the first line of its output, and the flow stores it in flow context (`state_dir`) for all subsequent writes. The "Restore Persisted State" node status shows the directory in use. State is restored 6s after startup (giving the virtual switch time to register on D-Bus, then the slider is pushed back to the VRM switch) and saved on every slider change and EQ completion. If pushing the slider value fails (switch not yet registered), a catch node re-runs the restore up to 5 times at 3s intervals. Saves are blocked until restore has run, so a startup echo can't clobber the file. If the file is missing, defaults are slider 100% and EQ baselined to now.
@@ -141,56 +144,93 @@ Flow features:
 
 ### Batteries Forward (`BatteriesForward.json`)
 
-Reads 12V battery data from Signal-K and publishes to 3 Victron virtual battery devices.
+Reads 12V battery data from Signal-K and publishes to 5 Victron virtual battery devices.
 
 - **Signal-K subscribe** nodes for voltage, current (House only), and SOC
 - **SOC conversion**: Signal-K ratio (0.0-1.0) multiplied by 100 for Venus OS percentage
 - **1s publish tick** with 10-second staleness check
-- **3 virtual battery outputs**: House, Bow, Stern (12V preset)
+- **5 virtual battery outputs** (12V preset): House, Bow, Stern (voltage/SOC from `electrical.batteries.*`), Port Engine and Starboard Engine (voltage only, from `propulsion.*.alternatorVoltage` / PGN 127489)
+- Engine batteries use `default_values: false` so the never-published SOC/current paths stay blank instead of showing a fake 50%; their assemblers also drop non-numeric payloads so a null Signal-K delta can't publish 0V
 
 ### Solar Priority (`SolarPriority.json`)
 
-Automatically uses solar power instead of shore power when solar production can cover AC loads. Prevents energy waste when the boat is idle with the charge slider set below 100% (which otherwise stops solar production while shore powers all loads).
+Automatically powers AC loads from solar instead of shore power when the panels can carry them. Designed for storage mode: the battery is held at ~60% SOC by the Max Charge slider and the goal is **zero energy cycled through the battery** — battery power is therefore the primary control signal, not PV-vs-load comparison.
 
-**Problem**: When the battery sits at the CVL ceiling (e.g., 60% slider), MPPTs produce nothing — so there is no PV power reading to compare against load. The flow solves this by estimating available solar capacity from the panel open-circuit voltage (Voc), which is always readable even when MPPTs are idle.
+**Problem**: When the battery sits at the CVL ceiling (e.g., 60% slider), MPPTs produce nothing — so there is no PV power reading to compare against load. The flow estimates available solar capacity from the panel open-circuit voltage (Voc), which is readable even when MPPTs are idle.
 
-**Mechanism**: Controls the Quattro's `IgnoreAcIn1` D-Bus path. When solar is estimated to be sufficient, AC input is ignored → Quattro inverts from battery → battery SOC dips below CVL → MPPTs ramp up → solar effectively powers loads. No backfeed risk (AC input is simply disconnected, not reversed).
+**Mechanism**: Controls the Quattro's `IgnoreAcIn1` D-Bus path. When solar is estimated sufficient, AC input is ignored → Quattro inverts from battery → battery dips below CVL → MPPTs ramp up → solar powers the loads. No backfeed risk (AC input is disconnected, not reversed). While enabled, the flow owns this path and re-asserts the desired value every 30s (survives vebus restarts and external writes); while disabled it never writes after the initial return to shore, so manual control stays possible.
 
-**Power estimation from Voc**:
-- Linear model: `P_est = P_rated × max(0, (Voc - VOC_ZERO) / (VOC_FULL - VOC_ZERO)) × gain`
-- `VOC_ZERO` (default 30V): panel voltage below which power is negligible
-- `VOC_FULL` (default 80V): panel voltage at full sun
-- `P_rated`: total rated panel wattage (configurable via VRM slider, default 500W)
-- `gain`: self-tuning correction factor (starts at 1.0, adjusts after each probe)
+**Power estimation**:
+- Idle MPPT (PV < 30W): `P_est = P_rated × clamp((Voc - 30V) / (80V - 30V)) × gain` — `/Pv/V` reads true open-circuit voltage
+- Producing MPPT: `/Pv/V` reads Vmp (lower than Voc), so the estimate becomes `max(actual PV power, Voc model)` — actual production is a live lower bound on capacity
+- `P_rated`: total rated panel wattage (VRM slider, default 500W); `gain`: self-tuning correction factor
 
-**Self-tuning**: After each probe, the flow compares the Voc-based estimate against measured PV power and adjusts the gain: `gain = 0.85 × gain + 0.15 × (actual / estimated)`, clamped to [0.3, 3.0]. Over multiple cycles this converges to an accurate mapping for the specific panel installation, accounting for orientation, shading, temperature, and aging.
+**Self-tuning (throttle-aware)**: A throttled MPPT (battery at CVL ceiling) produces exactly the load, not its capacity — naively comparing that to the estimate would spiral the gain down. The gain is therefore only tuned **down** after a *failed* probe (battery discharging at ramp end ⇒ MPPTs were provably unthrottled ⇒ measured PV *is* the real capacity), and only tuned **up** when measured PV exceeds the estimate (lower-bound evidence). Update: `gain ×= 0.85 + 0.15 × (actual / estimated)`, clamped to [0.3, 3.0]. Persisted across reboots.
 
-**Load averaging**: AC consumption is smoothed with a 60-second rolling average to avoid reacting to transient spikes.
+**Data inputs** (each stored as `{value, timestamp}`; any critical input staler than 30s forces shore):
+- `com.victronenergy.solarcharger` `/Pv/V` — panel voltage, from one MPPT
+- `com.victronenergy.system` `/Dc/Pv/Power` — total DC-coupled PV power (W)
+- `com.victronenergy.system` `/Ac/Consumption/L1/Power` — AC consumption (instant + 60s *time-based* rolling average)
+- `com.victronenergy.system` `/Dc/Battery/Soc` — battery SOC (%)
+- `com.victronenergy.system` `/Dc/Battery/Power` — battery power (W, + charging / − discharging) — the truth signal
+- `com.victronenergy.vebus` `/Ac/ActiveIn/ActiveInput` — command feedback (0 = AC-in 1, 240 = inverting); optional but detects an ineffective `IgnoreAcIn1` write (wrong service selected — otherwise the flow would fake-enter solar mode while still on shore) and an absent shore connection (probing is blocked when there is no fallback)
 
-**Data inputs**:
-- `com.victronenergy.solarcharger` `/Pv/V` — panel open-circuit voltage (V), from one MPPT
-- `com.victronenergy.system` `/Dc/Pv/Power` — total DC-coupled PV power (W), sum of all MPPTs
-- `com.victronenergy.system` `/Ac/Consumption/L1/Power` — AC consumption phase 1 (W)
-- `com.victronenergy.system` `/Dc/Battery/Soc` — battery state of charge (%)
+**Control output** (`com.victronenergy.vebus`): `/Ac/Control/IgnoreAcIn1` — 0 = accept shore, 1 = ignore shore. Shore is assumed on AC input 1 (see the flow's SETUP comment for AC-in-2 systems).
 
-**Control output** (`com.victronenergy.vebus`):
-- `/Ac/Control/IgnoreAcIn1` — 0 = accept shore, 1 = ignore shore
+**State machine** (`shore` → `probe` → `solar`):
+- **Shore → Probe**: estimate ≥ avg load × 1.2 AND ≥ 100W AND SOC ≥ 40% AND shore present, all sustained for 30s (no probing on a sun glint), gated by cooldown + backoff → disconnect shore
+- **Probe (60s ramp)**: PV and battery power are averaged over the final 15s (a passing cloud at the evaluation instant can't fail an otherwise good probe). Aborts early if a load bigger than the estimate appears (3s sustained). At ramp end:
+  - **→ Solar**: battery not discharging (> −50W avg) — solar covers *everything* including DC loads and inverter losses
+  - **→ Shore**: battery discharging → gain tuned down (reliable measurement), exponential backoff
+  - **→ Shore (FAULT)**: feedback still shows AC-in 1 → `IgnoreAcIn1` ineffective → 1h lockout, no gain pollution
+- **Solar → Shore** (all safety exits bypass cooldown):
+  - Big load: battery discharge > 400W sustained 3s → immediate reconnect (uses instant readings, not the average)
+  - Deficit: battery discharge > 50W sustained 15s (clouds, evening)
+  - SOC drift: SOC falls 2% below its value at solar entry, or below 40%
+  - Emergency: SOC < 30% from any state → immediate shore + 1h lockout
+  - Fault: feedback shows AC re-accepted externally despite re-asserts → shore + 1h lockout
+- **Anti-cycling**: 5 min cooldown between transitions; failed probes back off exponentially 5→10→20→40→60 min (capped). Backoff is released early when Voc rises ≥ 5V above its value at the last failure (sky materially brighter), after a ≥ 30 min stable solar stint, or on re-enable.
+- **Disabled / missing / stale data**: always returns to shore (safe state). A `catch` node forces shore on any decision-engine exception; a safe-start inject writes 0 at startup.
 
-**State machine** (three states: `shore`, `probe`, `solar`):
-- **Shore → Probe**: estimated PV ≥ avg load × 1.2 AND est ≥ 100W AND SOC ≥ 40% AND cooldown elapsed → disconnect shore
-- **Probe (60s)**: MPPTs ramp up; after 60s, evaluate actual PV power
-  - **Probe → Solar**: actual PV ≥ avg load × 1.2 → stay on solar (self-tune gain)
-  - **Probe → Shore**: actual PV < required → reconnect shore (self-tune gain)
-- **Solar → Shore**: avg load > actual PV for 15 continuous seconds, OR SOC < 40%
-- **Emergency reconnect**: SOC < 30% → immediate shore from any state, no delay
-- **Cooldown**: 5 minutes minimum between any transitions (anti-cycling)
-- **Disabled/missing data**: always defaults to shore (safe state)
+**Persistence** (`solar-priority-state.json`, same writable-dir discovery as Virtual BMS): enable state, PV capacity, and learned gain survive Node-RED restarts, redeploys, and reboots — after a marina power cut the flow resumes on its own. Restore runs ~6s after startup and pushes values back to the VRM switches (catch + retry ×5); saves are blocked until restore has run so startup echoes can't clobber the file.
 
-**VRM dashboard** ("Solar" group):
-- "Solar Priority" on/off toggle (disabled by default)
-- "PV Capacity" slider (100–2000W, step 50W) — set to total rated panel wattage
+**VRM dashboard** ("Solar" group): "Solar Priority" on/off toggle, "PV Capacity" slider (100–2000W, step 50W).
 
-**Setup required**: After import, (1) open "PV Voltage" node and select an MPPT solar charger, (2) open "AC Input Control" node and select the Quattro.
+**Setup required**: After import, (1) open "PV Voltage" and select an MPPT solar charger, (2) verify "AC Input Control" and "AC Input Feedback" point at the Quattro (pre-filled with `vebus/276`), (3) verify the four `victron-input-system` nodes.
+
+### Instance Registry (`InstanceRegistry.json`)
+
+Pins every virtual device the flows publish to a fixed dbus service name **and** a fixed VRM/device instance, so redeploys and restarts can never mint new instances. Previously instances were assigned dynamically (localsettings auto-allocation in registration order), which littered the Signal K data model with orphan paths (e.g. four generations of tank paths `tanks.freshWater.81/83/85/89` + matching `wasteWater.82/84/86/90` from one sender, and dead GPS services `vi1_uc1479909` / `vi2_uc1548484`).
+
+**Why instances drifted**: the victron palette derives the dbus service name from the Node-RED node ID (`com.victronenergy.<class>.virtual_<nodeId>`) and proposes a default instance; localsettings then auto-assigns the next free number in registration order. Any regenerated node ID (copy/paste re-import, flow rebuild) or reset settings entry mints a brand-new service + instance — and Signal K keys its paths off both, so each generation leaves an orphan.
+
+**Design**:
+- The function node **"Instance Registry (single source of truth)"** holds the *only* table mapping each virtual device (node ID → service name, class, source identity) to a hand-assigned instance. Nothing anywhere may derive an instance from an array index, discovery order, a loop counter, a timestamp, or a hash.
+- Instances come from the reserved block **200–255**, far above anything Venus auto-assigns (native devices allocate from 0 upward): 200–209 batteries, 210–219 motor drives, 220–239 switches, 240–255 spare. Never reuse a number, even after deleting a device.
+- **Idempotent enforcement**: on startup (10s inject) and via the manual "Enforce + audit now" inject, the flow pre-seeds `/Settings/Devices/virtual_<id>/ClassAndVrmInstance` (AddSetting keeps an existing value, so re-runs never clobber), pins it with SetValue when it differs, then compares the live service's `/DeviceInstance`. Existing services are updated in place — the service name never changes, so a redeploy can never create a second copy. A `RECONVERGE` warning means the service registered before the pin landed (first-ever deploy only); one more deploy converges it.
+- **Audit + cleanup**: the audit lists `virtual_*` settings entries that are neither in the registry nor live (orphans from dead services); a separate manual inject removes them via `RemoveSettings`. Live-but-unregistered services (e.g. an older flow version still deployed, like CZone v5) are only warned about and never removed. After removing orphans, restart Signal K (`svc -t /service/signalk-server`) so its cached dead paths disappear.
+
+**Device instance allocation** (authoritative copy lives in the registry node — keep in sync):
+
+| Instance | Class | Service `com.victronenergy.…` | Device | Source identity |
+|----------|-------|-------------------------------|--------|-----------------|
+| 200 | battery | `battery.virtual_bms03a00000000050` | REC-BMS Main Bank | REC-BMS 9M-0485, CAN-BMS 0x351–0x404 via YDNB-07 |
+| 201 | battery | `battery.virtual_bat1_virtual` | House 12V | N2K addr 16, PGN 127506/127508 |
+| 202 | battery | `battery.virtual_bat2_virtual` | Bow 12V | N2K addr 16, PGN 127506/127508 |
+| 203 | battery | `battery.virtual_bat3_virtual` | Stern 12V | N2K addr 16, PGN 127506/127508 |
+| 204 | battery | `battery.virtual_bat4_virtual` | Port Engine 12V | PGN 127489 src 141, engine instance 0 |
+| 205 | battery | `battery.virtual_bat5_virtual` | Starboard Engine 12V | PGN 127489 src 142, engine instance 1 |
+| 210 | motordrive | `motordrive.virtual_gl6gk_port` | Port E-Motor | CANopen node 0x0A, PGN 127493 instance 0 |
+| 211 | motordrive | `motordrive.virtual_gl6gk_stbd` | Starboard E-Motor | CANopen node 0x0B, PGN 127493 instance 1 |
+| 220 | switch | `switch.virtual_bms03a00000000060` | Max Charge Slider | VRM control only |
+| 221 | switch | `switch.virtual_sp_switch_001` | Solar Priority Toggle | VRM control only |
+| 222 | switch | `switch.virtual_sp_rated_switch` | PV Capacity Slider | VRM control only |
+| 225–235 | switch | `switch.virtual_cz_vs_sw1`…`sw11` | CZone Bilge1, Bilge2, Horn, Helm, Nav, Anchor, Red, Fly, Underwater, Bow1, Bow2 | CZone PGN 127501/127502 |
+| 236–255 | — | — | spare | — |
+
+**Rules for adding a device**: hand-write a stable, dot-free node ID (never let Node-RED generate one); add a registry row using the next free number in the correct block; deploy. Never let a virtual device register without a registry row.
+
+**Verification** (`verify_pinning.py`): snapshots the service→instance map, `virtual_*` settings entries and the Signal K model (tanks/electrical/propulsion), restarts Node-RED three times, and fails if any snapshot gains a service, changes an instance, or grows a new Signal K path. Password via `CERBO_PASS` env var or prompt. Run it after every change to the registry or to flows containing virtual devices.
 
 ## Key Technical Notes
 
