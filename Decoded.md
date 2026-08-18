@@ -42,7 +42,7 @@ A0 05 00 00 00 00 00 00
 0x05A0 = 1440. Likely remaining capacity — 1440 Wh, or 1440 × 0.1 Ah = 144 Ah remaining (which would be ~72% of a 200 Ah bank, aligning with 71.99% SOC and suggesting nominal capacity is ~200 Ah).
 
 0x380 — Serial Number (ASCII)
-39 4D 2D 30 34 38 35 00 → "9M-0485"
+39 4D 2D 30 34 38 35 00 → BMS serial, ASCII
 
 0x381 — Status / Reserved
 00 00 00 00 00 00 00 00 → All zeros — no active status flags.

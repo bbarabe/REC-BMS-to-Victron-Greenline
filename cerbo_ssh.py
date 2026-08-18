@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Read-only SSH helper for Cerbo GX. Runs a command, prints output.
+"""Read-only SSH helper for a Cerbo GX. Runs a command, prints output.
+
 Usage: cerbo_ssh.py "<command>" [timeout_seconds]
+Host from CERBO_HOST (default venus.local), password from CERBO_PASS.
 """
 import os, sys, paramiko
 
-HOST = "192.168.50.107"
+HOST = os.environ.get("CERBO_HOST", "venus.local")
 USER = "root"
 PASS = os.environ.get("CERBO_PASS")
 if not PASS:

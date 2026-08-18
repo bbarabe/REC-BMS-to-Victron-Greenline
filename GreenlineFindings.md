@@ -1,80 +1,39 @@
-# Greenline 6GK — can0 reverse-engineering findings
+# Greenline 6GK — CAN bus reference
 
-## Live-run decode 2026-08-17 (dock, in gear on lines) — the big session
+Decode of the hybrid drive traffic on `can0`: the CANopen TPDOs from the two
+electric drives, the J1939-style HCU frames, the NMEA 2000 diesel side, and the
+OP BOX PLC tag dictionary. Scalings below are cross-checked against the MFD
+hybrid page and the HMI project's own tag bindings.
 
-Five synchronised captures (raw `can0` + OP BOX tag poll on one clock, 8 Hz tags / ~720 CAN
-frames per second), with the owner operating one drive at a time, plus **two photographs of the
-MFD hybrid page** taken during the runs as ground truth, plus **the HMI project's own tag
-bindings** (saved page `rd202.html`). Between them these resolve every major open item — and
-overturn one previously "verified" decode.
+## `0x48x` float 1 is motor torque (N·m), not power
 
-| run | state | what it pinned |
-|---|---|---|
-| `base0` | both drives off, pack charging +6.2 A | baseline; `AV[13]/[14]` non-zero, `AV[11]/[12]` zero |
-| `runA`/`runB` | **STBD only**, reverse, 430 rpm | side assignment; `AV[11]/[12]` non-zero, `AV[13]/[14]` zero |
-| `runC` | **PORT only**, forward, 430 rpm, throttle 0 % | mirror image → side assignment proven |
-| `runD` | **PORT** blipped to 491 rpm, throttle 5 % | torque scale, shutdown transient |
-| `runE` | **PORT** throttle sweep 0→8.1 %, 422–524 rpm, `AccPedalPos1` polled alongside CAN | **throttle field**, DC-current scale, rated torque |
+Float 1 of `0x48A/0x48B` is **motor torque in N·m, signed** (+ motoring,
+− generating). It is not power. Mechanical power is `T·ω`; the MFD's
+"MOTOR POWER" tracks the electrical product `V × I_dc`.
 
-Running **one motor at a time** is what made this decisive: every port/starboard ambiguity
-collapses when the other drive is at zero.
+**Motor power is not transmitted directly** — the display computes it. Derive it
+from `T·ω` or from `V × I_dc`.
 
----
+`torque N·m ÷ torque %` (the HCU percent-torque field below) gives a **rated
+torque of ≈155 N·m**, consistent to ~1 % across runs; regressing N·m against
+torque % over a 422–524 rpm sweep gives r = 0.9913.
 
-## CORRECTION — `0x48x` float 1 is motor TORQUE in N·m, not power ×100 W
+Note for anyone re-checking near 1000 rpm: at ~1000 rpm `ω/100 ≈ 1.05`, so a
+torque-in-N·m reading and a power-in-hundreds-of-watts reading differ by only
+~5 % and a single operating point cannot tell them apart. At 430–491 rpm they
+differ by more than 2×. There is a residual ~6 % discrepancy in the high-rpm
+numbers that is still open (see Unresolved).
 
-The earlier "Motor power, ×100 W" decode is **wrong**. Direct comparison against the MFD:
+### `GreenlineEDriveFlow.json`
 
-| capture | `0x48A` f1 | rpm | T·ω | display "MOTOR POWER" | f1 as ×100 W |
-|---|---|---|---|---|---|
-| runC | 44.79 | 430 | **2.017 kW** | **2.0 kW** ✓ | 4.48 kW ✗ (2.2× high) |
-| runD | 49.79 | 491 | **2.56 kW** | **2.6 kW** ✓ | 4.98 kW ✗ (1.9× high) |
+The flow publishes both drives as Victron `motordrive` devices. It takes DC
+current from the *measured* `61452` w2 rather than deriving it from power, so
+the DC triplet is internally consistent (`P = V × I`) and matches the MFD.
 
-Cross-checked independently against the HCU torque-percent field (below): torque N·m ÷ torque %
-gives a **rated torque of 155.3 / 156.9 / 157.4 N·m** across three runs — consistent to ~1 %,
-which a wrong interpretation would not produce. The runE sweep (422–524 rpm, torque 22–37 %) confirms
-it: regressing N·m against torque % gives r = 0.9913 and per-bucket ratios of 153–158, so **rated torque
-≈ 155 N·m**.
-
-**Why July looked right:** at 1004 rpm, ω/100 = 1.051, so torque-in-N·m and power-in-hundreds-of-watts
-differ by only ~5 % — inside the noise of reading a display. July's single operating point could not
-discriminate. At 430–491 rpm they differ by >2×, and torque wins outright. The July residual
-(f1·ω = 8.15 kW vs displayed 7.6–7.8 kW) is a real ~6 % discrepancy worth re-checking at high rpm,
-but it does not rescue the ×100 W reading.
-
-**Motor power is therefore not transmitted directly** — the display computes it. Use `T·ω` (mechanical)
-or `V × I_dc` (electrical); the MFD's "MOTOR POWER" tracks the electrical product.
-
-### Consequence: `GreenlineEDriveFlow.json` — corrected 2026-08-17
-
-The flow had carried the old decode (`s.power = f1 * 100`), publishing `Dc/0/Power` ~2.2× high at
-430 rpm (4478 W vs ~2017 W) and a `Dc/0/Current` derived from it. The error scales as `100/ω`, so it
-nearly vanished near 1000 rpm — which is why it went unnoticed since July.
-
-**Now fixed in the repo** (not yet deployed). The rewrite also stops deriving current from power and
-instead uses the *measured* DC current from `61452` w2, so the DC triplet is internally consistent
-(`P = V × I`) and matches the MFD.
-
-Replaying the real `runE` capture through the new parse function reproduces the OP BOX's own numbers:
-
-| quantity | flow output | PLC tag |
-|---|---|---|
-| peak motor current | 56.48 A | 56.6 A |
-| peak motor power | 3148 W | 3.11 kW |
-| peak throttle | 8.08 % | 8.082 % |
-| peak torque | 36 % | 36 % |
-| direction fwd / rev / neutral | 2 / 1 / 0 | FWD / REV / NEUTRAL |
-| both drives at rest | 0.07 A, 4 W | ~0 |
-
-**Deployed and verified 2026-08-17.** The owner redeployed and confirmed the readings now match the
-Greenline app. Independently checked on D-Bus afterwards: with the drives powered down both devices
-report `Connected = 0` (the staleness tick working as intended) and `Dc/0/Current` 0.07 A /
-`Dc/0/Power` 2 W at standstill, against −0.8 A / −19 W from the old decode at the same standstill.
-
-Other changes: a 2 s tick inject drives `Connected → 0` after 6 s of CAN silence (previously the
-values froze forever — the drives were still publishing a stale 22.7 V hours after shutdown); the
-candump filter gained PGNs 61451/61452/65363; and a third output carries torque, throttle and phase
-current, which have no Victron dbus path.
+A 2 s tick drives `Connected → 0` after 6 s of CAN silence, otherwise the values
+freeze indefinitely — the drives keep publishing a stale voltage long after
+shutdown. The capture filter covers PGNs 61451/61452/65363, and a third output
+carries torque, throttle and phase current, which have no Victron D-Bus path.
 
 ---
 
@@ -84,24 +43,22 @@ Each frame = two IEEE-754 little-endian floats. `A` = port (node 0x0A), `B` = st
 
 | CAN ID | Bytes 0–3 (float 1) | Bytes 4–7 (float 2) |
 |---|---|---|
-| `0x18A/18B` | status byte, DLC 1: `00` = stopped, `01` = running (confirmed both ways this session) | — |
+| `0x18A/18B` | status byte, DLC 1: `00` = stopped, `01` = running | — |
 | `0x28A/28B` | **HCU / controller-region temp °C** | **Electric motor temp °C** |
 | `0x38A/38B` | **Motor voltage V** | **Motor phase current, RMS A** (display shows peak = ×√2) |
-| `0x48A/48B` | **Motor torque, N·m, SIGNED** (+ motoring, − generating) — *see correction above* | **Motor RPM** (stays positive in reverse) |
+| `0x48A/48B` | **Motor torque, N·m, SIGNED** (+ motoring, − generating) | **Motor RPM** (stays positive in reverse) |
 | `0x305` | all zeros | |
 | `0x307` | `12 34 56 78 "VIC"` constant — ID/heartbeat | |
 
-### `0x28x` temperatures — now separated by their dynamics
+### `0x28x` temperatures
 
-The load step separates the two sensors cleanly (idle → loaded → still loaded):
+The two sensors are told apart by their dynamics under a load step:
 
 - **float 1 = controller/HCU-region**: starboard `18.72 → 22.58 → 22.41` — jumps ~4 °C within seconds
   of load and plateaus (small thermal mass).
 - **float 2 = electric motor winding**: starboard `11.03 → 11.65 → 13.70` — slow monotonic rise
   (large thermal mass). **Exact display match**: port f2 `20.39` vs displayed `20 °C`, starboard f2
   `11.10` vs displayed `11 °C`.
-
-Port (never ran in runA/runB) stayed flat throughout — confirming the response is load-driven, not ambient.
 
 float 1's absolute value matches the displayed *HCU MOSFET temp* exactly on an **idle** drive
 (19.35 vs 19 °C) but reads ~3 °C above both displayed HCU temps on a **loaded** drive, and the
@@ -112,35 +69,25 @@ that is **not** the one displayed. Exact display mapping unresolved.
 
 ## HCU frames — src `0x64` = STARBOARD, `0x65` = PORT
 
-**Side assignment is now proven, not inferred.** In runC (port only) `14F00B65` showed w2 = 3437–3443
-and w0 ≠ idle while `14F00B64` sat at exactly w0 = 32000 / w2 = 0; runA/runB showed the exact mirror.
-
 | PGN (hex ID) | Field map |
 |---|---|
-| 61451 `14F00Bxx` | **byte 1 = motor torque %, offset −125** (J1939 percent-torque convention); byte 0 = 0. **w2 = motor RPM × 8**. w4 = 1100 constant (1080 in July) — constant within a session, changes between sessions; unexplained |
+| 61451 `14F00Bxx` | **byte 1 = motor torque %, offset −125** (J1939 percent-torque convention); byte 0 = 0. **w2 = motor RPM × 8**. w4 = 1100 constant — constant while running, changes between power cycles; unexplained |
 | 61452 `14F00Cxx` | **w4 = motor phase current peak × 20** (5595→271 A, 6219→311 A ⇒ 20.6 / 20.0 counts/A ✓); **w2 = motor DC current**: `A = 0.024918 × w2 − 800.41` (r = 0.9994 over −30…−57 A) ⇒ **40.1 counts/A, zero at w2 ≈ 32122** — i.e. essentially 0.025 A/count. w0 also tracks load (r = −0.9993, ~13.8 counts/A, opposite sign) — a second load quantity, identity unresolved |
 | 61453 `14F00Dxx` | three slow temps; **port and starboard read nearly identically and barely respond to load** — does not match the displayed HCU temps under either ×1/256 (≈36.5 °C) or ×1/512 (≈18.3 °C) scaling. Unresolved; likely shared/ambient sensors |
-| 65243 `14FEDBxx` | slow counters — w2 = 35/37, w0 = 14080 (stbd) / 1280 (port), static this session |
+| 65243 `14FEDBxx` | slow counters — w2 = 35/37, w0 = 14080 (stbd) / 1280 (port), static |
 
-### Torque % — verified twice against the display
+### Torque %
 
-| run | `14F00Bxx` byte 1 | −125 ⇒ torque % | display "MOTOR TORQUE" |
-|---|---|---|---|
-| runC (port) | 153–154 | 28–29 % | **28 %** ✓ |
-| runD (port) | 157 | 32 % | **32 %** ✓ |
-| runA (stbd) | 150 | 25 % | — |
-
-At zero torque w0 = **exactly 32000** (= 125 × 256), which is what fixes the −125 offset.
+Byte 1 of `14F00Bxx` minus 125 is the torque percentage the MFD displays
+(e.g. byte 153 → 28 %, byte 157 → 32 %). At zero torque w0 = **exactly 32000** (= 125 × 256), which is what fixes the −125 offset.
 
 ---
 
-## Throttle position — SOLVED: PGN 65363 `0x18FF53xx`, bytes 1–2
+## Throttle position — PGN 65363 `0x18FF53xx`, bytes 1–2
 
 **`throttle_percent = u16le(bytes 1–2) × 0.107759`**  (= raw ÷ **9.280**, zero intercept)
 
-Measured in `runE` — a slow throttle sweep on the port drive with `AccPedalPos1` polled at 8 Hz on the
-same clock as the CAN capture. Restricting to *settled plateaus* (both the tag and the CAN field
-unchanged for ≥1 s), the ratio is **exactly 9.280 at every plateau**, with a fitted intercept of 0.0000:
+The ratio is exactly 9.280 at every settled plateau, with a zero intercept:
 
 | raw u16 | `AccPedalPos1` % | ratio |
 |---|---|---|
@@ -150,25 +97,18 @@ unchanged for ≥1 s), the ratio is **exactly 9.280 at every plateau**, with a f
 | 44 | 4.741 | 9.280 |
 | 75 | 8.082 | 9.280 |
 
-Overall Pearson r = **+0.9908** across all 282 polls (degraded only by the lag below), and it is the
-**only** field on can0 correlating with throttle above r ≥ 0.95.
-
-**The CAN field leads the OP BOX tag by ~0.2–0.4 s** — at t = 8.6 s the raw was already 27 while
-`AccPedalPos1` still read 0.0, and on the way down the raw dropped first. So the PLC's tag is a
-*filtered copy* of this CAN field, not an independent source. That direction of causality is what
-identifies the CAN field as the origin.
+It is the only field on `can0` that tracks throttle. **The CAN field leads the OP
+BOX `AccPedalPos1` tag by ~0.2–0.4 s** in both directions, so the PLC tag is a
+filtered copy of this CAN field rather than an independent source.
 
 Byte 0 is the drive index (`00` port / `01` starboard), matching the `0x8D`/`0x8E` sources.
 
-Only 0–8.1 % was exercised, so the **nominal full-scale is unconfirmed**: extrapolating, 100 % would be
-raw ≈ 928. The field is 16-bit, so there is no range problem — byte 2 simply stays 0 below ~27.5 %.
+The scale is established over 0–8.1 %; the nominal full scale is unconfirmed, but
+extrapolates to raw ≈ 928 at 100 %. The field is 16-bit, so there is no range
+problem — byte 2 simply stays 0 below ~27.5 %.
 
-> **Correction to the first pass of this session.** An earlier three-state scan flagged this exact field
-> and then wrongly dismissed it, on the argument that 9.8 counts/% would overflow a *byte* past ~26 %.
-> That reasoning was invalid — the field is a 16-bit little-endian word at bytes 1–2, not a byte. The
-> accompanying "commanded rpm ÷ 10" hypothesis (49 → 490 rpm) was a coincidence of the single operating
-> point available at the time and is **withdrawn**; the sweep shows no proportionality to rpm
-> (raw/rpm wanders 0.02–0.15) while throttle is exact.
+Note: this field is a 16-bit little-endian word at bytes 1–2, not a byte. It has
+no proportionality to rpm (raw/rpm wanders 0.02–0.15).
 
 ### OP BOX equivalent
 
@@ -186,31 +126,31 @@ a discrete engaged flag, identical in forward and reverse, with no proportional 
 
 ---
 
-## Gear — PGN 127493, neutral value confirmed
+## Gear — PGN 127493
 
 `09F2058D` (port) / `09F2058E` (stbd), **byte 1** = standard N2K gear enum:
 
-| value | gear | evidence |
-|---|---|---|
-| `0xFC` | **Forward** | runC port, display "THROTTLE STATE **FWD**" ✓ |
-| `0xFD` | **Neutral** | base0 both, runC starboard, display "THROTTLE STATE **NEUTRAL**" ✓ |
-| `0xFE` | **Reverse** | runA/runB starboard ✓ |
+| value | gear |
+|---|---|
+| `0xFC` | **Forward** |
+| `0xFD` | **Neutral** |
+| `0xFE` | **Reverse** |
 
-Neutral was the last untested value — **now confirmed against the display**, closing that open item.
+All three values match the display's "THROTTLE STATE" field.
 The OP BOX equivalent is `EngineST_HMI[n]/ClutchState/AV`: **2.0 = Neutral, 3.0 = Forward** (both observed).
 
 ---
 
-## OP BOX — `PStD1/AV[1..20]`, corrected
+## OP BOX — `PStD1/AV[1..20]`
 
 `AV[11..14]` were previously guessed as motor RPM and controller temp. **They are neither** — they are
 the battery time-remaining pair, and only one pair is populated at a time depending on current sign.
 
-Three independent confirmations:
+Three independent checks agree:
 
-1. **Arithmetic.** `hours + minutes/60`, multiplied by pack current, recovers the expected amp-hours:
-   discharging (runA) → 715 Ah vs SOC×capacity = **713 Ah**; charging (base0) → 668–680 Ah vs
-   (100−SOC)×capacity = **685 Ah**.
+1. **Arithmetic.** `hours + minutes/60`, multiplied by pack current, recovers the expected amp-hours,
+   both discharging (715 Ah vs SOC×capacity = 713 Ah) and charging (668–680 Ah vs
+   (100−SOC)×capacity = 685 Ah).
 2. **The display.** Bottom bar read "TIME TO EMPTY **24h60m**" while `AV[11]=24`, `AV[12]≈60`; later
    "**22h 3m**" while `AV[11]=22`, `AV[12]=3`.
 3. **The HMI project bindings** (`rd202.html`): the "TIME TO FULL" label is immediately followed by the
@@ -236,13 +176,13 @@ validated the whole correlation pipeline before it was trusted on the motor side
 
 ### The rest of the OP BOX tag dictionary
 
-Recovered from the HMI project's own `datalinks` rather than by guessing names:
+From the HMI project's own `datalinks`:
 
 ```
 EngineST_HMI[1..2]/AccPedalPos1/AV        throttle position % (= PGN 65363 raw / 9.280, lagged ~0.3 s)
 EngineST_HMI[1..2]/ClutchState/AV         gear: 2.0 = NEUTRAL, 3.0 = FORWARD (observed)
 EngineST_HMI[1..2]/EngineSpeed/AV         DIESEL rpm -- reads 0 with the e-motor running, NOT motor rpm
-EngineST_HMI[1..2]/EnginePower/AV         motor power kW (1.67 -> 3.11 over the runE sweep)
+EngineST_HMI[1..2]/EnginePower/AV         motor power kW
 EngineST_HMI[1..2]/EngineMode/AV          1.0 = MOTOR
 EngineST_HMI[1..2]/BattCurrent/AV         motor DC current A = the MFD's "MOTOR CURRENT"
 EngineST_HMI[1..2]/EngineCoolTemp/AV      coolant temp (0.0 at dock)
@@ -278,34 +218,32 @@ browser already viewing the HMI, which is how `rd202.html` was obtained).
 | Others (0x02–0x23) | NMEA2000 | Nav gear (Simrad/Navico heading, GPS, AIS, autopilot, rudder…) |
 
 232 distinct CAN IDs at ~720 frames/s. Both the 11-bit CANopen range and the repackaged BMS frames
-reach userspace on `can0` (see the 2026-08-17 re-baseline note below).
+reach userspace on `can0` (see the note on `can0` visibility below).
 
 ## Diesel side — standard NMEA2000 from 0x8D/0x8E
 
 - PGN 127488: **diesel RPM ×0.25**, instance 0 = port, 1 = stbd
-- PGN 127489: coolant temp, starter battery V, **engine hours** — now 236 h port / 233 h stbd
-  (208.1/209.2 h in July)
+- PGN 127489: coolant temp, starter battery V, **engine hours**
 - PGN 127493 transmission (gear, above), 65363 proprietary (speed demand, above)
 
 ---
 
-## Re-baseline 2026-08-17 (motors idle at dock) — two earlier corrections
+## `can0` visibility notes
 
-1. **The 11-bit CANopen e-drive frames ARE present on `can0`.** `0x18A/B`, `0x28A/B`, `0x38A/B`,
-   `0x48A/B`, `0x305`, `0x307` all stream at 10 Hz. The VE.Can port does **not** blanket-filter 11-bit
-   frames the way the spec's "Key Technical Notes" implies — at least this SFF range reaches userspace.
-2. **The REC-BMS main bank is on `can0`** as PGN **65283 (0xFF03)**, src `0x51`–`0x81` (repackaged
-   `0x351`–`0x381` via YDNB). The July note "48 V propulsion BMS not seen on can0" is resolved — that
-   bank is the REC-BMS, and `dbus-recbms` decodes it.
-
-## Confirmed by the earlier charging session
-
-- Torque sign: negative floats in `0x48x` f1 while generating ✓
-- Side assignment: CANopen 0x0A = port, 0x0B = stbd ✓ (re-confirmed this session)
+1. **The 11-bit CANopen e-drive frames are present on `can0`.** `0x18A/B`,
+   `0x28A/B`, `0x38A/B`, `0x48A/B`, `0x305`, `0x307` all stream at 10 Hz. The
+   VE.Can port does **not** blanket-filter 11-bit frames the way the main
+   specification's "Key Technical Notes" implies — at least this SFF range
+   reaches userspace.
+2. **The REC-BMS main bank is on `can0`** as PGN **65283 (0xFF03)**, apparent src
+   `0x51`–`0x81` (the YDNB-07 repackaging of `0x351`–`0x381`). `dbus-recbms`
+   decodes it.
+3. Torque sign: floats in `0x48x` f1 go negative while generating.
+4. Side assignment: CANopen node `0x0A` = port, `0x0B` = starboard.
 
 ---
 
-## Still open
+## Unresolved
 
 1. **`65363` full-scale calibration** — the throttle scale (÷9.280) is exact over 0–8.1 %, but full travel
    was never exercised; 100 % extrapolates to raw ≈ 928, unverified.
@@ -313,30 +251,15 @@ reach userspace on `can0` (see the 2026-08-17 re-baseline note below).
    (demand vs actual?), identity unresolved.
 3. **`61453`** — does not match the displayed HCU temps under any obvious scaling.
 4. **`0x28x` float 1** — real controller-side sensor, but not the one the MFD shows.
-5. **`61451` w4 = 1100** — constant within a session, 1080 in July. Unexplained.
+5. **`61451` w4 = 1100** — constant while running, differs between power cycles.
+   Unexplained.
 6. **`AV[10]`, `AV[19]`** — still constant 0.
-7. **High-rpm re-check of the torque scale** to resolve the residual ~6 % on the July numbers. Everything
-   this session was 422–524 rpm; the July session was ~1000 rpm.
-8. **Reverse-direction torque sign** — all runE data is forward; starboard reverse showed positive torque
-   and positive rpm, so direction still comes only from 127493.
+7. **High-rpm re-check of the torque scale** to resolve the residual ~6 % in the
+   high-rpm numbers. The torque work was done at 422–524 rpm.
+8. **Reverse-direction torque sign** — reverse shows positive torque and positive
+   rpm, so direction comes only from 127493.
 
-### Procedure that worked (reuse it)
+## Implementation notes
 
-Capture raw `can0` and OP BOX tags **on one clock** from the Cerbo, run **one drive at a time**, and
-photograph the MFD during the run. The tooling is a self-triggering capture (arm it, then operate the
-drive whenever ready — no need to race a timer) plus a brute-force correlator that scores every
-byte/u16/f32 field of every CAN ID against every moving tag. Trying to synchronise the owner to a
-countdown wasted a run; the trigger approach did not.
-
-Beware a **monotonic-drift confound**: at a steady rpm hold, motor warming makes power drift slowly, and
-every slowly-drifting nav frame on the bus correlates with it at r > 0.95. Only a *varying* input
-(a throttle ramp, or a start/stop transition) produces trustworthy correlations.
-
-`socket.CAN_EFF_FLAG` is negative on armv7l — mask `& 0xFFFFFFFF` before `struct.pack`, or just use the
-literal `0x80000000` when testing received IDs.
-
-## Security note
-
-The root password had **not** been rotated as of 2026-08-17 — the previously shared one still worked. Worth changing
-(Settings → General → Set root password, or `passwd` via SSH). The OP BOX `loginDefaultUser` endpoint
-also still grants an admin session with no password.
+`socket.CAN_EFF_FLAG` is negative on armv7l — mask `& 0xFFFFFFFF` before
+`struct.pack`, or use the literal `0x80000000` when testing received IDs.

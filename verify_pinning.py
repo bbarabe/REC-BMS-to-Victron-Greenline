@@ -30,7 +30,7 @@ import getpass
 
 import paramiko
 
-HOST = os.environ.get("CERBO_HOST", "192.168.50.107")
+HOST = os.environ.get("CERBO_HOST", "venus.local")
 USER = "root"
 RESTARTS = 3
 SETTLE_TIMEOUT = 180   # max seconds to wait for flows to come back up

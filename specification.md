@@ -16,16 +16,34 @@ There are two physically separate CAN bus networks, bridged by a Yacht Devices Y
   - Yanmar engines
   - No chartplotters, switching, or general NMEA 2000 devices on this bus
 
-- **CAN2 (main NMEA 2000 network / Cerbo GX VE.Can port = `can0`)** — 250 kbps:
-  - Cerbo GX (VE.Can port)
-  - CZone digital switching
-  - Simrad chartplotters/MFDs
+- **CAN2 (main NMEA 2000 network / Cerbo GX VE.Can port = `can0`)** — 250 kbps.
+  Node inventory:
+
+  | Addr | Device (from Product Information) |
+  |------|-----------------------------------|
+  | `0x02` | **CZone UC1** (BEP `80-911-0120-00`) — the switching interface |
+  | `0x17` | Simrad **NSX-7 MFD** (fw 2.3.190); `0x16` Navigator, `0x14` iGPS, `0x07` Pilot Controller — same unit, 4 logical nodes |
+  | `0x0C` | **NAC-3 Autopilot** — also the 5 Hz PGN 127501 instance-0 "all OFF" spammer; `0x00` NMEA0183, `0x03` virtual rudder, `0x04` pilot controller, `0x0D` rudder feedback |
+  | `0x05` | OP50 · `0x06` NAP44 Autopilot Controller · `0x1D` RF25 rudder feedback |
+  | `0x0E` `0x18` | GS25 compass / antenna · `0x15` Precision-9 compass |
+  | `0x23` | Airmar DST810 depth/speed/temp · `0x1C` CORTEX VHF/AIS |
+  | `0x10` | **SIMARINE SN01 SiCOM** N2K gateway — the PGN 127506/127508 battery data source |
+  | `0x01` | Sentinel Boat Monitor BM-40 · `0x21` Fusion MS-RA770 ("Galley") |
+  | `0x39` | YDNB-07 bridge · `0xE3` Cerbo GX · `0x64` Signal K |
+
+  - **There is only one CZone node on the bus** (`0x02`). Frames that appear to come from
+    source addresses `0x51`-`0x81` carrying "proprietary PGN 65283" are **not devices at all**:
+    they are the YDNB-07's repackaged REC-BMS frames. The bridge rewrites 11-bit id `0xNNN`
+    as `0x18FF0NNN`, so the original CAN id's low byte lands where a source address would be
+    (`0x351` → apparent src `0x51`) and the PGN decodes as 65283. They decode correctly
+    with the REC-BMS frame map below. Any bus survey of CAN2 must exclude
+    `0x18FF0000/0x1FFFF800` or it will invent phantom nodes.
   - Battery monitors: device address 16 (`n2k-on-ve.can-socket.16`) provides PGN 127506/127508 battery data
   - All other NMEA 2000 devices
   - Receives forwarded traffic from CAN1 via the YDNB-07 bridge
   - **Important**: The VE.Can port filters out 11-bit CAN frames at the hardware/driver level (sun4i_can). Only 29-bit extended frames reach userspace (`candump`). This is why BMS frames must be repackaged.
 
-### YDNB-07 Bridge (Serial: 00070836, Firmware 1.42)
+### YDNB-07 Bridge (Firmware 1.42)
 
 Configuration file: `YDNB.CFG`
 
@@ -43,13 +61,149 @@ Manual: `ydnb07.md` / `ydnb07.pdf`
 - Runs Node-Red with `@victronenergy/node-red-contrib-victron` v1.7.7 and `@signalk/node-red-embedded` v2.18.1
 - Signal-K server decodes NMEA 2000 PGNs into Signal-K paths
 
+## CZone Digital Switching
+
+**Bus behavior**
+
+CZone exposes its switching over three PGNs, plus a proprietary query pair used
+for discovery. All of it is broadcast, so a passive listener on `can0` sees
+everything.
+
+- **PGN 127501 Binary Switch Bank Status** — the CZone UC1 (src `0x02`)
+  broadcasts every 2 s and within ~10 ms of any output change. 8 bytes: byte 0
+  is the bank instance, then 28 two-bit switch fields across bytes 1-7. A field
+  reads `0`/`1` for a configured circuit and `3` for one that is not configured.
+- **PGN 127502 Switch Bank Control** — how a circuit is operated. The MFD uses
+  CAN id `0DF20E17` (priority 3); the same frame from any source address is
+  accepted, including the unclaimed `0xFE`.
+- **PGN 130820 / 65299** — the CZone circuit description reply and its request
+  (see below).
+
+**Interpretation of the 127502 bits is set by the circuit's own CZone
+configuration, not by the sender** — the MFD, the keypads and a driver are all
+treated identically. `00` is never a command in its own right:
+
+- **Latching circuits** (lights): `01` is a button *press* and **toggles** the
+  latched output; `00` is the button release and is ignored. The same `01`
+  frame sent twice therefore turns a light on and then off.
+- **Momentary circuits** (bilge pumps, horn): the output **follows the bit** —
+  `01` = on, `00` = off, no toggling.
+
+CZone applies any of these in 8-15 ms.
+
+**Bank instances.** A CZone configuration can define more than one bank over
+the same physical outputs, each with its own switch types. Every bank the UC1
+serves appears as its own PGN 127501 instance. Bank 1 is the user latch shared
+by the MFD and the keypads and is the one to drive.
+
+The physical output is the **OR** of the banks: a second bank can force an
+output on, but its `00` cannot clear a latch set on bank 1. A control path
+built on a secondary bank can therefore only ever add, never switch off
+something latched at a keypad — which makes it unsuitable as the sole control
+channel. Bank 1 has no such limitation.
+
+- Another device on the bus (the Navico autopilot, src `0x0C`) broadcasts PGN
+  127501 **instance 0** at 5 Hz with every field zeroed. Two consequences: the
+  tracked state must never be taken from it, and — because all 28 fields read
+  as configured — it looks like a 28-circuit bank to anything sizing a bank
+  from the status frame. Reject any instance that is not the UC1's.
+
+### CZone circuit discovery
+
+A CZone bank describes itself over the bus, so nothing about it needs to be
+hardcoded — not the bank instance, not the circuit count, not the names.
+
+**Bank list and bank size come from PGN 127501.** The bank instances the UC1
+broadcasts are the bank list, and the number of two-bit fields that are not `3`
+("unavailable") is the circuit count:
+
+```
+bank 1   payload 01 00 00 C0 FF FF FF FF
+         fields  0000000000033333333333333333
+                 └─ 11 configured ─┘└──── 17 unavailable ────┘
+```
+
+A bank appears and disappears here: configure a second bank and the UC1 starts
+broadcasting its instance; delete it and the instance stops.
+
+**Names and categories come from a query/reply pair.**
+
+*Request — PGN 65299*, single frame, broadcast, CAN id `1CFF13xx` (priority 7):
+
+```
+27 99 | 01 | circuit | bank | tag | 80 | 00
+  │      │      │       │     └── correlation tag; BIT 7 MUST BE CLEAR
+  │      │      │       └── bank instance
+  │      │      └── 0-based circuit index
+  │      └── request type: circuit description
+  └── mfg 295 BEP Marine, industry group 4
+```
+
+*Reply — PGN 130820*, fast-packet, broadcast by the UC1, 2-13 ms later:
+
+```
+27 99 | 01 | tag | 80 | <NUL-terminated name> | 00 00 00 00 | CC CC | 20 00 00
+             │                                                └── category mask
+             └── echoes the request's correlation tag
+```
+
+The 9-byte trailer is constant except bytes 4-5, a little-endian category
+bitmask:
+
+| Mask | Bit | CZone category |
+|------|-----|----------------|
+| `0x0000` | — | (none) |
+| `0x0004` | 2 | Navigation |
+| `0x0400` | 10 | Lighting |
+| `0x1000` | 12 | Pump |
+
+Behaviours that matter when implementing this:
+
+- **The query works from the unclaimed source address `0xFE`.** No address
+  claim, no product-information handshake, no membership in the UC1's node list.
+- **Bit 7 of the correlation tag is a flag, not part of the tag.** Set it and
+  the UC1 answers with a well-formed but *empty* record
+  `27 99 01 <tag & 0x7F> 80 00`, which is indistinguishable from "no such
+  circuit". Always mask the tag to 7 bits.
+- **An empty name means the circuit does not exist**, so a bank can be sized by
+  enumerating until the replies come back empty.
+- Replies are broadcast, so a listener sees the answers to every node's queries.
+- Other manufacturers also use PGN 130820 with their own header; check the
+  first two bytes for `27 99` before decoding.
+
+**The UC1 does not answer ISO Requests.** It replies only to 60928 (address
+claim) and 126996 (product information); requests for 130820, 126998 or 127501
+are refused with an ISO Acknowledgement of `1` (NAK). Discovery must use the
+PGN 65299 query above, and there is no point requesting 127501 — it is
+broadcast every 2 s regardless.
+
+### Switch type is not published
+
+The latching/momentary distinction is absent from every message the UC1 sends.
+It is not in the PGN 130820 record (whose trailer is fully accounted for by the
+category mask), not in any of the UC1's other proprietary PGNs, and there is no
+field anywhere on the bus that separates the momentary circuits from the
+latching ones.
+
+Note that the **category is not a proxy for it**: the horn is categorised
+*Navigation* alongside the nav and anchor lights but is momentary, while the
+bilge pumps are momentary under *Pump*.
+
+The MFD does not need the information either — it sends the same
+press-and-release for every circuit and lets the UC1's circuit logic decide.
+
+Consequence for a driver: the type has to be configured rather than discovered.
+`dbus-czone` keeps it in Venus's own per-output `Settings/Type`, seeded from
+`config.ini` and editable in the GUI, so a change to the CZone configuration
+does not require a code change.
+
 ## Battery Systems
 
 ### Main Battery Bank (REC-BMS via CAN-BMS protocol)
 
 - **Chemistry**: 15S NMC
 - **Nominal capacity**: 1440 Ah (~83 kWh at 58V)
-- **BMS**: REC-BMS, serial "9M-0485"
+- **BMS**: REC-BMS
 - **6 modules**: C8SU1/C7SU1, C14SU2, C13SU4, T1SU3, T1SU4
 - **CAN protocol**: Victron/SMA CAN-BMS, 11-bit standard CAN IDs
 
@@ -65,19 +219,19 @@ CAN frame map (all 8-byte DLC unless noted):
 | 0x360 | Force Charge | Byte 0: 0xFF = force charge requested, 0x00 = normal (not acted upon) |
 | 0x372 | Module Status | Byte 0: modules online, Byte 2: blocking charge, Byte 4: blocking discharge, Byte 6: offline |
 | 0x373 | Cell Min/Max | Min/max cell voltage (mV), min/max cell temp (K) |
-| 0x374-0x377 | Extreme-cell IDs | ASCII labels of the cells/sensors currently holding the extremes: 0x374 min-V cell, 0x375 max-V cell, 0x376 min-T sensor, 0x377 max-T sensor (confirmed on-bus 2026-08-17 — the strings track the extremes, they are not static module IDs) |
-| 0x379 | Capacity | Installed (rated) capacity — constant 1440 regardless of SOC (confirmed 2026-08-17; earlier decodes mislabeled it as remaining) |
+| 0x374-0x377 | Extreme-cell IDs | ASCII labels of the cells/sensors currently holding the extremes: 0x374 min-V cell, 0x375 max-V cell, 0x376 min-T sensor, 0x377 max-T sensor. The strings track the extremes; they are not static module IDs. |
+| 0x379 | Capacity | Installed (rated) capacity — constant regardless of SOC, not remaining capacity |
 | 0x380 | Serial Number | ASCII serial |
 | 0x381 | Unknown | Additional data (not yet decoded) |
 | 0x404 | Heartbeat | Keep-alive (DLC=3) |
 
 **Note**: This REC-BMS does **not** send the standard CAN-BMS alarm frame (0x35A). The Virtual BMS flow generates synthetic alarms based on available data (SOC thresholds, cell imbalance from 0x373, module status from 0x372, CAN staleness).
 
-Full decode: `Decoded.md`, raw capture: `BatteryCAN.md`
+Full decode: `Decoded.md`; frame reference: `BatteryCAN.md`
 
 ### 12V Batteries
 
-Three 12V batteries are monitored by an NMEA 2000 device at address 16 (PGN 127506/127508). The two engine batteries are not on that monitor — their voltage comes from the Yanmar gateways' PGN 127489 (Engine Parameters, Dynamic) *Alternator Potential* field (0.01V resolution, ~2 Hz, transmitted even with engines off; confirmed against known battery voltages 2026-07-07). 127489 carries no SOC or current.
+Three 12V batteries are monitored by an NMEA 2000 device at address 16 (PGN 127506/127508). The two engine batteries are not on that monitor — their voltage comes from the Yanmar gateways' PGN 127489 (Engine Parameters, Dynamic) *Alternator Potential* field (0.01V resolution, ~2 Hz, transmitted even with engines off). 127489 carries no SOC or current.
 
 | Signal-K Path | Name | Source | Available Data |
 |---------------|------|--------|---------------|
@@ -87,7 +241,7 @@ Three 12V batteries are monitored by an NMEA 2000 device at address 16 (PGN 1275
 | propulsion.port.alternatorVoltage | Port Engine | Src 141 (0x8D), PGN 127489, engine instance 0 | Voltage only |
 | propulsion.starboard.alternatorVoltage | Starboard Engine | Src 142 (0x8E), PGN 127489, engine instance 1 | Voltage only |
 
-The 127489 messages also carry engine hours (~208h port / ~209h starboard as of 2026-07-07) and engine temperature; oil temp, coolant pressure, and fuel pressure are not populated (0xFFFF) by these gateways.
+The 127489 messages also carry engine hours and engine temperature; oil temp, coolant pressure, and fuel pressure are not populated (0xFFFF) by these gateways.
 
 ## REC-BMS Driver (`dbus-recbms/`)
 
@@ -103,6 +257,47 @@ Behavior is a 1:1 port of the flow (staged fallback, startup grace, Quattro volt
 - Publishes paths the virtual battery node rejected: hi-res `/Soc` (0.01% from 0x355 bytes 4-5), `/Soh`, `/Capacity` (remaining = SOC × installed), `/ConsumedAmphours` (negative, BMV convention), `/InstalledCapacity` (from 0x379), `/TimeToGo`, `/System/MinCellVoltage`–`MaxCellTemperature` (cell extremes from 0x373), `/System/Min|MaxVoltageCellId` + `/System/Min|MaxTemperatureCellId` (extreme-cell identity from 0x374-0x377), module counts from 0x372, `/History/ChargeCycles`, live `/Serial` + FW/HW version, plus diagnostics: `/RecBms/Phase`, `/RecBms/EqStatus`, `/RecBms/TimeToFull` (from 60s-smoothed charge current) and `/RecBms/ForceChargeRequest` (0x360; forwarded to `/Info/ChargeRequest` only if `forward_charge_request = true` in config).
 
 Install/migration/rollback procedure: `dbus-recbms/README.md`.
+
+## CZone Driver (`dbus-czone/`)
+
+Standalone Python D-Bus service that replaces the Node-RED CZone flow. Runs
+under daemontools (`/service/dbus-czone`, installed via `install.sh`, survives
+firmware updates through `/data/rc.local`), starts seconds after D-Bus at boot
+independently of Signal K / Node-RED, and is untouched by Node-RED deploys.
+
+**Publishes one multi-output switch bank**, the way Venus models the GX IO
+extender (`/opt/victronenergy/dbus-switch/dbus-switch.py`):
+`com.victronenergy.switch.czone` (instance 224) with
+`/SwitchableOutput/output_1..output_N`. The whole bank costs a single device
+instance instead of the eleven the flow consumed, and VRM renders it as one unit.
+
+**Data path**: raw SocketCAN socket on `can0` (kernel filters for PGN 127501 and
+130820, 29-bit only) — no `candump` subprocess, no watchdog, no line parsing.
+
+**Startup** (~5 s): listen to PGN 127501 for the bank list and circuit count,
+then query each circuit for its name and category over PGN 65299/130820 (both
+described under CZone Digital Switching above). Names become the output names,
+categories become the Venus groups. The discovered table is cached in
+localsettings (`/Settings/CZone/Circuits`) and used if the bus is silent because
+CZone is powered down.
+
+**Control**: PGN 127502 on the bank-1 instance. Latching circuits get a press
+plus a release 120 ms later, and only when a fresh 127501 reading disagrees with
+the target — a press toggles, so a command on stale state is refused rather than
+guessed. Momentary circuits get direct level control. A retry is issued only when
+a status frame newer than the last send still disagrees, at most once, because
+re-pressing a latching circuit would toggle it back; an unconfirmed command
+reverts the switch to the real CZone state after 9 s.
+
+**No keep-alive and no echo guard.** CZone latches a bank-1 press natively, and
+the driver owns both sides of its D-Bus service — its own updates never re-enter
+as commands, unlike the virtual-switch nodes in the flow.
+
+The momentary/latching split is not published by CZone (see "Switch type is not
+published"), so it lives in Venus's per-output `Settings/Type` — seeded from
+`dbus-czone/config.ini`, persisted, and editable in the GUI.
+
+Install/migration/rollback procedure: `dbus-czone/README.md`.
 
 ## Node-Red Flows
 
@@ -134,30 +329,17 @@ Key features (all ported to the driver):
   - `/Alarms/HighDischargeCurrent`: warning when modules are blocking discharge (from 0x372)
   - `/Alarms/InternalFailure`: alarm on CAN staleness (ALERT phase+) or modules offline (from 0x372)
 
-### CZone Control (`CZoneProxy.json`)
+### CZone Control (`CZoneProxy.json`) — LEGACY
 
-Bidirectional control of CZone digital switching outputs via Victron Virtual Switches. v6 removed Signal-K from the loop entirely — state is read directly from `can0`. (The Signal-K path added 1-2s of latency and, worse, when the Signal-K server wedged the frozen state cache silently blocked all commands until reboot.) v6.0 was rolled back in production because it strobed the lights; v6.1 is the rebuild with the root cause fixed (see instance filter below).
+**Replaced by the standalone `dbus-czone/` driver (see above). Kept in the repo
+for rollback only — do not deploy it alongside the driver: both drive the same
+CZone circuits, and two writers on one bank will fight.**
 
-**Bus behavior (measured from candump captures, 2026-07-06):**
-- The CZone output interface (src `0x02`) broadcasts PGN 127501 every 2s and within ~10ms of any output change, twice per cycle: once as bank instance 1 and once as instance 10 (identical payloads).
-- MFD/keypad commands (src `0x20`) use PGN 127502 **instance 1** with *momentary* semantics: `ON` frames stream at ~250ms while the button is held, one `OFF` on release, and the CZone circuit logic toggles its latched output on the rising edge. Instance-1 127502 is therefore *not* set-state and must not be imitated.
-- Bank-10 127502 commands *are* direct set-state: applied in <10ms, confirmed via 127501, and accepted from the unclaimed source address `0xFE`.
-- An unidentified device at src `0x0C` broadcasts 127501 **instance 0** ("all OFF") at 5 Hz, with occasional single-frame blips of switch 1 ON. To identify it: `cansend can0 18EA0CFE#00EE00 && candump -td can0,18EEFF0C:1FFFFFFF -n 1`.
-
-Flow features:
-- **State monitoring**: `candump can0,01F20D00:03FFFF00` captures PGN 127501 directly — the filter masks the PGN field (CAN ID bits 8-25) so any priority/source matches. Same watchdog pattern as Virtual BMS: pkill stale capture before start, chunk-safe line parser, auto-restart 5s after candump exits. The decoder stores per-switch `{state, ts}` in flow context and pushes to the virtual switches only on change.
-- **Instance filter (the v6.0 strobing bug)**: the decoder ignores any 127501 frame whose bank instance byte (data byte 0) is not `0x01`. Without this, the `0x0C` device's 5 Hz instance-0 all-OFF spam flips the tracked state several times a second; the resulting virtual-switch syncs echo out the command side and strobe the physical lights.
-- **State request**: ISO Request (PGN 59904) for 127501 is broadcast at startup and every 60s (`cansend can0 18EAFFFE#0DF201`) so state is known right after a deploy even if CZone only transmits on change.
-- **Command sending**: `cansend can0` with PGN 127502 instance 10 to set CZone outputs
-- **Confirm-and-retry**: every command is registered as pending; a 250ms tick checks whether a 127501 reading *newer than the command* reports the target state. Unconfirmed commands are resent after 500ms (max 3 transmissions); if still unconfirmed after 5s the virtual switch is reverted to the last real CZone state and a warning is logged.
-- **Keep-alive** (measured empirically 2026-07-02): CZone reverts a 127502-commanded bank-10 state ~10s after the last command frame — a single fire-and-forget command turns the output on for only a few seconds. Confirmed ONs commanded from VRM are therefore re-asserted in a single 127502 frame every ~1s. A hold is released when the output is observed OFF with no command in flight (keypad or CZone turned it off) or when an OFF is commanded; keypad-lit circuits are never held since CZone latches those natively. Note: holds live in flow context, so a Node-RED redeploy drops them and any VRM-lit circuits turn off ~10s later.
-- **Virtual switch caveat**: the `victron-virtual-switch` node does *not* preserve message properties from input to output — a state write echoes out the command side without the `_czoneSync` flag. The engine's fresh-state dedupe is what actually stops these echoes from becoming commands.
-- **Revert-echo guard**: a revert write (after a 5s unconfirmed command) also echoes out the command side, and if CZone is unresponsive the fresh-state dedupe can't stop it — state is stale — so it would re-command and re-revert in a ~5s loop. The engine records each revert (`czRecentRevert`) and drops any command that mirrors a revert made in the last 3s.
-- **Deploy-echo guard**: on (re)deploy every virtual switch emits its initial OFF out the command side before any 127501 has been decoded, which would otherwise blast OFF commands to all 11 circuits (and kill keypad-lit lights). The engine drops all commands for the first 12s after deploy — by then candump is running and real state has been synced into the switches.
-- **Stale-state safety**: the "already ON/OFF" dedupe only applies when the 127501 reading is <10s old — stale state never blocks a command.
-- **11 switches**: Bilge1, Bilge2, Horn, Helm, Nav, Anchor, Red, Fly, Underwater, Bow1, Bow2
-- **Latching logic**: Lights use on/off toggle; horn and bilge pumps are momentary
-- **Feedback-loop protection**: `_czoneSync` flag on virtual-switch writes, plus the fresh-state dedupe in the command engine as second line of defense
+Reads PGN 127501 from `can0` with a `candump` subprocess and publishes eleven
+separate `victron-virtual-switch` devices (instances 225-235), one per circuit;
+commands go out as PGN 127502. Circuit names, the circuit count and the
+momentary/latching split are all hardcoded in the flow. The driver replaces all
+of that with discovery and a single multi-output bank.
 
 ### Batteries Forward (`BatteriesForward.json`)
 
@@ -231,7 +413,7 @@ Pins every virtual device the flows publish to a fixed dbus service name **and**
 
 | Instance | Class | Service `com.victronenergy.…` | Device | Source identity |
 |----------|-------|-------------------------------|--------|-----------------|
-| 200 | battery | `battery.recbms` | REC-BMS Main Bank | dbus-recbms driver — REC-BMS 9M-0485, CAN-BMS 0x351–0x404 via YDNB-07 |
+| 200 | battery | `battery.recbms` | REC-BMS Main Bank | dbus-recbms driver — REC-BMS, CAN-BMS 0x351–0x404 via YDNB-07 |
 | 201 | battery | `battery.virtual_bat1_virtual` | House 12V | N2K addr 16, PGN 127506/127508 |
 | 202 | battery | `battery.virtual_bat2_virtual` | Bow 12V | N2K addr 16, PGN 127506/127508 |
 | 203 | battery | `battery.virtual_bat3_virtual` | Stern 12V | N2K addr 16, PGN 127506/127508 |

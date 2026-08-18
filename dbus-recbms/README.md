@@ -38,7 +38,7 @@ the same alarm thresholds.
 Improvements over the flow (the palette's virtual battery rejected these
 paths): hi-res `/Soc` (0.01%), `/Soh`, `/Capacity` (remaining = SOC ×
 installed), `/ConsumedAmphours`, `/InstalledCapacity` (0x379 — rated, not
-remaining; decode corrected 2026-08-17), `/TimeToGo`,
+remaining), `/TimeToGo`,
 `/System/MinCellVoltage`–`MaxCellTemperature`, extreme-cell identity
 (`/System/Min|MaxVoltageCellId`, `/System/Min|MaxTemperatureCellId` from
 0x374-0x377), module counts from 0x372, `/History/ChargeCycles`, live
@@ -61,7 +61,7 @@ grants them cleanly (the driver can self-heal a wrong grant, but this is
 cleaner):
 
 1. **Copy to the Cerbo**
-   `scp -r dbus-recbms root@192.168.50.107:/data/`
+   `scp -r dbus-recbms root@<cerbo>:/data/`
 2. **Disable the old flow** — in Node-RED, delete (or disable) the *Virtual
    BMS* flow tab and Deploy. This stops candump and frees the two service
    names and instances 200/220.

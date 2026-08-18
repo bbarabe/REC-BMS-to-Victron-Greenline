@@ -97,7 +97,7 @@ class Config:
         self.custom_name = b.get("custom_name", "REC-BMS Main Bank")
         self.installed_ah = float(b.get("installed_capacity_ah", 1440))
         self.nr_of_cells = int(b.get("nr_of_cells", 15))
-        self.serial_default = b.get("serial", "9M-0485")
+        self.serial_default = b.get("serial", "REC-BMS")
         # forward the BMS 0x360 force-charge flag to /Info/ChargeRequest
         # (DVCC acts on it) — off by default, matching the old flow
         self.forward_charge_request = \
@@ -212,7 +212,7 @@ def decode_frame(bms, canid, data):
         bms["minCellT"] = _s16(data, 4) - 273
         bms["maxCellT"] = _s16(data, 6) - 273
     elif canid in (0x374, 0x375, 0x376, 0x377):
-        # Identity of the extreme cells (confirmed on-bus 2026-08-17: the
+        # Identity of the extreme cells (the
         # strings track which module/sensor currently holds the extreme),
         # per the Victron CAN-BMS spec — not static module IDs.
         key = {0x374: "minVCellId", 0x375: "maxVCellId",
