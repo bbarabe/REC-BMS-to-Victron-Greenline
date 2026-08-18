@@ -22,5 +22,6 @@ CAN decode), [`Decoded.md`](Decoded.md) and [`BatteryCAN.md`](BatteryCAN.md)
 
 Helper scripts: `cerbo_ssh.py` (read-only command runner), `nmea_capture.py` /
 `nmea_decode.py` (bus capture and switching-event decode), `verify_pinning.py`
-(device-instance regression check). All take the host from `CERBO_HOST` and the
+(device-instance regression check), `edrive_temps.py` (live e-drive MOSFET /
+MCU-HCU / drive temperatures). All take the host from `CERBO_HOST` and the
 password from `CERBO_PASS`.

@@ -32,8 +32,27 @@ the DC triplet is internally consistent (`P = V × I`) and matches the MFD.
 
 A 2 s tick drives `Connected → 0` after 6 s of CAN silence, otherwise the values
 freeze indefinitely — the drives keep publishing a stale voltage long after
-shutdown. The capture filter covers PGNs 61451/61452/65363, and a third output
-carries torque, throttle and phase current, which have no Victron D-Bus path.
+shutdown. The capture filter covers PGNs 61451/61452/61453/65363, and a third
+output carries torque, throttle and phase current, which have no Victron D-Bus
+path.
+
+**All three temperatures are published** (2026-08-18). The `motordrive` device
+exposes exactly three temperature paths, and there are exactly three sensors:
+
+| D-Bus path | sensor | source |
+|---|---|---|
+| `Motor/Temperature` | drive / motor winding | `0x28x` f2, `61453` w1 as 1 °C fallback |
+| `Controller/Temperature` | MCU/HCU controller board | `61453` w2 only — 1 °C steps |
+| `Coolant/Temperature` | MOSFET | `0x28x` f1, `61453` w0 as 1 °C fallback |
+
+The MOSFET is the element the coolant loop cools, so it is the closest thing the
+drives report to a coolant-loop reading. Note `Controller/Temperature` changed
+meaning with this fix — it used to carry `0x28x` f1, which is the MOSFET.
+
+Each of the three paths is created only when its `include_*_temp` flag is set on
+the `victron-virtual` node; `include_coolant_temp` was `false`, and `61453` was
+**missing from the candump filter entirely**, so the temperature was unreachable
+twice over. Both are fixed.
 
 ---
 
@@ -44,26 +63,40 @@ Each frame = two IEEE-754 little-endian floats. `A` = port (node 0x0A), `B` = st
 | CAN ID | Bytes 0–3 (float 1) | Bytes 4–7 (float 2) |
 |---|---|---|
 | `0x18A/18B` | status byte, DLC 1: `00` = stopped, `01` = running | — |
-| `0x28A/28B` | **HCU / controller-region temp °C** | **Electric motor temp °C** |
+| `0x28A/28B` | **MOSFET temp °C** (displayed "MCU/HCU MOSFET") | **Drive temp °C** (displayed "DRIVE") |
 | `0x38A/38B` | **Motor voltage V** | **Motor phase current, RMS A** (display shows peak = ×√2) |
 | `0x48A/48B` | **Motor torque, N·m, SIGNED** (+ motoring, − generating) | **Motor RPM** (stays positive in reverse) |
 | `0x305` | all zeros | |
 | `0x307` | `12 34 56 78 "VIC"` constant — ID/heartbeat | |
 
-### `0x28x` temperatures
+### `0x28x` temperatures — SOLVED 2026-08-18
 
-The two sensors are told apart by their dynamics under a load step:
+**float 1 = MOSFET temp, float 2 = drive temp.** These are two of the three temperatures the
+display shows per side; they are the same sensors as `61453` words 0 and 1 (below), but at full
+float resolution instead of 1 °C steps. The third displayed value (**MCU/HCU**) is *not* in
+`0x28x` at all — it is only in `61453` word 2.
 
-- **float 1 = controller/HCU-region**: starboard `18.72 → 22.58 → 22.41` — jumps ~4 °C within seconds
-  of load and plateaus (small thermal mass).
-- **float 2 = electric motor winding**: starboard `11.03 → 11.65 → 13.70` — slow monotonic rise
-  (large thermal mass). **Exact display match**: port f2 `20.39` vs displayed `20 °C`, starboard f2
-  `11.10` vs displayed `11 °C`.
+Identification is direct: the displayed integer is the **truncation** of the float, confirmed on
+six values simultaneously against the MFD. During a 45 s idle sample:
 
-float 1's absolute value matches the displayed *HCU MOSFET temp* exactly on an **idle** drive
-(19.35 vs 19 °C) but reads ~3 °C above both displayed HCU temps on a **loaded** drive, and the
-displayed MOSFET value did not move while f1 climbed 23.1 → 24.3. So f1 is a controller-side sensor
-that is **not** the one displayed. Exact display mapping unresolved.
+| | `0x28x` f1 | displayed MOSFET | `0x28x` f2 | displayed DRIVE |
+|---|---|---|---|---|
+| port | 18.72–18.82 | **18** | 13.47–13.58 | **13** |
+| stbd | 18.98–19.08 | **18/19 flickering** | 12.96–13.14 | **12/13 flickering** |
+
+The starboard flicker is the proof of truncation rather than rounding: with the float at
+`18.98–19.08`, `61453` word 0 returned 18 on 281 of 444 frames and 19 on the other 163. Rounding
+would have produced 19 throughout. Both sensors that straddle an integer dither in exactly this
+way, which is also why a reading taken by eye can move ±1 °C between glances.
+
+The dynamics under a load step still hold and remain a useful cross-check — f1 jumps ~4 °C within
+seconds of load and plateaus (small thermal mass, controller side), f2 rises slowly and
+monotonically (large thermal mass, motor side).
+
+Still open from the earlier load run: f1 climbed 23.1 → 24.3 while the displayed MOSFET value did
+not move. That was measured before the three displayed temps were told apart, so it may simply
+have been compared against the wrong one of them. Worth re-checking under load now that `61453`
+gives all three unambiguously.
 
 ---
 
@@ -73,13 +106,46 @@ that is **not** the one displayed. Exact display mapping unresolved.
 |---|---|
 | 61451 `14F00Bxx` | **byte 1 = motor torque %, offset −125** (J1939 percent-torque convention); byte 0 = 0. **w2 = motor RPM × 8**. w4 = 1100 constant — constant while running, changes between power cycles; unexplained |
 | 61452 `14F00Cxx` | **w4 = motor phase current peak × 20** (5595→271 A, 6219→311 A ⇒ 20.6 / 20.0 counts/A ✓); **w2 = motor DC current**: `A = 0.024918 × w2 − 800.41` (r = 0.9994 over −30…−57 A) ⇒ **40.1 counts/A, zero at w2 ≈ 32122** — i.e. essentially 0.025 A/count. w0 also tracks load (r = −0.9993, ~13.8 counts/A, opposite sign) — a second load quantity, identity unresolved |
-| 61453 `14F00Dxx` | three slow temps; **port and starboard read nearly identically and barely respond to load** — does not match the displayed HCU temps under either ×1/256 (≈36.5 °C) or ×1/512 (≈18.3 °C) scaling. Unresolved; likely shared/ambient sensors |
+| 61453 `14F00Dxx` | **the three displayed temperatures**, u16 LE, standard J1939 scaling `°C = w × 0.03125 − 273`: **w0 = MOSFET, w1 = DRIVE, w2 = MCU/HCU**; w3 = 0. See below |
 | 65243 `14FEDBxx` | slow counters — w2 = 35/37, w0 = 14080 (stbd) / 1280 (port), static |
 
 ### Torque %
 
 Byte 1 of `14F00Bxx` minus 125 is the torque percentage the MFD displays
 (e.g. byte 153 → 28 %, byte 157 → 32 %). At zero torque w0 = **exactly 32000** (= 125 × 256), which is what fixes the −125 offset.
+
+### `61453` temperatures — SOLVED 2026-08-18
+
+`14F00D64` (stbd) / `14F00D65` (port) carry **all three temperatures the MFD shows per drive**,
+as three u16 little-endian words with the **standard J1939/NMEA 2000 temperature encoding**:
+
+```
+°C = word × 0.03125 − 273          (0.03125 K/bit, 273 K offset — SPN convention)
+```
+
+| word | bytes | quantity | display label |
+|---|---|---|---|
+| w0 | 0–1 | **MOSFET temp** | "MCU MOSFET" (port) / "HCU MOSFET" (stbd) |
+| w1 | 2–3 | **Drive temp** | "DRIVE" |
+| w2 | 4–5 | **MCU / HCU temp** | "MCU" (port) / "HCU" (stbd) |
+| w3 | 6–7 | always 0 | — |
+
+The earlier ×1/256 (≈36.5 °C) and ×1/512 (≈18.3 °C) attempts both failed because the offset was
+missing: the raw words are exact multiples of 32, so they land on whole degrees only once 273 is
+subtracted. Port `60 24 c0 23 80 24 00 00` → `9312, 9152, 9344` → **18, 13, 19 °C**, matching the
+displayed *18 / 19 / 13* (MOSFET / MCU / DRIVE) exactly. Verified simultaneously on both sides
+against the MFD, 2026-08-18.
+
+Note the **word order is not the display order** — the display prints MOSFET, MCU/HCU, DRIVE,
+while the frame carries MOSFET, DRIVE, MCU/HCU.
+
+This is the only source for the **MCU/HCU** temperature; `0x28x` carries the other two. Because
+the words are quantized to 1 °C, a sensor sitting on an integer boundary alternates between two
+values frame to frame — use `0x28x` when you want a stable reading of the MOSFET or drive temp.
+
+The old note that these "read nearly identically port to starboard and barely respond to load"
+was an artefact of the wrong scaling plus a dockside capture where every sensor really was within
+1 °C of ambient.
 
 ---
 
@@ -249,8 +315,12 @@ reach userspace on `can0` (see the note on `can0` visibility below).
    was never exercised; 100 % extrapolates to raw ≈ 928, unverified.
 2. **`61452` w0** — tracks load at ~13.8 counts/A with sign opposite to w2; a second load quantity
    (demand vs actual?), identity unresolved.
-3. **`61453`** — does not match the displayed HCU temps under any obvious scaling.
-4. **`0x28x` float 1** — real controller-side sensor, but not the one the MFD shows.
+3. ~~**`61453`** — does not match the displayed HCU temps under any obvious scaling.~~
+   **SOLVED 2026-08-18**: `°C = w × 0.03125 − 273`; w0/w1/w2 = MOSFET / drive / MCU-HCU.
+4. ~~**`0x28x` float 1** — real controller-side sensor, but not the one the MFD shows.~~
+   **SOLVED 2026-08-18**: f1 = MOSFET temp, f2 = drive temp; the display truncates them.
+   One sub-question survives: under load f1 once climbed 23.1 → 24.3 with the displayed MOSFET
+   value static. Re-check against `61453` w0 on a loaded drive.
 5. **`61451` w4 = 1100** — constant while running, differs between power cycles.
    Unexplained.
 6. **`AV[10]`, `AV[19]`** — still constant 0.
