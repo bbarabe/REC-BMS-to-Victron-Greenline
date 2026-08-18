@@ -66,6 +66,11 @@ Replaying the real `runE` capture through the new parse function reproduces the 
 | direction fwd / rev / neutral | 2 / 1 / 0 | FWD / REV / NEUTRAL |
 | both drives at rest | 0.07 A, 4 W | ~0 |
 
+**Deployed and verified 2026-08-17.** The owner redeployed and confirmed the readings now match the
+Greenline app. Independently checked on D-Bus afterwards: with the drives powered down both devices
+report `Connected = 0` (the staleness tick working as intended) and `Dc/0/Current` 0.07 A /
+`Dc/0/Power` 2 W at standstill, against −0.8 A / −19 W from the old decode at the same standstill.
+
 Other changes: a 2 s tick inject drives `Connected → 0` after 6 s of CAN silence (previously the
 values froze forever — the drives were still publishing a stale 22.7 V hours after shutdown); the
 candump filter gained PGNs 61451/61452/65363; and a third output carries torque, throttle and phase
