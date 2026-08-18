@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project contains Node-Red flows and device configurations for a marine vessel's electrical and battery monitoring system running on a **Victron Cerbo GX** (Venus OS). The system integrates multiple CAN bus networks, Signal-K, and Victron's D-Bus to provide unified monitoring and control via VRM (Victron Remote Management).
+This project contains Node-Red flows, a standalone Python D-Bus driver (`dbus-recbms/`), and device configurations for a marine vessel's electrical and battery monitoring system running on a **Victron Cerbo GX** (Venus OS). The system integrates multiple CAN bus networks, Signal-K, and Victron's D-Bus to provide unified monitoring and control via VRM (Victron Remote Management).
 
 ## Physical Architecture
 
@@ -65,8 +65,8 @@ CAN frame map (all 8-byte DLC unless noted):
 | 0x360 | Force Charge | Byte 0: 0xFF = force charge requested, 0x00 = normal (not acted upon) |
 | 0x372 | Module Status | Byte 0: modules online, Byte 2: blocking charge, Byte 4: blocking discharge, Byte 6: offline |
 | 0x373 | Cell Min/Max | Min/max cell voltage (mV), min/max cell temp (K) |
-| 0x374-0x377 | Module IDs | ASCII module/sensor labels |
-| 0x379 | Capacity | Remaining capacity |
+| 0x374-0x377 | Extreme-cell IDs | ASCII labels of the cells/sensors currently holding the extremes: 0x374 min-V cell, 0x375 max-V cell, 0x376 min-T sensor, 0x377 max-T sensor (confirmed on-bus 2026-08-17 — the strings track the extremes, they are not static module IDs) |
+| 0x379 | Capacity | Installed (rated) capacity — constant 1440 regardless of SOC (confirmed 2026-08-17; earlier decodes mislabeled it as remaining) |
 | 0x380 | Serial Number | ASCII serial |
 | 0x381 | Unknown | Additional data (not yet decoded) |
 | 0x404 | Heartbeat | Keep-alive (DLC=3) |
@@ -89,15 +89,32 @@ Three 12V batteries are monitored by an NMEA 2000 device at address 16 (PGN 1275
 
 The 127489 messages also carry engine hours (~208h port / ~209h starboard as of 2026-07-07) and engine temperature; oil temp, coolant pressure, and fuel pressure are not populated (0xFFFF) by these gateways.
 
+## REC-BMS Driver (`dbus-recbms/`)
+
+Standalone Python D-Bus service that replaces the Node-RED Virtual BMS flow. Runs under daemontools (`/service/dbus-recbms`, installed via `install.sh`, survives firmware updates through `/data/rc.local`), starts seconds after D-Bus at boot — independent of Signal K / Node-RED (which took minutes to bring the virtual battery up) — and is untouched by Node-RED deploys (which could wedge the D-Bus connection and force a reboot).
+
+**Data path**: raw SocketCAN socket on `can0` (kernel filter `0x18FF0000/0x1FFFF800`, 29-bit only) -> `decode_frame()` (strips wrapper: `id & 0x7FF`) -> 1s publish tick -> `com.victronenergy.battery.recbms` (instance 200) + `com.victronenergy.switch.recbms_maxcharge` (VRM "Max Charge" slider, instance 220).
+
+Behavior is a 1:1 port of the flow (staged fallback, startup grace, Quattro voltage fallback, slider→CVL, weekly EQ, synthetic alarms — all documented below; thresholds/timings live in `dbus-recbms/config.ini`). Differences from the flow:
+
+- No candump subprocess, watchdog, pkill, or chunked line parsing — the kernel filters and delivers frames directly.
+- Persistence moved from the `virtual-bms-state.json` writable-dir hack to localsettings (`/Settings/RecBms/ChargeSlider`, `/Settings/RecBms/EqLastCompleted`, `/Settings/RecBms/CustomName`) — no restore/retry dance, saves are synchronous.
+- Instance pinning is built in: the driver seeds `/Settings/Devices/recbms|recbms_maxcharge/ClassAndVrmInstance` and reconverges to 200/220 at startup if localsettings granted something else while the wanted instance is free (registry-style self-heal). The settings ids deliberately have no `virtual_` prefix so the Node-RED palette's auto-cleanup never touches them.
+- Publishes paths the virtual battery node rejected: hi-res `/Soc` (0.01% from 0x355 bytes 4-5), `/Soh`, `/Capacity` (remaining = SOC × installed), `/ConsumedAmphours` (negative, BMV convention), `/InstalledCapacity` (from 0x379), `/TimeToGo`, `/System/MinCellVoltage`–`MaxCellTemperature` (cell extremes from 0x373), `/System/Min|MaxVoltageCellId` + `/System/Min|MaxTemperatureCellId` (extreme-cell identity from 0x374-0x377), module counts from 0x372, `/History/ChargeCycles`, live `/Serial` + FW/HW version, plus diagnostics: `/RecBms/Phase`, `/RecBms/EqStatus`, `/RecBms/TimeToFull` (from 60s-smoothed charge current) and `/RecBms/ForceChargeRequest` (0x360; forwarded to `/Info/ChargeRequest` only if `forward_charge_request = true` in config).
+
+Install/migration/rollback procedure: `dbus-recbms/README.md`.
+
 ## Node-Red Flows
 
-### Virtual BMS (`Virtual BMS.json`)
+### Virtual BMS (`Virtual BMS.json`) — LEGACY
+
+**Replaced by the standalone `dbus-recbms/` driver (see above). Kept in the repo for rollback only — do not deploy alongside the driver (they claim the same instances 200/220).**
 
 Reads repackaged BMS CAN frames from `can0` via `candump`, decodes them, and publishes to a Victron virtual battery device on D-Bus.
 
 **Data path**: candump can0 (filter `18FF0000:1FFFF800`) -> Line Parser (strips 29-bit wrapper: `rawid & 0x7FF`) -> CAN Frame Decoder -> State Assembler -> Path Filter -> victron-virtual battery
 
-Key features:
+Key features (all ported to the driver):
 - **candump watchdog**: Before every start, `pkill -f '[c]andump can0,18FF0000:1FFFF800'` clears any stale capture process (prevents duplicates after a hard Node-Red restart or manual re-trigger). The pattern matches this flow's exact command line — filter argument included — so manually-run or other-purpose candump processes are never touched. If candump exits for any reason, a watchdog restarts it after 5 seconds (restart count kept in flow context).
 - **Chunk-safe line parsing**: exec stdout arrives in chunks, not lines. The parser buffers partial lines across chunks, splits on newlines, and emits one message per CAN frame — no frames are lost when the pipe coalesces multiple lines.
 - **Frame length guard**: Each CAN ID has a minimum-length requirement; short/corrupt frames are dropped (with a rate-limited warning, max 1/min) instead of throwing mid-decode. Only successfully decoded frames refresh the staleness timestamp.
@@ -214,7 +231,7 @@ Pins every virtual device the flows publish to a fixed dbus service name **and**
 
 | Instance | Class | Service `com.victronenergy.…` | Device | Source identity |
 |----------|-------|-------------------------------|--------|-----------------|
-| 200 | battery | `battery.virtual_bms03a00000000050` | REC-BMS Main Bank | REC-BMS 9M-0485, CAN-BMS 0x351–0x404 via YDNB-07 |
+| 200 | battery | `battery.recbms` | REC-BMS Main Bank | dbus-recbms driver — REC-BMS 9M-0485, CAN-BMS 0x351–0x404 via YDNB-07 |
 | 201 | battery | `battery.virtual_bat1_virtual` | House 12V | N2K addr 16, PGN 127506/127508 |
 | 202 | battery | `battery.virtual_bat2_virtual` | Bow 12V | N2K addr 16, PGN 127506/127508 |
 | 203 | battery | `battery.virtual_bat3_virtual` | Stern 12V | N2K addr 16, PGN 127506/127508 |
@@ -222,13 +239,15 @@ Pins every virtual device the flows publish to a fixed dbus service name **and**
 | 205 | battery | `battery.virtual_bat5_virtual` | Starboard Engine 12V | PGN 127489 src 142, engine instance 1 |
 | 210 | motordrive | `motordrive.virtual_gl6gk_port` | Port E-Motor | CANopen node 0x0A, PGN 127493 instance 0 |
 | 211 | motordrive | `motordrive.virtual_gl6gk_stbd` | Starboard E-Motor | CANopen node 0x0B, PGN 127493 instance 1 |
-| 220 | switch | `switch.virtual_bms03a00000000060` | Max Charge Slider | VRM control only |
+| 220 | switch | `switch.recbms_maxcharge` | Max Charge Slider | dbus-recbms driver, VRM control only |
 | 221 | switch | `switch.virtual_sp_switch_001` | Solar Priority Toggle | VRM control only |
 | 222 | switch | `switch.virtual_sp_rated_switch` | PV Capacity Slider | VRM control only |
 | 225–235 | switch | `switch.virtual_cz_vs_sw1`…`sw11` | CZone Bilge1, Bilge2, Horn, Helm, Nav, Anchor, Red, Fly, Underwater, Bow1, Bow2 | CZone PGN 127501/127502 |
 | 236–255 | — | — | spare | — |
 
 **Rules for adding a device**: hand-write a stable, dot-free node ID (never let Node-RED generate one); add a registry row using the next free number in the correct block; deploy. Never let a virtual device register without a registry row.
+
+**External services**: instances owned by standalone (non-Node-RED) dbus services — currently 200 and 220, owned by `dbus-recbms` — are listed in the registry node's `EXTERNAL` table. The sanity check reserves their numbers, but enforcement/audit ignores them: each service pins its own instance via `/Settings/Devices/<id>/ClassAndVrmInstance`, using settings ids without the `virtual_` prefix so the palette's auto-cleanup never removes them.
 
 **Verification** (`verify_pinning.py`): snapshots the service→instance map, `virtual_*` settings entries and the Signal K model (tanks/electrical/propulsion), restarts Node-RED three times, and fails if any snapshot gains a service, changes an instance, or grows a new Signal K path. Password via `CERBO_PASS` env var or prompt. Run it after every change to the registry or to flows containing virtual devices.
 

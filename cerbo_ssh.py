@@ -2,10 +2,13 @@
 """Read-only SSH helper for Cerbo GX. Runs a command, prints output.
 Usage: cerbo_ssh.py "<command>" [timeout_seconds]
 """
-import sys, paramiko
+import os, sys, paramiko
 
 HOST = "192.168.50.107"
 USER = "root"
+PASS = os.environ.get("CERBO_PASS")
+if not PASS:
+    sys.exit("Set CERBO_PASS in the environment")
 
 cmd = sys.argv[1]
 timeout = float(sys.argv[2]) if len(sys.argv) > 2 else 30
