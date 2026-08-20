@@ -1,7 +1,7 @@
 # dbus-recbms
 
 Standalone Venus OS driver for the REC-BMS main bank. Replaces the Node-RED
-**Virtual BMS** flow (`Virtual BMS.json`).
+**Virtual BMS** flow (`archive/Virtual BMS.json`).
 
 ## Why
 
@@ -39,12 +39,13 @@ the same alarm thresholds.
 
 Improvements over the flow (the palette's virtual battery rejected these
 paths): hi-res `/Soc` (0.01%), `/Soh`, `/Capacity` (remaining = SOC ×
-installed), `/ConsumedAmphours`, `/InstalledCapacity` (0x379 — rated, not
-remaining), `/TimeToGo`,
+installed), `/ConsumedAmphours`, `/InstalledCapacity` (0x379 `BatterySize` —
+rated, not remaining), `/TimeToGo`,
 `/System/MinCellVoltage`–`MaxCellTemperature`, extreme-cell identity
 (`/System/Min|MaxVoltageCellId`, `/System/Min|MaxTemperatureCellId` from
 0x374-0x377), module counts from 0x372, `/History/ChargeCycles`, live
-`/Serial` + firmware/hardware version, and diagnostics `/RecBms/Phase`,
+`/Serial` + `/HardwareVersion`, and diagnostics `/RecBms/Phase`,
+`/RecBms/ConfiguredCapacity`,
 `/RecBms/EqStatus`, `/RecBms/TimeToFull` (60s-smoothed charge current) and
 `/RecBms/ForceChargeRequest` (forwarded to `/Info/ChargeRequest` only when
 `forward_charge_request = true` — keep this off: this REC holds 0x360 byte 0
@@ -63,6 +64,31 @@ Persistence moved from the `virtual-bms-state.json` file hack to
 dance, survives reboots and firmware updates natively.
 
 All tunables live in [config.ini](config.ini).
+
+## The two capacity figures (v1.3.1)
+
+The BMS broadcasts capacity twice, and they do not agree:
+
+| Frame | Victron name | This bank | Published as |
+|---|---|---|---|
+| `0x379` bytes 0-1 | `BatterySize` — rated / installed | **1440 Ah** | `/InstalledCapacity` |
+| `0x35F` bytes 4-5 | `BatteryInfo` — capacity configured in the BMS | **1400 Ah** | `/RecBms/ConfiguredCapacity` |
+
+`/InstalledCapacity` stays on `0x379` because that is the frame the Victron
+CAN-bus BMS protocol designates for it, and it is what `/Capacity`
+(SOC × installed), `/ConsumedAmphours` and `/TimeToGo` are derived from.
+
+**Fixed in v1.3.1**: `0x35F` bytes 4-5 were being read as a firmware version,
+so `/FirmwareVersion` published a meaningless **`1400`**. That path now has no
+source and stays empty — the only version the BMS sends is the bytes 2-3 pair,
+published as `/HardwareVersion` (`2.9` here). REC's own documentation labels
+those two bytes the hardware version; independent work on the REC-Q reads the
+identical encoding as the *software* version, so the label is unsettled while
+the encoding (two plain bytes, `major.minor`, **not** little-endian) is not.
+
+If `/TimeToGo` ever needs to match the BMS's own arithmetic rather than the
+rated figure, the number to switch `/InstalledCapacity` to is the 1400 in
+`/RecBms/ConfiguredCapacity` — the REC computes its SOC against that.
 
 ## Solar boost (v1.2.0)
 
@@ -197,7 +223,7 @@ first install (first EQ = install + 7 days). To carry over the old EQ time:
 
 ## Rollback
 
-`sh /data/dbus-recbms/uninstall.sh`, then re-import the old `Virtual BMS.json`
+`sh /data/dbus-recbms/uninstall.sh`, then re-import the old `archive/Virtual BMS.json`
 flow in Node-RED and restore the two rows in the Instance Registry.
 
 ## Baselines

@@ -13,6 +13,9 @@ Two standalone D-Bus drivers do the work that Node-RED flows used to:
 The remaining Node-RED flows (12 V batteries, Greenline e-drive, solar priority,
 device-instance registry) are the `*.json` files at the top level.
 
+Superseded flows live in [`archive/`](archive/) — kept for rollback only, never
+deployed alongside the drivers that replaced them.
+
 **Start with [`specification.md`](specification.md)** — CAN topology, the CZone
 and REC-BMS protocols, the drivers and every flow are documented there.
 

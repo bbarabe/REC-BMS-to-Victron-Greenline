@@ -2,7 +2,7 @@
 """
 dbus-recbms — standalone Venus OS driver for the REC-BMS main bank.
 
-Replaces the Node-RED "Virtual BMS" flow (Virtual BMS.json). Runs as a
+Replaces the Node-RED "Virtual BMS" flow (archive/Virtual BMS.json). Runs as a
 daemontools service, starts seconds after D-Bus at boot — independent of
 Node-RED / Signal K — and is untouched by Node-RED deploys.
 
@@ -34,6 +34,12 @@ below the slider/EQ target and raises only the solar chargers back up to it
 via the systemcalc SolarVoltageOffset — the MPPTs, which regulate
 accurately, finish the top-off at the true target.
 
+v1.3.1 capacity fix: 0x35F bytes 4-5 are the capacity CONFIGURED in the BMS
+(1400 Ah), not a firmware version — reading them as one published a bogus
+"1400" to /FirmwareVersion. They now feed /RecBms/ConfiguredCapacity, and
+/FirmwareVersion has no source. /InstalledCapacity is unchanged: it stays on
+0x379 ("BatterySize", 1440 Ah rated), the frame the protocol designates for it.
+
 Baselines:
   https://github.com/victronenergy/velib_python           (dbusdummyservice.py)
   https://github.com/mr-manuel/venus-os_dbus-mqtt-battery (service structure)
@@ -55,7 +61,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -229,9 +235,16 @@ def decode_frame(bms, canid, data):
     elif canid == 0x35E:
         bms["manufacturer"] = _ascii(data)
     elif canid == 0x35F:
+        # Victron CAN-BMS "BatteryInfo". Bytes 2-3 are a version pair read as
+        # two plain numbers, NOT little-endian (REC labels them the hardware
+        # version; independent REC-Q work reads the same bytes as the software
+        # version, e.g. 02 06 -> 2.6 — the label is unsettled, the encoding is
+        # not). Bytes 4-5 are the capacity CONFIGURED in the BMS, in Ah, and
+        # were previously misread here as a firmware version, which published
+        # a bogus "1400" to /FirmwareVersion.
         bms["chemistry"] = data[0]
         bms["hwVersion"] = "%d.%d" % (data[2], data[3])
-        bms["fwVersion"] = _u16(data, 4)
+        bms["configuredAh"] = _u16(data, 4)
     elif canid == 0x360:
         bms["forceCharge"] = data[0] == 0xFF
     elif canid == 0x370:
@@ -256,8 +269,10 @@ def decode_frame(bms, canid, data):
                0x376: "minTCellId", 0x377: "maxTCellId"}[canid]
         bms[key] = _ascii(data)
     elif canid == 0x379:
-        # Installed (rated) capacity — constant 1440 on this bank regardless
-        # of SOC (the old flow mislabeled it as remaining capacity).
+        # Victron CAN-BMS "BatterySize" — the RATED/installed capacity, which
+        # is the figure Venus expects at /InstalledCapacity. Constant 1440 on
+        # this bank regardless of SOC (the old flow mislabeled it as remaining
+        # capacity). Distinct from 0x35F's configured capacity (1400).
         bms["installedAh"] = _u16(data, 0)
     elif canid == 0x380:
         bms["serial"] = _ascii(data)
@@ -516,6 +531,11 @@ class RecBmsDriver:
                      gettextcallback=lambda p, val:
                      "---" if val is None else "%.0fh" % (float(val) / 3600))
         svc.add_path("/RecBms/ForceChargeRequest", 0)
+        # 0x35F bytes 4-5: the capacity configured in the BMS (1400 Ah here).
+        # /InstalledCapacity stays on 0x379 ("BatterySize", 1440 Ah) — that is
+        # the frame the Victron CAN-BMS protocol designates for it.
+        svc.add_path("/RecBms/ConfiguredCapacity", None,
+                     gettextcallback=fmt("Ah", 0))
 
         # Solar boost: a REQUEST-and-forget control that biases only the solar
         # chargers above the published CVL, so they out-regulate the Quattro
@@ -1086,10 +1106,11 @@ class RecBmsDriver:
         s["/History/ChargeCycles"] = bms.get("chargeCycles")
         if bms.get("serial"):
             s["/Serial"] = bms["serial"]
-        if bms.get("fwVersion") is not None:
-            s["/FirmwareVersion"] = str(bms["fwVersion"])
+        # /FirmwareVersion has no source: 0x35F bytes 4-5 are capacity, and
+        # the only version the BMS sends is the bytes 2-3 pair below.
         if bms.get("hwVersion"):
             s["/HardwareVersion"] = bms["hwVersion"]
+        s["/RecBms/ConfiguredCapacity"] = bms.get("configuredAh")
 
         s["/RecBms/Phase"] = phase_name
         s["/RecBms/EqStatus"] = eq_label

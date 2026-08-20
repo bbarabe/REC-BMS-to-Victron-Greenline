@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project contains Node-Red flows, a standalone Python D-Bus driver (`dbus-recbms/`), and device configurations for a marine vessel's electrical and battery monitoring system running on a **Victron Cerbo GX** (Venus OS). The system integrates multiple CAN bus networks, Signal-K, and Victron's D-Bus to provide unified monitoring and control via VRM (Victron Remote Management).
+This project contains Node-Red flows, two standalone Python D-Bus drivers (`dbus-recbms/` and `dbus-czone/`), and device configurations for a marine vessel's electrical and battery monitoring system running on a **Victron Cerbo GX** (Venus OS). The system integrates multiple CAN bus networks, Signal-K, and Victron's D-Bus to provide unified monitoring and control via VRM (Victron Remote Management).
 
 ## Physical Architecture
 
@@ -12,7 +12,7 @@ There are two physically separate CAN bus networks, bridged by a Yacht Devices Y
 
 - **CAN1 (drive/BMS network)** — 250 kbps, limited devices:
   - REC-BMS (11-bit standard CAN frames): Victron/SMA CAN-BMS protocol at 0x351-0x404
-  - Boat electric drive system
+  - Greenline 6GK electric drive system — CANopen TPDOs (11-bit) plus HCU J1939 frames; decoded by `GreenlineEDriveFlow.json`, wire format in `GreenlineFindings.md`
   - Yanmar engines
   - No chartplotters, switching, or general NMEA 2000 devices on this bus
 
@@ -53,12 +53,12 @@ The bridge performs two functions:
 
 The repackaging scheme: original 11-bit CAN ID `0xNNN` becomes 29-bit CAN ID `0x18FF0NNN` (proprietary broadcast PGN 0xFF00 range, priority 6). The frame type byte at buffer offset 4 is changed from `0xFE` (11-bit) to `0xFF` (29-bit).
 
-Manual: `ydnb07.md` / `ydnb07.pdf`
+Manual: `ydnb07.md` (transcription of the Yacht Devices YDNB-07 manual, firmware 1.42)
 
 ### Cerbo GX (Venus OS)
 
 - **can0**: VE.Can port, 250 kbps, `sun4i_can` driver
-- Runs Node-Red with `@victronenergy/node-red-contrib-victron` v1.7.7 and `@signalk/node-red-embedded` v2.18.1
+- Runs Node-Red with `@victronenergy/node-red-contrib-victron` v1.7.18 and `@signalk/node-red-embedded` v2.18.1 — Node-Red is *embedded in the Signal K server*, not a service of its own, so restarting Node-Red means `svc -t /service/signalk-server`
 - Signal-K server decodes NMEA 2000 PGNs into Signal-K paths
 
 ## CZone Digital Switching
@@ -202,7 +202,7 @@ does not require a code change.
 ### Main Battery Bank (REC-BMS via CAN-BMS protocol)
 
 - **Chemistry**: 15S NMC
-- **Nominal capacity**: 1440 Ah (~83 kWh at 58V)
+- **Capacity**: 1440 Ah rated (~83 kWh at 58V), 1400 Ah configured in the BMS — the pack reports both, on 0x379 and 0x35F respectively
 - **BMS**: REC-BMS
 - **6 modules**: C8SU1/C7SU1, C14SU2, C13SU4, T1SU3, T1SU4
 - **CAN protocol**: Victron/SMA CAN-BMS, 11-bit standard CAN IDs
@@ -215,19 +215,19 @@ CAN frame map (all 8-byte DLC unless noted):
 | 0x355 | SOC/SOH | SOC%, SOH%, hi-res SOC (0.01%) |
 | 0x356 | Voltage/Current/Temp | Pack V (0.01V), current (0.1A signed), temp (0.1C), charge cycles (bytes 6-7) |
 | 0x35E | Manufacturer | ASCII "REC-BMS" |
-| 0x35F | Firmware/Capacity | Chemistry, HW ver, FW ver, capacity |
+| 0x35F | `BatteryInfo` | Chemistry id (byte 0); version pair (bytes 2-3, two plain bytes `major.minor` -> `/HardwareVersion` 2.9); **capacity configured in the BMS** (bytes 4-5 LE, 1400 Ah -> `/RecBms/ConfiguredCapacity`). Bytes 4-5 are **not** a firmware version — reading them as one published a bogus 1400 to `/FirmwareVersion` before driver v1.3.1 |
 | 0x360 | Force Charge | Byte 0: 0xFF nominally = force charge requested — but this REC asserts 0xFF **permanently** (observed at 65% SOC, balanced cells, at rest), so it is a static capability flag carrying no state. Not forwarded to Venus (`forward_charge_request = false`); on current firmware `/Info/ChargeRequest` is consumed by systemstate.py (GUI "Recharge" state), gui-v2 (display row) and hub4control (ESS forced grid recharge — inert here: no ESS assistant in the Quattro). DVCC and mk2-dbus ignore it, so the Quattro itself never sees it. |
 | 0x372 | Module Status | Byte 0: modules online, Byte 2: blocking charge, Byte 4: blocking discharge, Byte 6: offline |
 | 0x373 | Cell Min/Max | Min/max cell voltage (mV), min/max cell temp (K) |
 | 0x374-0x377 | Extreme-cell IDs | ASCII labels of the cells/sensors currently holding the extremes: 0x374 min-V cell, 0x375 max-V cell, 0x376 min-T sensor, 0x377 max-T sensor. The strings track the extremes; they are not static module IDs. |
-| 0x379 | Capacity | Installed (rated) capacity — constant regardless of SOC, not remaining capacity |
+| 0x379 | `BatterySize` | Installed (**rated**) capacity, 1440 Ah — constant regardless of SOC, not remaining capacity. The protocol's designated source for `/InstalledCapacity`, so `/Capacity`, `/ConsumedAmphours` and `/TimeToGo` derive from it; distinct from 0x35F's 1400 Ah configured capacity |
 | 0x380 | Serial Number | ASCII serial |
 | 0x381 | Unknown | Additional data (not yet decoded) |
 | 0x404 | Heartbeat | Keep-alive (DLC=3) |
 
-**Note**: This REC-BMS does **not** send the standard CAN-BMS alarm frame (0x35A). The Virtual BMS flow generates synthetic alarms based on available data (SOC thresholds, cell imbalance from 0x373, module status from 0x372, CAN staleness).
+**Note**: This REC-BMS does **not** send the standard CAN-BMS alarm frame (0x35A). `dbus-recbms` generates synthetic alarms based on available data (SOC thresholds, cell imbalance from 0x373, module status from 0x372, CAN staleness).
 
-Full decode: `Decoded.md`; frame reference: `BatteryCAN.md`
+The table above is the authoritative decode. `Decoded.md` holds the field-by-field working (scales, worked examples); `BatteryCAN.md` is a raw one-frame-per-id capture.
 
 ### 12V Batteries
 
@@ -304,46 +304,6 @@ Install/migration/rollback procedure: `dbus-czone/README.md`.
 
 ## Node-Red Flows
 
-### Virtual BMS (`Virtual BMS.json`) — LEGACY
-
-**Replaced by the standalone `dbus-recbms/` driver (see above). Kept in the repo for rollback only — do not deploy alongside the driver (they claim the same instances 200/220).**
-
-Reads repackaged BMS CAN frames from `can0` via `candump`, decodes them, and publishes to a Victron virtual battery device on D-Bus.
-
-**Data path**: candump can0 (filter `18FF0000:1FFFF800`) -> Line Parser (strips 29-bit wrapper: `rawid & 0x7FF`) -> CAN Frame Decoder -> State Assembler -> Path Filter -> victron-virtual battery
-
-Key features (all ported to the driver):
-- **candump watchdog**: Before every start, `pkill -f '[c]andump can0,18FF0000:1FFFF800'` clears any stale capture process (prevents duplicates after a hard Node-Red restart or manual re-trigger). The pattern matches this flow's exact command line — filter argument included — so manually-run or other-purpose candump processes are never touched. If candump exits for any reason, a watchdog restarts it after 5 seconds (restart count kept in flow context).
-- **Chunk-safe line parsing**: exec stdout arrives in chunks, not lines. The parser buffers partial lines across chunks, splits on newlines, and emits one message per CAN frame — no frames are lost when the pipe coalesces multiple lines.
-- **Frame length guard**: Each CAN ID has a minimum-length requirement; short/corrupt frames are dropped (with a rate-limited warning, max 1/min) instead of throwing mid-decode. Only successfully decoded frames refresh the staleness timestamp.
-- **Staged fallback**: If CAN data goes stale, progressively restricts charge/discharge limits (LIVE ≤60s → ALERT ≤2min → RESTRICT ≤5min → SURVIVAL). When BMS is stale, pack voltage is sourced from the Quattro's `/Dc/0/Voltage` (independent measurement), with fallback to last-known BMS voltage if the Quattro reading is also stale (>30s).
-- **Startup grace (cold-boot fix)**: A cold boot is not treated as CAN loss. Until the first frame ever decodes, the staleness clock is anchored to flow start (not epoch 0) and the flow holds a benign STARTUP phase for up to 3 minutes: CCL 0 (no blind charging), DCL 100A (inverter keeps running), DVL 52.0V (below resting pack voltage, so no low-battery cutoff), all alarms 0. Previously the first publish tick computed `age = now − 0`, jumped straight to SURVIVAL, and pushed DVL 54.0V — above the pack's resting ~53V — which tripped the Quattro's low-battery shutdown and raised a low-voltage alarm on every boot off shore power. If the grace window expires with still no frame, the normal ALERT → RESTRICT → SURVIVAL escalation proceeds from flow start. The virtual battery node's `default_values` is also off, so the service no longer flashes 48V/50% in the seconds before the first publish tick.
-- **CVL control**: "Max Charge" slider (40-100%) exposed on VRM dashboard (BMS group), maps **piecewise-linearly** to CVL **on the REC's own SOC scale** ([cvl] `curve` breakpoints in config.ini) and is clipped at 61.96V. Calibrated 2026-08-19 from three measured points: a settled hold at 58.6% ↔ 56.28V, a days-long ~0A hold at 62.3% ↔ 56.65V, and the REC's 100% sync point (raw 0x351 CVL, 62.70V). The two mid points both lie exactly on 0.100 V/% — the NMC mid-plateau is flatter than the 62→100% region (0.1605 V/%) — so the map has a knee at 62.3%: 40% → 54.42V, 60% → 56.42V, 62.3% → 56.65V, 100% → 62.70V (clip engages above ~95%; values ≥62.3% are unchanged from the earlier single-slope line). NMC steepens again below ~50%, so low slider values may settle a little high until a hold is measured there; new breakpoints can be appended to the curve as holds settle. The original 54.00→61.96V line sat inside the REC's scale at both ends (its "40%" ≈ 46% real, its "60%" held ≈ 62.5% real — the storage-mode mismatch the slider was built to prevent). The clip is user policy: never push the Quattro above 61.96V; only the EQ boost may ride on top (max 62.40V, still under the REC's 62.7V limit which is `min()`'d in regardless).
-- **Weekly equalization**: Every 7 days, adds +0.44V boost to the current slider CVL for 1 hour. Works at any slider position, not just 100%. EQ start is gated on persisted state having been restored; on first install the schedule is baselined so the first EQ runs 7 days later, not immediately.
-- **Persistent state** (`virtual-bms-state.json`): The slider position and last-equalization timestamp survive Node-Red restarts, redeploys, and reboots. Node-Red on Venus OS runs as a restricted user that cannot write to `/data` directly, so the startup exec discovers a writable directory (first writable of `$HOME/.node-red`, `$HOME`, `/data` — the Node-Red user dir is always writable since flows are saved there), reports it on the first line of its output, and the flow stores it in flow context (`state_dir`) for all subsequent writes. The "Restore Persisted State" node status shows the directory in use. State is restored 6s after startup (giving the virtual switch time to register on D-Bus, then the slider is pushed back to the VRM switch) and saved on every slider change and EQ completion. If pushing the slider value fails (switch not yet registered), a catch node re-runs the restore up to 5 times at 3s intervals. Saves are blocked until restore has run, so a startup echo can't clobber the file. If the file is missing, defaults are slider 100% and EQ baselined to now.
-- **Synthetic alarms** (since BMS does not send 0x35A; all thresholds from 0x373 cell extremes unless noted, and all report 0 when CAN is stale):
-  - `/Alarms/LowSoc`: warning at SOC < 20%, alarm at SOC < 10%
-  - `/Alarms/CellImbalance`: warning at cell delta > 50mV, alarm at > 100mV
-  - `/Alarms/LowVoltage`: warning at min cell < 3.30V, alarm at < 3.00V
-  - `/Alarms/HighVoltage`: warning at max cell > 4.20V, alarm at > 4.25V
-  - `/Alarms/LowTemperature`: warning at min cell < 5°C, alarm at < 0°C (NMC charging below freezing causes lithium plating)
-  - `/Alarms/HighTemperature`: warning at max cell > 45°C, alarm at > 50°C
-  - `/Alarms/HighChargeCurrent`: warning when modules are blocking charge (from 0x372)
-  - `/Alarms/HighDischargeCurrent`: warning when modules are blocking discharge (from 0x372)
-  - `/Alarms/InternalFailure`: alarm on CAN staleness (ALERT phase+) or modules offline (from 0x372)
-
-### CZone Control (`CZoneProxy.json`) — LEGACY
-
-**Replaced by the standalone `dbus-czone/` driver (see above). Kept in the repo
-for rollback only — do not deploy it alongside the driver: both drive the same
-CZone circuits, and two writers on one bank will fight.**
-
-Reads PGN 127501 from `can0` with a `candump` subprocess and publishes eleven
-separate `victron-virtual-switch` devices (instances 225-235), one per circuit;
-commands go out as PGN 127502. Circuit names, the circuit count and the
-momentary/latching split are all hardcoded in the flow. The driver replaces all
-of that with discovery and a single multi-output bank.
-
 ### Batteries Forward (`BatteriesForward.json`)
 
 Reads 12V battery data from Signal-K and publishes to 5 Victron virtual battery devices.
@@ -353,6 +313,46 @@ Reads 12V battery data from Signal-K and publishes to 5 Victron virtual battery 
 - **1s publish tick** with 10-second staleness check
 - **5 virtual battery outputs** (12V preset): House, Bow, Stern (voltage/SOC from `electrical.batteries.*`), Port Engine and Starboard Engine (voltage only, from `propulsion.*.alternatorVoltage` / PGN 127489)
 - Engine batteries use `default_values: false` so the never-published SOC/current paths stay blank instead of showing a fake 50%; their assemblers also drop non-numeric payloads so a null Signal-K delta can't publish 0V
+
+### Greenline E-Drive (`GreenlineEDriveFlow.json`)
+
+Passively decodes the two Greenline 6GK electric drives from `can0` and publishes them as two Victron virtual `motordrive` devices (port = instance 210, starboard = 211). Read-only: the flow never transmits, so it cannot influence the drive system.
+
+**Data path**: `candump -L can0,<13 filters>` -> chunk-safe line parser -> per-drive state assembler -> two `victron-virtual` motordrive nodes. Same watchdog pattern as the retired Virtual BMS flow: `pkill` any stale capture before starting, restart 5 s after candump exits.
+
+Both frame families are needed. The **CANopen TPDOs** (11-bit `0x18x`/`0x28x`/`0x38x`/`0x48x`, `A` = port, `B` = starboard) carry IEEE floats at full resolution; the **HCU J1939 frames** (`61451`/`61452`/`61453`) carry quantized values, but two quantities have no float source at all. Note the source-address inversion: on the J1939 frames `0x64` is **starboard** and `0x65` is **port**.
+
+| CAN id / PGN | Content |
+|---|---|
+| `0x18x` | status byte, `01` = running |
+| `0x28x` | float 1 = MOSFET temp °C, float 2 = drive (motor) temp °C |
+| `0x38x` | float 1 = motor voltage V, float 2 = phase current RMS A |
+| `0x48x` | float 1 = **motor torque N·m**, float 2 = motor RPM |
+| 61451 `0x14F00Bxx` | byte 1 − 125 = torque % |
+| 61452 `0x14F00Cxx` | w2 = DC current, w4 ÷ 20 = phase current peak A |
+| 61453 `0x14F00Dxx` | w0/w1/w2 × 0.03125 − 273 = MOSFET / drive / MCU-HCU temp °C |
+| 65363 `0x18FF53xx` | byte 0 = instance, bytes 1–2 LE ÷ 9.280 = throttle % |
+| 127493 | byte 0 = instance, byte 1 bits 0–1 = gear (`0xFC` Fwd, `0xFD` Neutral, `0xFE` Rev) |
+
+**`0x48x` float 1 is torque, not power.** It was originally read as power × 100 W. The drives do not transmit motor power at all — the MFD computes it — so `/Dc/0/Power` is derived as voltage × current instead. Details and the calibration in `GreenlineFindings.md`.
+
+**Temperatures**: all three the MFD shows per drive are published (solved 2026-08-18, see `edrive_temps.py` for a live read). The Victron `motordrive` class has exactly **nine** paths, so the mapping is forced: the MOSFET is what the coolant loop cools, so it feeds `/Coolant/Temperature`; `/Motor/Temperature` is the drive/motor temp; `/Controller/Temperature` is the MCU/HCU board, which only 61453 w2 reports and only in whole degrees. 61453 is quantized to 1 °C, so a sensor sitting on an integer boundary dithers ±1 °C frame to frame — exactly what the display shows.
+
+| motordrive path | Source |
+|---|---|
+| `/Dc/0/Voltage` | `0x38x` f1 |
+| `/Dc/0/Current` | 61452 w2 (measured) |
+| `/Dc/0/Power` | voltage × current (derived) |
+| `/Motor/RPM` | `0x48x` f2 |
+| `/Motor/Temperature` | `0x28x` f2 (drive/motor) |
+| `/Motor/Direction` | 127493 gear |
+| `/Controller/Temperature` | 61453 w2 (MCU/HCU) |
+| `/Coolant/Temperature` | `0x28x` f1 (MOSFET) |
+| `/Connected` | frame staleness (6 s) |
+
+Torque (N·m or %), throttle % and phase current have **no** `motordrive` path; they leave the parser on a third output for Signal K / MQTT.
+
+**2 s staleness tick**: without it the last values freeze forever when the bus goes quiet — the drives displayed a stale 22.7 V long after shutdown. The tick exists purely so `/Connected` drops to 0.
 
 ### Solar Priority (`SolarPriority.json`)
 
@@ -380,10 +380,11 @@ Estimate = `min(P_rated, max(live PV, Σ per-charger max(faded capture, model)))
 
 **Data inputs** (each stored as `{value, timestamp}`):
 - `com.victronenergy.solarcharger/278` + `/279` (MPPT 100/20 and 150/35): `/Pv/V` (daylight gate), `/Yield/Power` (capacity + heartbeat), `/MppOperationMode` (throttle state)
-- `com.victronenergy.system`: `/Ac/Consumption/L1/Power` (instant + 60s time-based rolling average; system heartbeat), `/Dc/Battery/Soc`, `/Dc/Battery/Power` (the truth signal)
+- `com.victronenergy.system`: `/Ac/Consumption/L1/Power` (instant + 60s time-based rolling average; system heartbeat), `/Dc/Battery/Soc`, `/Dc/Battery/Power` (the truth signal; also sampled once per tick into a 90s rolling mean), `/Dc/Battery/Voltage` (against the target: surplus, burn-down exit, harvest band, ceiling stall)
 - `com.victronenergy.vebus/276`: `/Ac/ActiveIn/ActiveInput` (command feedback: detects an ineffective `IgnoreAcIn1` write and an absent shore connection), `/Ac/Out/L1/P` (vebus heartbeat)
+- `com.victronenergy.battery/200` (dbus-recbms ≥ 1.3.0): `/RecBms/TargetChargeVoltage` (the true charge target — **not** `/Info/MaxChargeVoltage`, which since v1.3.0 is the solar-lead-lowered Quattro command), and the solar-boost feedback trio `/RecBms/SolarBoost/Active`, `/SolarBoost/WindowOpen` (only sample capacity once the array has settled), `/SolarBoost/EffectiveChargeVoltage` (compare `battV` against this, so a boost the flow asked for is never read as a surplus)
 
-**Control output** (`com.victronenergy.vebus/276`): `/Ac/Control/IgnoreAcIn1` — 0 = accept shore, 1 = ignore shore. Shore is assumed on AC input 1 (see the flow's SETUP comment for AC-in-2 systems).
+**Control outputs**: `com.victronenergy.vebus/276` `/Ac/Control/IgnoreAcIn1` — 0 = accept shore, 1 = ignore shore. Shore is assumed on AC input 1 (see the flow's SETUP comment for AC-in-2 systems). And `com.victronenergy.battery/200` `/RecBms/SolarBoost/Request` — volts of measurement boost, 0 to release; the driver clamps, gates and expires it, so the flow can only ever ask.
 
 **State machine** (`shore` → `probe`/`burndown` → `solar`, plus `suspend` from any inverting state):
 - **Shore → Burn-down**: battV > CVL + 0.05V (pack holds surplus — the Max Charge target was lowered, or an external over-charge) AND the charger is quiet (battP ≤ +100W) AND not latched AND SOC ≥ 40% AND shore present, sustained 30s, gated by cooldown only (no backoff — this is not solar-dependent) → disconnect shore and feed the loads from the surplus, **no sun required**. The MPPTs wake on their own once battV crosses under the CVL. Exits: battery no longer discharging for 15s → hand over to `solar` seamlessly; battV ≤ CVL − 0.15V sustained 30s (well past the ~0.08V/500W load sag measured, so the exit cannot flap) → `probe` if the estimate clears the bar (no relay cycling), else reconnect shore. **Loop protection** (added after observing a burn→recharge→burn cycle live on 2026-08-18: the Quattro overshoots the CVL while re-absorbing after shore returns — 56.78V at +471W vs CVL 56.65V — which kept re-arming the trigger; SOC moved a net −0.4% over ~4h while shore re-imported every burn): the charger-quiet entry condition, plus a **one-shot latch** — a completed burn-down blocks further burns until the CVL changes (slider moved, >0.02V) or battV exceeds CVL + 0.25V (genuine overcharge, above the measured overshoot band). Inputs: `/Dc/Battery/Voltage` (system) and `/RecBms/TargetChargeVoltage` (battery/200) — the slider/EQ target; since driver v1.3.0, `/Info/MaxChargeVoltage` is the Quattro's solar-lead-lowered command, not the voltage the pack converges to.
@@ -405,7 +406,7 @@ Estimate = `min(P_rated, max(live PV, Σ per-charger max(faded capture, model)))
 
 **VRM dashboard** ("Solar" group): "Solar Priority" on/off toggle (type 1), "PV Capacity" slider (100–2500W, step 50W, default 1800W ≈ the array's observed 7-day peak of ~1750W; only a sanity ceiling on the estimate).
 
-**Setup required**: After import, (1) verify the six solar-charger input nodes point at the two MPPTs (pre-filled `solarcharger/278` and `/279`), (2) verify "AC Input Control", "AC Input Feedback" and "AC Out Power" point at the Quattro (pre-filled `vebus/276`), (3) verify the three `victron-input-system` nodes.
+**Setup required**: After import, (1) verify the six solar-charger input nodes point at the two MPPTs (pre-filled `solarcharger/278` and `/279`), (2) verify "AC Input Control", "AC Input Feedback" and "AC Out Power" point at the Quattro (pre-filled `vebus/276`), (3) verify the four `victron-input-system` nodes auto-discovered "Venus system" (AC Load, Battery SOC, Battery Power, Battery Voltage), (4) verify the four `battery/200` nodes ("BMS Target CVL" plus the three solar-boost paths) — **deploy `dbus-recbms` ≥ 1.3.0 before this flow**, or `/RecBms/TargetChargeVoltage` will not exist.
 
 ### Instance Registry (`InstanceRegistry.json`)
 
@@ -434,14 +435,69 @@ Pins every virtual device the flows publish to a fixed dbus service name **and**
 | 220 | switch | `switch.recbms_maxcharge` | Max Charge Slider | dbus-recbms driver, VRM control only |
 | 221 | switch | `switch.virtual_sp_switch_001` | Solar Priority Toggle | VRM control only |
 | 222 | switch | `switch.virtual_sp_rated_switch` | PV Capacity Slider | VRM control only |
-| 225–235 | switch | `switch.virtual_cz_vs_sw1`…`sw11` | CZone Bilge1, Bilge2, Horn, Helm, Nav, Anchor, Red, Fly, Underwater, Bow1, Bow2 | CZone PGN 127501/127502 |
+| 224 | switch | `switch.czone` | CZone switch bank (all circuits, one multi-output device) | dbus-czone driver — CZone PGN 127501/127502 |
+| 225–235 | — | *(retired)* | was `virtual_cz_vs_sw1`…`sw11`, eleven single switches from `archive/CZoneProxy.json` | replaced by the single bank at 224 |
 | 236–255 | — | — | spare | — |
+
+Instances 225–235 are **retired, not spare** — the never-reuse rule applies. They
+were deliberately removed from the registry node's table when `dbus-czone` took
+over: a row there would re-create `/Settings/Devices/virtual_cz_vs_swN` on every
+enforcement pass *and* hide those entries from the orphan audit, which is exactly
+what the migration needs to delete.
 
 **Rules for adding a device**: hand-write a stable, dot-free node ID (never let Node-RED generate one); add a registry row using the next free number in the correct block; deploy. Never let a virtual device register without a registry row.
 
-**External services**: instances owned by standalone (non-Node-RED) dbus services — currently 200 and 220, owned by `dbus-recbms` — are listed in the registry node's `EXTERNAL` table. The sanity check reserves their numbers, but enforcement/audit ignores them: each service pins its own instance via `/Settings/Devices/<id>/ClassAndVrmInstance`, using settings ids without the `virtual_` prefix so the palette's auto-cleanup never removes them.
+**External services**: instances owned by standalone (non-Node-RED) dbus services — currently 200 and 220 (`dbus-recbms`) and 224 (`dbus-czone`) — are listed in the registry node's `EXTERNAL` table. The sanity check reserves their numbers, but enforcement/audit ignores them: each service pins its own instance via `/Settings/Devices/<id>/ClassAndVrmInstance`, using settings ids without the `virtual_` prefix so the palette's auto-cleanup never removes them.
 
 **Verification** (`verify_pinning.py`): snapshots the service→instance map, `virtual_*` settings entries and the Signal K model (tanks/electrical/propulsion), restarts Node-RED three times, and fails if any snapshot gains a service, changes an instance, or grows a new Signal K path. Password via `CERBO_PASS` env var or prompt. Run it after every change to the registry or to flows containing virtual devices.
+
+### Retired flows (`archive/`)
+
+Both were replaced by the standalone drivers above and are kept only for
+rollback. **Neither may run alongside its driver** — see `archive/README.md`
+for the collisions and the rollback procedure. What follows describes them as
+they were on their retirement date; every fix and calibration since lives in
+the drivers.
+
+### Virtual BMS (`archive/Virtual BMS.json`) — RETIRED
+
+**Replaced by the standalone `dbus-recbms/` driver (see above). Kept in the repo for rollback only — do not deploy alongside the driver (they claim the same instances 200/220).**
+
+Reads repackaged BMS CAN frames from `can0` via `candump`, decodes them, and publishes to a Victron virtual battery device on D-Bus.
+
+**Data path**: candump can0 (filter `18FF0000:1FFFF800`) -> Line Parser (strips 29-bit wrapper: `rawid & 0x7FF`) -> CAN Frame Decoder -> State Assembler -> Path Filter -> victron-virtual battery
+
+Key features (all ported to the driver):
+- **candump watchdog**: Before every start, `pkill -f '[c]andump can0,18FF0000:1FFFF800'` clears any stale capture process (prevents duplicates after a hard Node-Red restart or manual re-trigger). The pattern matches this flow's exact command line — filter argument included — so manually-run or other-purpose candump processes are never touched. If candump exits for any reason, a watchdog restarts it after 5 seconds (restart count kept in flow context).
+- **Chunk-safe line parsing**: exec stdout arrives in chunks, not lines. The parser buffers partial lines across chunks, splits on newlines, and emits one message per CAN frame — no frames are lost when the pipe coalesces multiple lines.
+- **Frame length guard**: Each CAN ID has a minimum-length requirement; short/corrupt frames are dropped (with a rate-limited warning, max 1/min) instead of throwing mid-decode. Only successfully decoded frames refresh the staleness timestamp.
+- **Staged fallback**: If CAN data goes stale, progressively restricts charge/discharge limits (LIVE ≤60s → ALERT ≤2min → RESTRICT ≤5min → SURVIVAL). When BMS is stale, pack voltage is sourced from the Quattro's `/Dc/0/Voltage` (independent measurement), with fallback to last-known BMS voltage if the Quattro reading is also stale (>30s).
+- **Startup grace (cold-boot fix)**: A cold boot is not treated as CAN loss. Until the first frame ever decodes, the staleness clock is anchored to flow start (not epoch 0) and the flow holds a benign STARTUP phase for up to 3 minutes: CCL 0 (no blind charging), DCL 100A (inverter keeps running), DVL 52.0V (below resting pack voltage, so no low-battery cutoff), all alarms 0. Previously the first publish tick computed `age = now − 0`, jumped straight to SURVIVAL, and pushed DVL 54.0V — above the pack's resting ~53V — which tripped the Quattro's low-battery shutdown and raised a low-voltage alarm on every boot off shore power. If the grace window expires with still no frame, the normal ALERT → RESTRICT → SURVIVAL escalation proceeds from flow start. The virtual battery node's `default_values` is also off, so the service no longer flashes 48V/50% in the seconds before the first publish tick.
+- **CVL control**: "Max Charge" slider (40-100%) exposed on VRM dashboard (BMS group), maps **piecewise-linearly** to CVL **on the REC's own SOC scale** ([cvl] `curve` breakpoints in config.ini) and is clipped at 61.96V. Calibrated 2026-08-19 from three measured points: a settled hold at 58.6% ↔ 56.28V, a days-long ~0A hold at 62.3% ↔ 56.65V, and the REC's 100% sync point (raw 0x351 CVL, 62.70V). The two mid points both lie exactly on 0.100 V/% — the NMC mid-plateau is flatter than the 62→100% region (0.1605 V/%) — so the map has a knee at 62.3%: 40% → 54.42V, 60% → 56.42V, 62.3% → 56.65V, 100% → 62.70V (clip engages above ~95%; values ≥62.3% are unchanged from the earlier single-slope line). NMC steepens again below ~50%, so low slider values may settle a little high until a hold is measured there; new breakpoints can be appended to the curve as holds settle. The original 54.00→61.96V line sat inside the REC's scale at both ends (its "40%" ≈ 46% real, its "60%" held ≈ 62.5% real — the storage-mode mismatch the slider was built to prevent). The clip is user policy: never push the Quattro above 61.96V; only the EQ boost may ride on top (max 62.40V, still under the REC's 62.7V limit which is `min()`'d in regardless).
+- **Weekly equalization**: Every 7 days, adds +0.44V boost to the current slider CVL for 1 hour. Works at any slider position, not just 100%. EQ start is gated on persisted state having been restored; on first install the schedule is baselined so the first EQ runs 7 days later, not immediately.
+- **Persistent state** (`virtual-bms-state.json`): The slider position and last-equalization timestamp survive Node-Red restarts, redeploys, and reboots. Node-Red on Venus OS runs as a restricted user that cannot write to `/data` directly, so the startup exec discovers a writable directory (first writable of `$HOME/.node-red`, `$HOME`, `/data` — the Node-Red user dir is always writable since flows are saved there), reports it on the first line of its output, and the flow stores it in flow context (`state_dir`) for all subsequent writes. The "Restore Persisted State" node status shows the directory in use. State is restored 6s after startup (giving the virtual switch time to register on D-Bus, then the slider is pushed back to the VRM switch) and saved on every slider change and EQ completion. If pushing the slider value fails (switch not yet registered), a catch node re-runs the restore up to 5 times at 3s intervals. Saves are blocked until restore has run, so a startup echo can't clobber the file. If the file is missing, defaults are slider 100% and EQ baselined to now.
+- **Synthetic alarms** (since BMS does not send 0x35A; all thresholds from 0x373 cell extremes unless noted, and all report 0 when CAN is stale):
+  - `/Alarms/LowSoc`: warning at SOC < 20%, alarm at SOC < 10%
+  - `/Alarms/CellImbalance`: warning at cell delta > 50mV, alarm at > 100mV
+  - `/Alarms/LowVoltage`: warning at min cell < 3.30V, alarm at < 3.00V
+  - `/Alarms/HighVoltage`: warning at max cell > 4.20V, alarm at > 4.25V
+  - `/Alarms/LowTemperature`: warning at min cell < 5°C, alarm at < 0°C (NMC charging below freezing causes lithium plating)
+  - `/Alarms/HighTemperature`: warning at max cell > 45°C, alarm at > 50°C
+  - `/Alarms/HighChargeCurrent`: warning when modules are blocking charge (from 0x372)
+  - `/Alarms/HighDischargeCurrent`: warning when modules are blocking discharge (from 0x372)
+  - `/Alarms/InternalFailure`: alarm on CAN staleness (ALERT phase+) or modules offline (from 0x372)
+
+### CZone Control (`archive/CZoneProxy.json`) — RETIRED
+
+**Replaced by the standalone `dbus-czone/` driver (see above). Kept in the repo
+for rollback only — do not deploy it alongside the driver: both drive the same
+CZone circuits, and two writers on one bank will fight.**
+
+Reads PGN 127501 from `can0` with a `candump` subprocess and publishes eleven
+separate `victron-virtual-switch` devices (instances 225-235), one per circuit;
+commands go out as PGN 127502. Circuit names, the circuit count and the
+momentary/latching split are all hardcoded in the flow. The driver replaces all
+of that with discovery and a single multi-output bank.
 
 ## Key Technical Notes
 

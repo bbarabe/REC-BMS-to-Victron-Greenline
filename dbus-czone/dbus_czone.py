@@ -2,7 +2,7 @@
 """
 dbus-czone — standalone Venus OS driver for the CZone switch bank.
 
-Replaces the Node-RED "CZone Control" flow (CZoneProxy.json). Runs as a
+Replaces the Node-RED "CZone Control" flow (archive/CZoneProxy.json). Runs as a
 daemontools service, starts seconds after D-Bus at boot — independent of
 Node-RED / Signal K — and is untouched by Node-RED deploys.
 

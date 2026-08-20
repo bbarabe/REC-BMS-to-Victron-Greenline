@@ -1,7 +1,7 @@
 # dbus-czone
 
 Standalone Venus OS driver for the CZone switch bank. Replaces the Node-RED
-"CZone Control" flow (`CZoneProxy.json`).
+"CZone Control" flow (`archive/CZoneProxy.json`).
 
 Runs as a daemontools service, comes up seconds after D-Bus at boot,
 independent of Node-RED / Signal K, and is untouched by Node-RED deploys.
@@ -30,11 +30,16 @@ Nothing about the bank is hardcoded — not the circuit count, not the names,
 not the bank instance. The wire format is documented in `specification.md`
 ("CZone circuit discovery").
 
-1. **Passive, ~2 s.** Listen to PGN 127501. The bank instances the UC1
+1. **Passive, ~3 s.** Listen to PGN 127501. The bank instances the UC1
    broadcasts are the bank list, and the number of 2-bit fields that are
    not `3` ("unavailable") is the circuit count.
 2. **Active, ~1 s.** For each circuit, send the CZone query PGN 65299 and
    read the name and category out of the PGN 130820 reply.
+
+`status_listen_s` (8 s) is only the ceiling: phase 1 stops as soon as the
+preferred bank has been seen *and* a `min(3 s, status_listen_s)` settle window
+has passed, since the UC1 emits every bank within a millisecond or two of the
+others. Start to fully-populated bank is ~4.4 s in practice.
 
 If the bus is silent (CZone powered down) the driver falls back to the table
 it cached in localsettings at `/Settings/CZone/Circuits`.
@@ -88,7 +93,10 @@ Order matters, same as the `dbus-recbms` migration:
 
 1. **Disable the Node-RED CZone flow first** (or delete the tab and deploy).
    Leaving it running means two writers on the same circuits.
-2. **Clean up its registry entries**, or the driver cannot pin its instance:
+2. **Clean up its registry entries**, or the driver cannot pin its instance.
+   Deploy the updated Instance Registry first — its `cz_vs_sw1`-`sw11` rows are
+   gone, so the enforcement pass no longer re-creates the settings entries this
+   step removes (and the audit can finally report them as orphans):
    `RemoveSettings` must be called on the `/Settings` object with keys
    **relative** to it — full paths, or calling on `/Settings/Devices`,
    return `-1` for every key:
