@@ -31,7 +31,9 @@ line parsing, no watchdog needed — and publishes:
 Behavior is a 1:1 port of the flow: staged fallback
 (LIVE → ALERT → RESTRICT → SURVIVAL), cold-boot startup grace, Quattro
 `/Dc/0/Voltage` as independent voltage source when CAN is stale, slider → CVL
-mapping (40% → 54.00V, 100% → 61.96V), weekly 1-hour +0.44V equalization
+mapping piecewise-calibrated to the REC's own SOC scale from measured hold
+equilibria (40% → 54.42V, 60% → 56.42V, knee at 62.3% → 56.65V,
+100% → 62.70V, clipped to 61.96V), weekly 1-hour +0.44V equalization
 (live-only, aborts on CAN loss, first run baselined to install + 7 days), and
 the same alarm thresholds.
 
@@ -45,7 +47,15 @@ remaining), `/TimeToGo`,
 `/Serial` + firmware/hardware version, and diagnostics `/RecBms/Phase`,
 `/RecBms/EqStatus`, `/RecBms/TimeToFull` (60s-smoothed charge current) and
 `/RecBms/ForceChargeRequest` (forwarded to `/Info/ChargeRequest` only when
-`forward_charge_request = true`).
+`forward_charge_request = true` — keep this off: this REC holds 0x360 byte 0
+at a constant `0xFF`, i.e. the flag carries no state. Consumers on current
+Venus firmware: `systemstate.py` (GUI/VRM "Recharge" state), the gui-v2
+battery-parameters page (display), and `hub4control` — the ESS controller,
+which forces grid recharging on a charge request. Without an ESS assistant
+in the Quattro (this boat: none, no `/Hub4/*` paths) hub4control idles, so
+forwarding would only freeze the displayed state today — but it would mean
+permanent forced grid charging if ESS were ever configured. `dvcc.py` and
+`mk2-dbus` never read the path).
 
 Persistence moved from the `virtual-bms-state.json` file hack to
 **localsettings**: `/Settings/RecBms/ChargeSlider`, `/Settings/RecBms/EqLastCompleted`,
@@ -53,6 +63,102 @@ Persistence moved from the `virtual-bms-state.json` file hack to
 dance, survives reboots and firmware updates natively.
 
 All tunables live in [config.ini](config.ini).
+
+## Solar boost (v1.2.0)
+
+A request-and-forget control that lets a caller measure what the panels can
+actually produce **without dropping shore power**.
+
+The problem it solves: DVCC hands the same charge voltage to the Quattro and
+to both MPPTs. At an identical setpoint the stiffer source wins, and a
+shore-fed Quattro is far stiffer than an MPPT — so the solar chargers get
+squeezed to zero. Measured 2026-08-19: both chargers sat at 0 W for 17
+minutes while the Quattro pushed up to 1.3 kW from shore, on a sunny morning.
+Lowering the Quattro does not help — it ignores
+`/BatteryOperationalLimits/MaxChargeVoltage` in that range. Raising *only* the
+solar chargers does, via the offset `dbus-systemcalc-py` applies to them alone
+(`delegates/dvcc.py`).
+
+While boosted the MPPTs run unthrottled (`MppOperationMode == 2`), which is
+exactly the condition where **their output IS their capacity** — a direct
+measurement, no probing, no AC transfer, no battery cycling.
+
+| path | |
+|---|---|
+| `/RecBms/SolarBoost/Request` | **writeable** — volts to request, 0 to release |
+| `/RecBms/SolarBoost/Applied` | volts actually in force |
+| `/RecBms/SolarBoost/Active` | 0/1 |
+| `/RecBms/SolarBoost/SecondsLeft` | countdown to automatic expiry |
+| `/RecBms/SolarBoost/WindowOpen` | 1 while the caller should be sampling |
+| `/RecBms/SolarBoost/EffectiveChargeVoltage` | CVL + boost — compare against this, not the CVL |
+| `/RecBms/SolarBoost/Status` | `idle` / `ramp` / `measure` / `settling` / refusal reason |
+
+**It is never sticky.** The boost expires by itself after `hold_s` (120 s), and
+the driver additionally clears the offset at startup, on `SIGTERM`/`SIGINT`,
+and via `atexit` — so a requester that dies, or a driver that is killed and
+restarted, cannot leave the bank charging high. It is also re-asserted every
+tick, because the systemcalc path is volatile and would otherwise be lost to a
+systemcalc restart.
+
+Timing (`measure_start_s = 75`, `measure_len_s = 30`) comes from a measured
+step response: with ~0.15 V of margin both chargers reached `MppOperationMode
+2` in **43–45 s** and 90 % of the step in **53 s**. 75 s leaves ~20 s of slack.
+
+Every request is gated on live cell data, re-checked on every tick while
+active — max cell voltage, cell temperature band, `CVL + boost` against a hard
+ceiling, and a **minimum margin over the present pack voltage**. That last one
+matters: the MPPTs ramp at a rate set by how far the bus sits below their
+target, and at only ~0.05 V of margin they took **126 s to reach 5 %** of the
+step. Boosting with too little margin would open the measurement window on an
+array that had barely started and record the result as its capacity, so the
+driver refuses instead of returning a number that is wrong but looks real.
+
+> `SolarVoltageOffset` is a `Debug` path — unsupported, and it may move or
+> vanish in a Venus update. The driver logs a warning and refuses the request
+> if the write fails, rather than reporting a boost it did not apply.
+
+Since v1.3.0 the boost's ceiling and margin gates run against the **true
+target** (not the lead-lowered Quattro command), and the offset actually
+written is `solar_lead_v + boost` while a boost is active.
+
+## Solar lead (v1.3.0)
+
+The Quattro does not hold the CVL it is given: in absorption it regulates
+**+0.05–0.15V above** the commanded voltage. Measured 2026-08-19 with SVS on
+and the BMS, the Quattro's own meter and `/BatterySense/Voltage` all agreeing
+within 10mV — `VebusChargeState` said *absorption* while the pack was held
+rock-steady at CVL+0.07V with the tail current decaying, so the bias is in
+its regulation target, not in any measurement. Every calibrated slider
+equilibrium was therefore overshot, which re-armed the flow's surplus logic
+and ate the solar-boost margin. The MPPTs, by contrast, regulate accurately.
+
+`[cvl] solar_lead_v` (0.15V here; built-in default 0 = off) splits the two:
+the published `/Info/MaxChargeVoltage` — what DVCC hands the Quattro — is
+**target − lead**, and the driver holds the systemcalc `SolarVoltageOffset`
+at the lead so the solar chargers still see the **true target**.
+Consequences:
+
+- The Quattro lands at or just below the calibrated equilibrium (its bias is
+  smaller than the lead), so it can no longer overcharge past the target.
+- The last stretch of any charge is finished by the MPPTs at the true
+  target, sun permitting; with no sun the pack settles up to `lead − bias`
+  below target, which storage mode does not care about.
+- Below the target only solar has charging headroom, so on shore the MPPTs
+  run unthrottled (`MppOperationMode 2`) whenever the pack sits under
+  target — passive solar priority plus continuous free capacity readings.
+- `/RecBms/TargetChargeVoltage` publishes the true target (the Solar
+  Priority flow keys its surplus/burn-down logic on it);
+  `/RecBms/SolarLead` publishes the lead in force;
+  `EffectiveChargeVoltage` = target + boost, as before.
+- Fail-safe: if the offset path is unwritable, the driver logs a warning
+  (rate-limited) and publishes the **full target** as the CVL — a missing
+  lead can only restore v1.2 behavior, never lower the solar ceiling.
+- The GUI/VRM DVCC charge-voltage readout shows the lowered Quattro
+  command, not the target. The weekly EQ boost rides on the target as
+  before; with no sun during the EQ hour the pack tops out `lead` low.
+
+Deploy order: install this driver version **before** deploying the flow
+revision that reads `/RecBms/TargetChargeVoltage`.
 
 ## Install / migration
 

@@ -22,9 +22,17 @@ Behavior ported 1:1 from the Node-RED flow:
   - staged fallback   LIVE -> ALERT -> RESTRICT -> SURVIVAL on CAN loss
   - startup grace     cold boot is not CAN loss (benign STARTUP phase)
   - Quattro /Dc/0/Voltage as independent pack-voltage source when stale
-  - CVL from Max Charge slider (40-100% -> base+span mapping)
+  - CVL from Max Charge slider (40-100% -> base+span mapping on the REC's
+    SOC scale, clipped to max_v; the EQ boost may ride above the clip)
   - weekly 1h equalization boost (+0.44V), only while LIVE
   - synthetic alarms (REC-BMS sends no 0x35A frame)
+
+v1.3.0 solar lead: the Quattro's absorption holds +0.05..0.15V ABOVE its
+commanded CVL (measured 2026-08-19 with SVS on and the BMS/Quattro/sense
+meters agreeing to 10mV), so the driver commands the Quattro solar_lead_v
+below the slider/EQ target and raises only the solar chargers back up to it
+via the systemcalc SolarVoltageOffset — the MPPTs, which regulate
+accurately, finish the top-off at the true target.
 
 Baselines:
   https://github.com/victronenergy/velib_python           (dbusdummyservice.py)
@@ -42,10 +50,12 @@ import sys
 import time
 
 import dbus
+import atexit
+import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -98,8 +108,10 @@ class Config:
         self.installed_ah = float(b.get("installed_capacity_ah", 1440))
         self.nr_of_cells = int(b.get("nr_of_cells", 15))
         self.serial_default = b.get("serial", "REC-BMS")
-        # forward the BMS 0x360 force-charge flag to /Info/ChargeRequest
-        # (DVCC acts on it) — off by default, matching the old flow
+        # forward the BMS 0x360 flag to /Info/ChargeRequest — off by
+        # default: this REC holds byte 0 at a constant 0xFF (capability
+        # flag, not a request), and Venus only uses the path for the
+        # GUI "Recharge" state (systemstate.py; dvcc ignores it)
         self.forward_charge_request = \
             str(b.get("forward_charge_request", "false")).lower() == "true"
 
@@ -117,11 +129,21 @@ class Config:
         self.slider_default = float(s.get("default", 100))
 
         v = cp["cvl"] if cp.has_section("cvl") else {}
-        self.cvl_base = float(v.get("base_v", 54.0))
-        self.cvl_span = float(v.get("span_v", 7.96))
+        # piecewise-linear slider% -> CVL breakpoints "pct:volts, pct:volts, ..."
+        curve = v.get("curve", "40:54.42, 62.3:56.65, 100:62.70")
+        self.cvl_curve = sorted(
+            (float(p.split(":")[0]), float(p.split(":")[1]))
+            for p in curve.split(",") if p.strip()
+        )
+        if len(self.cvl_curve) < 2:
+            raise ValueError("[cvl] curve needs at least two pct:volts points")
+        self.cvl_max = float(v.get("max_v", 61.96))
         self.eq_boost = float(v.get("eq_boost_v", 0.44))
         self.eq_interval_s = float(v.get("eq_interval_days", 7)) * 86400
         self.eq_duration_s = float(v.get("eq_duration_min", 60)) * 60
+        # standing Quattro/solar split: command the vebus this far below the
+        # target and raise only the MPPTs back to it (0 disables)
+        self.solar_lead = max(0.0, min(0.30, float(v.get("solar_lead_v", 0.0))))
 
         f = cp["fallback"] if cp.has_section("fallback") else {}
         self.live_timeout = float(f.get("live_timeout_s", 60))
@@ -142,6 +164,21 @@ class Config:
         self.vebus_instance = int(q.get("vebus_instance", 276))
         self.extv_max_age = float(q.get("max_age_s", 30))
         self.extv_poll_s = int(q.get("poll_s", 5))
+
+        sb = cp["solarboost"] if cp.has_section("solarboost") else {}
+        self.boost_enabled = str(sb.get("enabled", "true")).lower() != "false"
+        self.boost_max_v = float(sb.get("max_boost_v", 0.30))
+        self.boost_hold_s = float(sb.get("hold_s", 120))
+        self.boost_measure_start_s = float(sb.get("measure_start_s", 75))
+        self.boost_measure_len_s = float(sb.get("measure_len_s", 30))
+        self.boost_cell_max_v = float(sb.get("cell_max_v", 4.05))
+        self.boost_cell_min_t = float(sb.get("cell_min_t", 5))
+        self.boost_cell_max_t = float(sb.get("cell_max_t", 45))
+        self.boost_ceiling_v = float(sb.get("ceiling_v", 62.70))
+        self.boost_min_margin_v = float(sb.get("min_margin_v", 0.10))
+        self.boost_service = sb.get("target_service", "com.victronenergy.system")
+        self.boost_path = sb.get(
+            "target_path", "/Debug/BatteryOperationalLimits/SolarVoltageOffset")
 
 
 # ----------------------------------------------------------------------------
@@ -308,6 +345,21 @@ class RecBmsDriver:
             self._init_switch_service()
 
         self._open_can()
+        # Solar-boost state. Reset at startup so a driver restart can never
+        # inherit a boost left behind by a crash (the offset itself lives in
+        # systemcalc and would otherwise survive us); the standing solar
+        # lead, by contrast, is (re)established immediately.
+        self.boost = {"active": False, "req_ts": 0.0, "volts": 0.0}
+        self.last_target = None
+        self._last_offset_warn = 0.0
+        self._boost_write(cfg.solar_lead, quiet=True)
+        atexit.register(self._boost_shutdown)
+        for _sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(_sig, self._boost_signal)
+            except (ValueError, OSError):
+                pass
+
         GLib.timeout_add_seconds(cfg.extv_poll_s, self._poll_ext_voltage)
         GLib.timeout_add(1000, self._tick)
 
@@ -465,6 +517,30 @@ class RecBmsDriver:
                      "---" if val is None else "%.0fh" % (float(val) / 3600))
         svc.add_path("/RecBms/ForceChargeRequest", 0)
 
+        # Solar boost: a REQUEST-and-forget control that biases only the solar
+        # chargers above the published CVL, so they out-regulate the Quattro
+        # and run unthrottled (MppOperationMode 2 = output IS capacity).
+        # Write volts to request, 0 to release. It ALWAYS expires by itself --
+        # see _service_boost() -- so a requester that dies cannot leave the
+        # bank charging high.
+        svc.add_path("/RecBms/SolarBoost/Request", 0.0, writeable=True,
+                     onchangecallback=self._boost_requested,
+                     gettextcallback=v2)
+        svc.add_path("/RecBms/SolarBoost/Applied", 0.0, gettextcallback=v2)
+        svc.add_path("/RecBms/SolarBoost/Active", 0)
+        svc.add_path("/RecBms/SolarBoost/SecondsLeft", 0,
+                     gettextcallback=fmt_int("s"))
+        svc.add_path("/RecBms/SolarBoost/WindowOpen", 0)
+        svc.add_path("/RecBms/SolarBoost/EffectiveChargeVoltage", None,
+                     gettextcallback=v2)
+        svc.add_path("/RecBms/SolarBoost/Status", "idle")
+
+        # Solar lead (v1.3.0): /Info/MaxChargeVoltage is what the Quattro is
+        # commanded (target - lead); the true target and the lead actually in
+        # force are published here for the flow and for diagnostics.
+        svc.add_path("/RecBms/TargetChargeVoltage", None, gettextcallback=v2)
+        svc.add_path("/RecBms/SolarLead", 0.0, gettextcallback=v2)
+
         register_service(svc)
         self.batt = svc
         log.info("registered com.victronenergy.battery.%s instance %d",
@@ -543,6 +619,176 @@ class RecBmsDriver:
                 self.sw["/SwitchableOutput/output_1/Dimming"] = float(new)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------ solar boost
+    # Raising ONLY the solar chargers above the Quattro's regulation point is
+    # what makes them produce: with a shared CVL the Quattro wins the tie and
+    # squeezes the MPPTs to zero (measured 2026-08-19 -- both chargers sat at
+    # 0 W for 17 min while the Quattro pushed 1.3 kW from shore). Venus applies
+    # /Debug/BatteryOperationalLimits/SolarVoltageOffset to the solar chargers
+    # only (dbus-systemcalc-py delegates/dvcc.py), which is the lever.
+    #
+    # The BMS driver owns it because the offset is a deliberate excursion above
+    # the CVL this same driver publishes -- so the clamp can be checked against
+    # live cell data rather than a fixed guess.
+
+    def _boost_write(self, volts, quiet=False):
+        """Push the offset into systemcalc. Returns True on success."""
+        c = self.cfg
+        try:
+            obj = shared_bus().get_object(c.boost_service, c.boost_path)
+            obj.SetValue(dbus.Double(float(volts)),
+                         dbus_interface="com.victronenergy.BusItem")
+            return True
+        except Exception as e:
+            if not quiet:
+                log.warning("solar boost: cannot write %s%s: %s",
+                            c.boost_service, c.boost_path, e)
+            return False
+
+    def _boost_allowed(self, volts):
+        """Safety gate, evaluated on request AND on every tick while active."""
+        c = self.cfg
+        if not c.boost_enabled:
+            return False, "disabled in config"
+        if volts <= 0 or volts > c.boost_max_v:
+            return False, "%.2fV outside 0..%.2fV" % (volts, c.boost_max_v)
+        bms = self.bms
+        if "_lastUpdate" not in bms or                 (time.time() - bms["_lastUpdate"]) > c.live_timeout:
+            return False, "BMS not live"
+        cmax = bms.get("maxCellV")
+        if cmax is None:
+            return False, "no cell voltage"
+        if cmax >= c.boost_cell_max_v:
+            return False, "max cell %.3fV >= %.3fV" % (cmax, c.boost_cell_max_v)
+        tmin, tmax = bms.get("minCellT"), bms.get("maxCellT")
+        if tmin is None or tmax is None:
+            return False, "no cell temperature"
+        if tmin < c.boost_cell_min_t or tmax > c.boost_cell_max_t:
+            return False, "cell temp %.0f..%.0fC outside %.0f..%.0fC" % (
+                tmin, tmax, c.boost_cell_min_t, c.boost_cell_max_t)
+        # Gates run against the TRUE target, not the published (lead-lowered)
+        # Quattro command — the boosted solar ceiling is target + volts.
+        target = self.last_target
+        if target is None:
+            return False, "no CVL published yet"
+        if float(target) + volts > c.boost_ceiling_v:
+            return False, "target %.2f + %.2f > ceiling %.2fV" % (
+                target, volts, c.boost_ceiling_v)
+        # The MPPTs ramp at a rate set by how far the bus sits below their
+        # target. Measured 2026-08-19: ~0.15V of margin -> unthrottled in
+        # 43-45 s, but only ~0.05V -> 126 s to reach 5 % of the step. With too
+        # little margin the measurement window would open on an array that has
+        # barely started, and that reading would be recorded as its capacity.
+        # Refuse rather than return a number that is wrong and looks real.
+        packv = self.batt["/Dc/0/Voltage"]
+        if packv is None:
+            return False, "no pack voltage"
+        margin = (float(target) + volts) - float(packv)
+        if margin < c.boost_min_margin_v:
+            return False, "margin %.2fV < %.2fV (pack %.2f, target %.2f)" % (
+                margin, c.boost_min_margin_v, packv, float(target) + volts)
+        return True, ""
+
+    def _boost_requested(self, path, value):
+        try:
+            volts = float(value)
+        except (TypeError, ValueError):
+            return False
+        if volts <= 0:
+            self._boost_clear("released by requester")
+            return True
+        ok, why = self._boost_allowed(volts)
+        if not ok:
+            log.warning("solar boost refused (%.2fV): %s", volts, why)
+            self.batt["/RecBms/SolarBoost/Status"] = "refused: " + why
+            return False
+        if not self._boost_write(self.cfg.solar_lead + volts):
+            self.batt["/RecBms/SolarBoost/Status"] = "refused: systemcalc write failed"
+            return False
+        self.boost = {"active": True, "req_ts": time.time(), "volts": volts}
+        self.batt["/RecBms/SolarBoost/Applied"] = round(volts, 2)
+        self.batt["/RecBms/SolarBoost/Active"] = 1
+        self.batt["/RecBms/SolarBoost/Status"] = "ramp"
+        log.info("solar boost +%.2fV for %.0fs (measure %.0f..%.0fs)", volts,
+                 self.cfg.boost_hold_s, self.cfg.boost_measure_start_s,
+                 self.cfg.boost_measure_start_s + self.cfg.boost_measure_len_s)
+        return True
+
+    def _boost_clear(self, reason):
+        was = self.boost["active"]
+        self.boost = {"active": False, "req_ts": 0.0, "volts": 0.0}
+        self._boost_write(self.cfg.solar_lead)   # keep the standing lead
+        s = self.batt
+        s["/RecBms/SolarBoost/Request"] = 0.0
+        s["/RecBms/SolarBoost/Applied"] = 0.0
+        s["/RecBms/SolarBoost/Active"] = 0
+        s["/RecBms/SolarBoost/SecondsLeft"] = 0
+        s["/RecBms/SolarBoost/WindowOpen"] = 0
+        s["/RecBms/SolarBoost/Status"] = reason
+        s["/RecBms/SolarBoost/EffectiveChargeVoltage"] = \
+            self.last_target if self.last_target is not None \
+            else s["/Info/MaxChargeVoltage"]
+        if was:
+            log.info("solar boost cleared (%s)", reason)
+
+    def _service_boost(self, now, target):
+        """Runs every tick, after the target CVL for this tick is known.
+        Maintains the systemcalc offset = standing lead + any active boost
+        (the path is volatile, so it is re-asserted every tick), expires or
+        aborts the boost, and publishes the boost telemetry. Returns the
+        lead actually in force, so the caller can publish target - lead as
+        the Quattro's CVL."""
+        c = self.cfg
+        b = self.boost
+        s = self.batt
+        self.last_target = target
+        boost_v = 0.0
+        if b["active"]:
+            elapsed = now - b["req_ts"]
+            if elapsed >= c.boost_hold_s:
+                self._boost_clear("expired after %.0fs" % c.boost_hold_s)
+            else:
+                ok, why = self._boost_allowed(b["volts"])
+                if not ok:
+                    self._boost_clear("aborted: " + why)
+                else:
+                    boost_v = b["volts"]
+                    win_from = c.boost_measure_start_s
+                    win_to = win_from + c.boost_measure_len_s
+                    window = win_from <= elapsed < win_to
+                    s["/RecBms/SolarBoost/SecondsLeft"] = int(c.boost_hold_s - elapsed)
+                    s["/RecBms/SolarBoost/WindowOpen"] = 1 if window else 0
+                    s["/RecBms/SolarBoost/Status"] = (
+                        "measure" if window
+                        else ("ramp" if elapsed < win_from else "settling"))
+        lead = 0.0
+        if c.solar_lead > 0 or boost_v > 0:
+            if self._boost_write(c.solar_lead + boost_v, quiet=True):
+                lead = c.solar_lead
+            else:
+                # Unwritable offset (Debug path — may vanish in a Venus
+                # update): publish the FULL target as the CVL so the MPPT
+                # ceiling is never silently lowered by a lead that is not
+                # actually in force. A boost cannot be honored either.
+                if boost_v > 0:
+                    self._boost_clear("aborted: systemcalc write failed")
+                    boost_v = 0.0
+                if now - self._last_offset_warn > 60:
+                    log.warning("solar lead: cannot write systemcalc offset; "
+                                "publishing the full target CVL")
+                    self._last_offset_warn = now
+        s["/RecBms/SolarBoost/EffectiveChargeVoltage"] = round(target + boost_v, 2)
+        return lead
+
+    def _boost_shutdown(self):
+        if self.boost.get("active"):
+            log.info("solar boost released on shutdown")
+        self._boost_write(0.0, quiet=True)
+
+    def _boost_signal(self, signum, frame):
+        self._boost_shutdown()
+        raise SystemExit(0)
 
     # -------------------------------------------------------------------- CAN
     def _open_can(self):
@@ -654,9 +900,25 @@ class RecBmsDriver:
 
     # ------------------------------------------------------------------ tick
     def _slider_cvl(self, slider):
+        # Piecewise-linear on the REC's own SOC<->voltage scale (the NMC
+        # mid-plateau is flatter than the 62->100% region, so a single slope
+        # can't hold both ends), clipped to cvl_max: the published charge
+        # voltage never exceeds it — only the equalization boost may ride
+        # on top. Breakpoints come from measured ~0A hold equilibria plus
+        # the REC's 100% sync point; add new points to [cvl] curve as more
+        # holds settle.
         c = self.cfg
-        span = c.slider_max - c.slider_min
-        return c.cvl_base + (slider - c.slider_min) / span * c.cvl_span
+        pts = c.cvl_curve
+        if slider <= pts[0][0]:
+            cvl = pts[0][1]
+        elif slider >= pts[-1][0]:
+            cvl = pts[-1][1]
+        else:
+            for (p0, v0), (p1, v1) in zip(pts, pts[1:]):
+                if slider <= p1:
+                    cvl = v0 + (slider - p0) / (p1 - p0) * (v1 - v0)
+                    break
+        return min(cvl, c.cvl_max)
 
     def _tick(self):
         c = self.cfg
@@ -772,7 +1034,18 @@ class RecBmsDriver:
             ttf = int((installed - remaining) / self.current_ema * 3600)
 
         s = self.batt
-        s["/Info/MaxChargeVoltage"] = round(final_cvl, 2)
+        # The Quattro's absorption holds +0.05..0.15V ABOVE its commanded
+        # CVL (measured 2026-08-19: SVS on, BMS/Quattro/sense meters all
+        # within 10mV, VebusChargeState=absorption, pack held steady at
+        # CVL+0.07V while the tail decayed). The MPPTs regulate accurately,
+        # so command the Quattro solar_lead_v BELOW the target and raise
+        # only the solar chargers back up to it: the Quattro lands at or
+        # under the calibrated equilibrium and solar finishes the top-off.
+        target = round(final_cvl, 2)
+        lead = self._service_boost(now, target)
+        s["/RecBms/TargetChargeVoltage"] = target
+        s["/RecBms/SolarLead"] = round(lead, 2)
+        s["/Info/MaxChargeVoltage"] = round(target - lead, 2)
         s["/Info/MaxChargeCurrent"] = ccl
         s["/Info/MaxDischargeCurrent"] = dcl
         s["/Info/BatteryLowVoltage"] = dvl
