@@ -355,7 +355,11 @@ Torque (N·m or %), throttle % and phase current have **no** `motordrive` path; 
 
 **2 s staleness tick**: without it the last values freeze forever when the bus goes quiet — the drives displayed a stale 22.7 V long after shutdown. The tick exists purely so `/Connected` drops to 0.
 
-### Solar Priority (`SolarPriority.json`)
+### Solar Priority driver (`dbus-recbms/solar_priority.py`) — DEPLOYED 2026-08-21
+
+The flow below, ported line-for-line to a standalone daemontools service (`/service/dbus-solarpriority`) that ships in the `dbus-recbms/` package but stays separate (own config `solar_priority.ini`, own log, own D-Bus service `com.victronenergy.switch.solarpriority` instance 221 carrying the toggle and the PV-capacity slider as two outputs). Inputs via velib `DbusMonitor` (last-known-good + heartbeat liveness, as in the flow); outputs `IgnoreAcIn1` and the dbus-recbms boost request over D-Bus. Differences from the flow are deliberate and listed in `dbus-recbms/README.md`: `IgnoreAcIn1` forced to 0 on exit/SIGTERM/exception, FAULT/emergency lockouts are hard 1 h holds (the flow's evidence release cleared them), transitions logged durably. The flow and the driver must never run together (both write `IgnoreAcIn1`); migration steps in the README. Once deployed, `SolarPriority.json` moves to `archive/` and instance 222 is retired.
+
+### Solar Priority (`archive/SolarPriority.json`) — RETIRED, the algorithm description below still applies to the driver
 
 Automatically powers AC loads from solar instead of shore power when the panels can carry them. Designed for storage mode: the battery is held at a target SOC by the Max Charge slider and the goal is **zero energy cycled through the battery** — battery power is therefore the primary control signal, not PV-vs-load comparison. Charging in solar mode is allowed (surplus charges the pack until DVCC/CVL caps it at the target).
 

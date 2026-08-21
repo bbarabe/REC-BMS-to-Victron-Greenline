@@ -250,6 +250,98 @@ Things dvcc.py does that are worth knowing:
   to 0 as well — solar is off during a CAN outage on shore; when inverting
   the MPPTs still get 0 + inverter draw, so they keep carrying loads.
 
+## Solar Priority driver (`solar_priority.py`, dbus-solarpriority)
+
+The Node-RED **Solar Priority** flow (`SolarPriority.json`, Decision Engine
+v4.2) as a standalone service, shipped in this package but fully separate:
+its own file, config (`solar_priority.ini`), daemontools service
+(`/service/dbus-solarpriority`), log (`/var/log/dbus-solarpriority`) and
+D-Bus service. It talks to dbus-recbms only over D-Bus — the same paths the
+flow used (`/RecBms/TargetChargeVoltage`, the `SolarBoost/*` trio,
+`/RecBms/SolarLead`, `/RecBms/LeadFault`) — so `dbus_recbms.py` is untouched
+and either service can be installed, restarted or removed without the other.
+
+Why a driver: the same two reasons as the BMS (boots seconds after D-Bus,
+immune to Node-RED deploys) plus one that matters more here — the flow
+*controls the Quattro's AC input*. A flow that dies mid-solar leaves
+`IgnoreAcIn1 = 1` and the boat inverting until someone notices; the driver
+writes 0 on SIGTERM/exit and on any engine exception, and every transition
+goes to a durable log instead of a debug sidebar.
+
+| Service | Instance | Content |
+|---|---|---|
+| `com.victronenergy.switch.solarpriority` | 221 | output_1: "Solar Priority" toggle; output_2: "PV Capacity" slider (100–2500 W, step 50); both in the **BMS** group next to the Max Charge slider (`[service] group`); `/SolarPriority/*` diagnostics |
+
+Settings persist in localsettings (`/Settings/SolarPriority/Enabled`,
+`/RatedPower`). Instance 222 (the flow's separate slider device) is retired.
+
+**Engine**: a line-for-line port of the flow's Decision Engine v4.2 — the
+state machine (shore → probe → solar; burn-down for surplus, harvest and
+ceiling stall; suspend for heater-class loads), measured capacity capture,
+the adaptive single-diode panel model, boost-assisted probes, the 90 s
+battery-power mean, the lead-band harvest and the v4.2 lead-fault hooks. The
+engine is a pure class (`Engine.tick(now_ms, inputs) -> outputs`) so it can
+be driven offline; every threshold is in `solar_priority.ini` `[engine]`
+under the flow's names in lower case, defaults identical to the flow.
+
+**Inputs** come from a velib `DbusMonitor`: a signal-driven cache, so values
+are last-known-good exactly like the flow, each with the time it last
+*changed*. Service liveness is still judged on the jittering heartbeat paths
+(`system /Ac/Consumption/L1/Power`, `vebus /Ac/Out/L1/P`, each MPPT
+`/Yield/Power`), with a 20 s staleness rule — a dead system or vebus forces
+shore. Devices are matched by instance (`[inputs]`): MPPTs 278/279, vebus
+276, battery 200. `shore_ac_input` selects `IgnoreAcIn1|2` and the
+ActiveInput value that means "on shore".
+
+**Deliberate differences from the flow**
+
+- `IgnoreAcIn` forced to 0 and the boost released on SIGTERM / atexit and
+  after an engine exception (the flow's catch node only covered the latter).
+- A FAULT or emergency-SOC **lockout is a hard 1 h hold**. In the flow the
+  evidence-based early release (capacity ≥ need clears `backoffUntil`) also
+  cleared lockouts, so in strong sun a locked-out engine re-probed every
+  cooldown. The driver keeps a separate `lockoutUntil`; re-enabling the
+  toggle still clears it.
+- The lead-fault text is logged at ERROR on change (the flow used
+  `node.error`); nothing else about the fault handling differs.
+
+**Diagnostics** on the switch service: `/SolarPriority/State` (shore / probe
+/ solar / burndown / suspend), `/Status` (the flow's node-status line),
+`/StatusFill`, `/LastTransition` + `/LastTransitionTime`, `/EstimateW`,
+`/NeedW`, `/Desired`. Transitions are logged:
+`tail -f /var/log/dbus-solarpriority/current | tai64nlocal`.
+
+**Migration from the flow** (the two must never run together — both write
+`IgnoreAcIn1`):
+
+1. dbus-recbms ≥ 1.4.0 must be running (it is).
+2. In Node-RED, **disable the Solar Priority flow tab** and Deploy. Check
+   `dbus -y | grep virtual_sp_` shows nothing (a zombie service would hold
+   instance 221 — if it does, restart Signal K).
+3. Copy the package and install the second service:
+   `scp -r dbus-recbms root@<cerbo>:/data/` (diff `config.ini` first, as
+   always) then `sh /data/dbus-recbms/install.sh solarpriority`.
+4. Verify: `svstat /service/dbus-solarpriority`; the log shows
+   `registered com.victronenergy.switch.solarpriority instance 221`, the
+   safe-start write, and status via
+   `dbus -y com.victronenergy.switch.solarpriority /SolarPriority/Status GetValue`.
+   Toggle "Solar Priority" ON in VRM (BMS group, next to Max Charge) — the flow's enable state
+   is not carried over (it lived in a Node-RED state file).
+5. Instance Registry: move the two `sp_*` rows from `REGISTRY` to `EXTERNAL`
+   (instance 221 only; 222 retired), run *Enforce + audit now*, remove the
+   two `virtual_sp_*` orphan settings, restart Signal K, and move
+   `SolarPriority.json` to `archive/`.
+
+Rollback: `sh uninstall.sh solarpriority`, re-enable the flow tab, restore
+the registry rows.
+
+## Deploying updates
+
+From the dev machine: `python deploy_cerbo.py recbms` (or `solarpriority`, or
+both) — one SSH session, config value-guard, `.bak-<tag>` backups, restart,
+verification. `--install` for a first install, `--dry-run` to preview.
+See the repo's `CLAUDE.md`.
+
 ## Install / migration
 
 Order matters — free instances 200/220 before the first start so localsettings
@@ -266,7 +358,8 @@ cleaner):
    flags `virtual_bms03a00000000050` / `virtual_bms03a00000000060` as
    orphans, then run the *Remove orphans* inject.
 4. **Install**
-   `sh /data/dbus-recbms/install.sh`
+   `sh /data/dbus-recbms/install.sh` (BMS only; `install.sh solarpriority`
+   adds the Solar Priority service, `install.sh all` both)
    (creates `/service/dbus-recbms` and the `/data/rc.local` hook so it
    survives firmware updates)
 5. **Verify**

@@ -1,13 +1,14 @@
 # archive/ — retired Node-RED flows
 
 **Nothing in this folder is deployed, and nothing here should be deployed as-is.**
-Both flows were replaced by standalone D-Bus drivers in August 2026. They are
+All three flows were replaced by standalone D-Bus drivers in August 2026. They are
 kept only so a rollback does not have to go through git history.
 
 | File | Replaced by | Retired |
 |---|---|---|
 | `Virtual BMS.json` | [`../dbus-recbms/`](../dbus-recbms/) | 2026-08-17 |
 | `CZoneProxy.json` | [`../dbus-czone/`](../dbus-czone/) | 2026-08-18 |
+| `SolarPriority.json` (v4.2) | [`../dbus-recbms/solar_priority.py`](../dbus-recbms/) (`dbus-solarpriority`) | 2026-08-21 |
 
 ## Read this before importing either one
 
@@ -17,6 +18,9 @@ kept only so a rollback does not have to go through git history.
     **220**.
   - `CZoneProxy.json` and `dbus-czone` are both writers on the **same CZone
     bank-1 circuits**; two writers on one bank produce wrong latch states.
+  - `SolarPriority.json` and `dbus-solarpriority` both write the Quattro's
+    **`/Ac/Control/IgnoreAcIn1`** and both claim instance **221**; two
+    controllers on the AC input fight each other into FAULT lockouts.
   Stop and uninstall the driver (`uninstall.sh`) *before* importing.
 - **The Instance Registry no longer pins these flows' devices.**
   `CZoneProxy.json`'s eleven virtual switches (instances **225-235**) were
@@ -36,7 +40,8 @@ kept only so a rollback does not have to go through git history.
 
 1. `sh /data/dbus-<name>/uninstall.sh` on the Cerbo.
 2. Clear the driver's settings entry if you want a clean re-registration
-   (`/Settings/Devices/recbms`, `/Settings/Devices/czone`).
+   (`/Settings/Devices/recbms`, `/Settings/Devices/czone`,
+   `/Settings/Devices/solarpriority`).
 3. Import the JSON from this folder into Node-RED and deploy.
 4. For `CZoneProxy.json`, restore the `cz_vs_sw1`-`cz_vs_sw11` rows in the
    Instance Registry (they are in git history, commit `d00780d` and earlier),

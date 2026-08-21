@@ -35,7 +35,7 @@ copy landed.
 
 | What | How | Who |
 |---|---|---|
-| `dbus-recbms/`, `dbus-czone/` | `scp` to `/data/`, then `svc -t` | scriptable |
+| `dbus-recbms/` (`dbus-recbms` + `dbus-solarpriority` services), `dbus-czone/` | `scp` to `/data/`, then `svc -t` | scriptable |
 | `*.json` Node-RED flows | import + Deploy in the Node-RED UI | **the user, by hand** |
 
 **Never hot-deploy a flow** — do not splice `flows_einstein.json` on the Cerbo and
@@ -45,10 +45,31 @@ means restarting Signal K and everything else it hosts.
 
 ## Standalone drivers
 
+Use the deploy script — it encodes every rule in this section (one session,
+no connect retries, config value-guard, backups, restart only what changed,
+verify by re-reading the shipped VERSION):
+
+```sh
+python deploy_cerbo.py recbms                  # upload changed files, svc -t, verify
+python deploy_cerbo.py solarpriority --install # first install of a service
+python deploy_cerbo.py recbms --dry-run        # show the plan / config diff only
+python deploy_cerbo.py czone --verify-only     # no upload, no restart
+```
+
+It aborts (exit 3) when the live config's *values* differ from the repo's
+HEAD copy — fold the on-boat edit into the repo first, or `--force-config`.
+Manual equivalent, if you must:
+
 ```sh
 scp -r dbus-recbms root@$CERBO_HOST:/data/
 ssh root@$CERBO_HOST 'svc -t /service/dbus-recbms'      # ~2s outage
 ```
+
+`dbus-recbms/` holds two services: `dbus_recbms.py` (the BMS) and
+`solar_priority.py` (`/service/dbus-solarpriority`, the Solar Priority engine).
+One `scp -r` ships both; restart only the one you changed. The Solar Priority
+driver and the `SolarPriority.json` flow must **never run together** (both
+write `IgnoreAcIn1`).
 
 `install.sh` is only for a **first** install (it creates `/service/<name>` and the
 `/data/rc.local` hook that survives firmware updates). An already-installed driver
