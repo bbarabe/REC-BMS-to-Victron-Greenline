@@ -34,6 +34,18 @@ below the slider/EQ target and raises only the solar chargers back up to it
 via the systemcalc SolarVoltageOffset — the MPPTs, which regulate
 accurately, finish the top-off at the true target.
 
+v1.4.0 lead verification: systemcalc applies the Debug voltage offsets only
+when /Settings/System/AccessLevel > 2 (Superuser) — and it evaluates that
+once per process (reify). The D-Bus write succeeds regardless, so v1.3 could
+believe a lead was in force while the MPPTs were actually held at target -
+lead. The driver now compares com.victronenergy.system
+/Control/EffectiveChargeVoltage (the voltage DVCC really sends the MPPTs)
+against what it expects; on a sustained mismatch it publishes the FULL
+target, refuses boosts, raises /Alarms/InternalFailure to warning and
+explains itself in /RecBms/LeadFault. It also pins
+/Settings/SystemSetup/BmsInstance to its own instance when that is still on
+automatic, so no other battery service can take over the CVL.
+
 v1.3.1 capacity fix: 0x35F bytes 4-5 are the capacity CONFIGURED in the BMS
 (1400 Ah), not a firmware version — reading them as one published a bogus
 "1400" to /FirmwareVersion. They now feed /RecBms/ConfiguredCapacity, and
@@ -61,7 +73,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -120,6 +132,10 @@ class Config:
         # GUI "Recharge" state (systemstate.py; dvcc ignores it)
         self.forward_charge_request = \
             str(b.get("forward_charge_request", "false")).lower() == "true"
+        # pin /Settings/SystemSetup/BmsInstance to our instance when it is
+        # still on automatic (-1); never override an explicit user choice
+        self.pin_bms_instance = \
+            str(b.get("pin_bms_instance", "true")).lower() != "false"
 
         s = cp["slider"] if cp.has_section("slider") else {}
         self.slider_enabled = str(s.get("enabled", "true")).lower() != "false"
@@ -150,6 +166,12 @@ class Config:
         # standing Quattro/solar split: command the vebus this far below the
         # target and raise only the MPPTs back to it (0 disables)
         self.solar_lead = max(0.0, min(0.30, float(v.get("solar_lead_v", 0.0))))
+        # verify the offset against systemcalc /Control/EffectiveChargeVoltage:
+        # a mismatch must persist this long before it counts (DVCC only
+        # adjusts every 3 s, so a slider move is briefly inconsistent)
+        self.lead_verify_s = float(v.get("lead_verify_s", 10))
+        self.lead_fault_alarm = \
+            str(v.get("lead_fault_alarm", "true")).lower() != "false"
 
         f = cp["fallback"] if cp.has_section("fallback") else {}
         self.live_timeout = float(f.get("live_timeout_s", 60))
@@ -367,6 +389,15 @@ class RecBmsDriver:
         self.boost = {"active": False, "req_ts": 0.0, "volts": 0.0}
         self.last_target = None
         self._last_offset_warn = 0.0
+        # Lead verification (v1.4.0): what DVCC actually sends the MPPTs
+        self.eff_cv = None                  # (volts or None, ts) from systemcalc
+        self._last_pub_cvl = None           # /Info/MaxChargeVoltage we published
+        self._last_offset = 0.0             # offset we last wrote
+        self.lead_fault = {"active": False, "since": 0.0, "msg": "",
+                           "mismatch_since": 0.0}
+        self._check_access_level()
+        if cfg.pin_bms_instance:
+            self._pin_bms_instance()
         self._boost_write(cfg.solar_lead, quiet=True)
         atexit.register(self._boost_shutdown)
         for _sig in (signal.SIGTERM, signal.SIGINT):
@@ -376,6 +407,7 @@ class RecBmsDriver:
                 pass
 
         GLib.timeout_add_seconds(cfg.extv_poll_s, self._poll_ext_voltage)
+        GLib.timeout_add_seconds(3, self._poll_effective_cv)   # DVCC cadence
         GLib.timeout_add(1000, self._tick)
 
     # ------------------------------------------------------------------ setup
@@ -560,6 +592,12 @@ class RecBmsDriver:
         # force are published here for the flow and for diagnostics.
         svc.add_path("/RecBms/TargetChargeVoltage", None, gettextcallback=v2)
         svc.add_path("/RecBms/SolarLead", 0.0, gettextcallback=v2)
+        # Lead verification (v1.4.0): "" while the systemcalc offset is
+        # verified in force; otherwise a human-readable explanation. The
+        # Solar Priority flow surfaces it with node.error().
+        svc.add_path("/RecBms/LeadFault", "")
+        svc.add_path("/RecBms/DvccEffectiveChargeVoltage", None,
+                     gettextcallback=v2)
 
         register_service(svc)
         self.batt = svc
@@ -671,6 +709,8 @@ class RecBmsDriver:
         c = self.cfg
         if not c.boost_enabled:
             return False, "disabled in config"
+        if self.lead_fault["active"]:
+            return False, "solar lead fault (" + self.lead_fault["msg"] + ")"
         if volts <= 0 or volts > c.boost_max_v:
             return False, "%.2fV outside 0..%.2fV" % (volts, c.boost_max_v)
         bms = self.bms
@@ -752,6 +792,121 @@ class RecBmsDriver:
         if was:
             log.info("solar boost cleared (%s)", reason)
 
+    # ------------------------------------------------ lead verification
+    def _settings_get(self, path):
+        try:
+            return self.sbus.call_blocking(
+                "com.victronenergy.settings", path, BUSITEM, "GetValue", "",
+                [], timeout=2)
+        except Exception:
+            return None
+
+    def _check_access_level(self):
+        """systemcalc applies the Debug voltage offsets only when
+        /Settings/System/AccessLevel > 2 (Superuser), evaluated ONCE per
+        systemcalc process. Warn at startup; the per-tick verification
+        below catches it either way."""
+        lvl = self._settings_get("/Settings/System/AccessLevel")
+        try:
+            lvl = int(lvl)
+        except (TypeError, ValueError):
+            log.warning("cannot read /Settings/System/AccessLevel")
+            return
+        # Upstream dvcc.py (master, 2026-08) gates the offsets on level > 2;
+        # the boat's firmware applied them at level 2 (verified 2026-08-21),
+        # so this is informational — the per-tick verification decides.
+        log.info("GX access level %d (upstream dvcc.py applies the Debug "
+                 "offsets only above 2; offset verification below is "
+                 "authoritative)", lvl)
+
+    def _pin_bms_instance(self):
+        """/Settings/SystemSetup/BmsInstance: -1 = automatic (lowest
+        instance among battery services publishing /Info/MaxChargeVoltage),
+        -255 = no BMS. Pin it to us while it is automatic so no future
+        battery service can take over the CVL; never override an explicit
+        choice."""
+        path = "/Settings/SystemSetup/BmsInstance"
+        cur = self._settings_get(path)
+        try:
+            cur = int(cur)
+        except (TypeError, ValueError):
+            log.warning("cannot read %s; not pinning", path)
+            return
+        want = self.batt_instance
+        if cur == want:
+            return
+        if cur == -1:
+            try:
+                self.sbus.call_blocking(
+                    "com.victronenergy.settings", path, BUSITEM, "SetValue",
+                    "v", [dbus.Int32(want)], timeout=5)
+                log.info("%s: automatic -> pinned to %d", path, want)
+            except Exception as e:
+                log.warning("%s: could not pin to %d (%s)", path, want, e)
+        elif cur == -255:
+            log.warning("%s is -255 (BMS control DISABLED): DVCC is not "
+                        "passing our limits to any charger", path)
+        else:
+            log.warning("%s is %d (explicit choice, not us); leaving it",
+                        path, cur)
+
+    def _poll_effective_cv(self):
+        try:
+            raw = self.sbus.call_blocking(
+                self.cfg.boost_service, "/Control/EffectiveChargeVoltage",
+                BUSITEM, "GetValue", "", [], timeout=2)
+            v = float(raw)
+            if not (20 <= v <= 80):
+                v = None
+        except Exception:
+            v = None
+        self.eff_cv = (v, time.time())
+        self.batt["/RecBms/DvccEffectiveChargeVoltage"] = v
+        return True
+
+    def _verify_lead(self, now):
+        """Compare what DVCC really sends the MPPTs against what we expect
+        from the CVL we published and the offset we wrote last tick.
+        Returns True while the offset is proven (or cannot be judged),
+        False once a mismatch has persisted lead_verify_s."""
+        c = self.cfg
+        f = self.lead_fault
+        pub, off = self._last_pub_cvl, self._last_offset
+        if pub is None or off <= 0.005:
+            return not f["active"]          # nothing to verify this tick
+        v, ts = self.eff_cv if self.eff_cv else (None, 0.0)
+        stale = (now - ts) > 15
+        applied = v is not None and abs(v - (pub + off)) <= 0.015
+        ignored = v is not None and abs(v - pub) <= 0.015
+        if applied:
+            f["mismatch_since"] = 0.0
+            if f["active"]:
+                log.info("solar lead: systemcalc offset verified in force "
+                         "again (effective %.2fV); fault cleared", v)
+                f["active"] = False
+                f["msg"] = ""
+            return True
+        if ignored or v is None or stale:
+            if not f["mismatch_since"]:
+                f["mismatch_since"] = now
+            elif now - f["mismatch_since"] >= c.lead_verify_s and not f["active"]:
+                lvl = self._settings_get("/Settings/System/AccessLevel")
+                if v is None or stale:
+                    msg = ("systemcalc /Control/EffectiveChargeVoltage "
+                           "unavailable (DVCC off or systemcalc down?)")
+                else:
+                    msg = ("systemcalc ignores the solar offset: MPPTs get "
+                           "%.2fV, expected %.2fV. GX access level is %s "
+                           "(need 3 = Superuser); after raising it run "
+                           "'svc -t /service/dbus-systemcalc-py'"
+                           % (v, pub + off, lvl))
+                f.update(active=True, since=now, msg=msg)
+                log.error("SOLAR LEAD FAULT: %s -- publishing the full "
+                          "target, boosts refused", msg)
+            return not f["active"]
+        # neither matches: a transient (slider just moved, DVCC mid-cycle)
+        return not f["active"]
+
     def _service_boost(self, now, target):
         """Runs every tick, after the target CVL for this tick is known.
         Maintains the systemcalc offset = standing lead + any active boost
@@ -783,9 +938,20 @@ class RecBmsDriver:
                         "measure" if window
                         else ("ramp" if elapsed < win_from else "settling"))
         lead = 0.0
+        verified = self._verify_lead(now)
+        if not verified and boost_v > 0:
+            self._boost_clear("aborted: solar lead fault")
+            boost_v = 0.0
         if c.solar_lead > 0 or boost_v > 0:
+            # Keep writing the offset even while faulted: if the access
+            # level is raised and systemcalc restarted, the next poll sees
+            # the offset applied and the fault self-clears.
             if self._boost_write(c.solar_lead + boost_v, quiet=True):
-                lead = c.solar_lead
+                self._last_offset = c.solar_lead + boost_v
+                # While faulted publish the FULL target (lead 0): the MPPT
+                # ceiling is never silently lowered by a lead that is not
+                # actually in force.
+                lead = c.solar_lead if verified else 0.0
             else:
                 # Unwritable offset (Debug path — may vanish in a Venus
                 # update): publish the FULL target as the CVL so the MPPT
@@ -794,11 +960,15 @@ class RecBmsDriver:
                 if boost_v > 0:
                     self._boost_clear("aborted: systemcalc write failed")
                     boost_v = 0.0
+                self._last_offset = 0.0
                 if now - self._last_offset_warn > 60:
                     log.warning("solar lead: cannot write systemcalc offset; "
                                 "publishing the full target CVL")
                     self._last_offset_warn = now
+        else:
+            self._last_offset = 0.0
         s["/RecBms/SolarBoost/EffectiveChargeVoltage"] = round(target + boost_v, 2)
+        s["/RecBms/LeadFault"] = self.lead_fault["msg"] if self.lead_fault["active"] else ""
         return lead
 
     def _boost_shutdown(self):
@@ -1066,6 +1236,7 @@ class RecBmsDriver:
         s["/RecBms/TargetChargeVoltage"] = target
         s["/RecBms/SolarLead"] = round(lead, 2)
         s["/Info/MaxChargeVoltage"] = round(target - lead, 2)
+        self._last_pub_cvl = round(target - lead, 2)
         s["/Info/MaxChargeCurrent"] = ccl
         s["/Info/MaxDischargeCurrent"] = dcl
         s["/Info/BatteryLowVoltage"] = dvl
@@ -1090,6 +1261,11 @@ class RecBmsDriver:
         delta = cell_max - cell_min
         s["/Alarms/CellImbalance"] = (2 if delta > 0.100 else 1 if delta > 0.050 else 0) if live else 0
         s["/Alarms/InternalFailure"] = 2 if phase >= 1 else (2 if bms.get("modulesOffline") else 0)
+        # Solar lead fault (v1.4.0): warning level on a standard alarm path
+        # so the GUI notifies and a VRM alarm rule can mail; detail string
+        # in /RecBms/LeadFault
+        if c.lead_fault_alarm and self.lead_fault["active"]:
+            s["/Alarms/InternalFailure"] = max(s["/Alarms/InternalFailure"], 1)
 
         s["/System/MinCellVoltage"] = bms.get("minCellV") if live else None
         s["/System/MaxCellVoltage"] = bms.get("maxCellV") if live else None

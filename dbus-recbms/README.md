@@ -186,6 +186,70 @@ Consequences:
 Deploy order: install this driver version **before** deploying the flow
 revision that reads `/RecBms/TargetChargeVoltage`.
 
+## Lead verification (v1.4.0)
+
+Reading Victron's `dbus-systemcalc-py` (`delegates/dvcc.py`) showed the one
+real hole in v1.3: both `/Debug/BatteryOperationalLimits/*VoltageOffset`
+paths are applied **only while `/Settings/System/AccessLevel > 2`
+(Superuser)**, and systemcalc evaluates that once per process (`@reify`).
+The D-Bus write succeeds at any access level, so a driver that only checks
+the write could believe a lead was in force while the MPPTs were actually
+held at `target − lead` — the whole bank would settle ~0.15 V low, boosts
+would do nothing, and harvest would never arm. (ESS does not have this
+problem because its own +0.1 V MPPT bias is hard-coded in dvcc.py, gated on
+the ESS assistant rather than on access level; the Debug offsets are the
+only lever outside ESS.)
+
+v1.4.0 therefore checks ground truth every 3 s:
+`com.victronenergy.system /Control/EffectiveChargeVoltage` is the voltage
+DVCC actually sends the solar chargers. The driver expects it to equal the
+`/Info/MaxChargeVoltage` it published plus the offset it wrote; if instead
+it equals the published CVL alone (offset ignored), or is unavailable, for
+`[cvl] lead_verify_s` (10 s) it declares a **lead fault**:
+
+- `/Info/MaxChargeVoltage` = full target (lead 0) — same fail-safe as an
+  unwritable offset: v1.2 behavior, never a lowered solar ceiling;
+- `/RecBms/SolarLead` = 0, boosts refused/aborted
+  (`/RecBms/SolarBoost/Status` says why);
+- `/RecBms/LeadFault` carries a human-readable explanation including the
+  current access level and the fix;
+- `/Alarms/InternalFailure` is raised to **warning** (1) while faulted
+  (`lead_fault_alarm = false` to disable) — a standard battery alarm, so the
+  GUI notifies and a VRM alarm rule on it can send mail;
+- `/RecBms/DvccEffectiveChargeVoltage` mirrors the systemcalc value for
+  diagnosis.
+
+The offset keeps being written while faulted, so the fault clears by itself
+once it is seen applied (the MPPTs then see `target + lead` for one tick plus
+one DVCC cycle, ≤ 4 s, before the lead is re-established — harmless, and
+still under `ceiling_v` even during EQ). Fix: Settings → General → Access level =
+**Superuser**, then `svc -t /service/dbus-systemcalc-py` (the reify). The
+driver also logs the access level at startup. Note: the boat's current
+firmware applied the offset at access level 2 (verified 2026-08-21 on
+deploy), so the gate is version-dependent — which is exactly why the driver
+checks the effective voltage instead of the setting.
+
+Also new in v1.4.0: `[battery] pin_bms_instance` writes
+`/Settings/SystemSetup/BmsInstance = 200` while that setting is still on
+automatic (−1), so no later battery service can be auto-selected as the
+DVCC BMS. An explicit choice is never overridden; −255 (BMS control
+disabled) is logged as a warning.
+
+Things dvcc.py does that are worth knowing:
+
+- DVCC adjusts every **3 s**; a boost request is applied 0–3 s after the
+  write (`measure_start_s = 75` already allows for it).
+- The DVCC "limit managed battery charge voltage" setting is applied
+  *before* the solar offset, so it does **not** cap a boost — this driver's
+  `ceiling_v` is the only ceiling on the MPPTs.
+- If this driver dies (not CAN loss — the service itself), systemcalc stops
+  writing to the MPPTs and they raise error #67 after ~60 s and stop;
+  daemontools restarts the driver in ~1 s, so this only matters in a crash
+  loop.
+- CCL 0 (the driver's fallback phases) drives the MPPT `/Link/ChargeCurrent`
+  to 0 as well — solar is off during a CAN outage on shore; when inverting
+  the MPPTs still get 0 + inverter draw, so they keep carrying loads.
+
 ## Install / migration
 
 Order matters — free instances 200/220 before the first start so localsettings
