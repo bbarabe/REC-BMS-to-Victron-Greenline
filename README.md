@@ -1,23 +1,29 @@
 # REC-BMS-to-Victron-Greenline
 
-Personal integration of a REC BMS, CZone digital switching and a Greenline
-hybrid drive into a Cerbo GX (Venus OS).
+Personal integration of a REC BMS, CZone digital switching, the 12 V house
+batteries and a Greenline hybrid drive into a Cerbo GX (Venus OS).
 
-Two standalone D-Bus drivers do the work that Node-RED flows used to:
+All of it runs as standalone D-Bus drivers. Every function used to be a Node-RED
+flow; as of 2026-08-21 none is, so nothing on the boat depends on Signal K or
+Node-RED any more.
 
 | | |
 |---|---|
-| [`dbus-recbms/`](dbus-recbms/) | REC-BMS main bank → `com.victronenergy.battery` plus a VRM "Max Charge" slider |
+| [`dbus-recbms/`](dbus-recbms/) | REC-BMS main bank → `com.victronenergy.battery` plus a VRM "Max Charge" slider. Ships `dbus-solarpriority` too: harvest-and-burn solar priority on `com.victronenergy.switch` |
 | [`dbus-czone/`](dbus-czone/) | CZone switching → one multi-output `com.victronenergy.switch` bank, circuits discovered from the bus |
+| [`dbus-batteries/`](dbus-batteries/) | 12 V batteries from N2K PGN 127508/127506/127489 → `com.victronenergy.battery`, with which batteries to forward chosen at runtime over D-Bus |
+| [`dbus-edrive/`](dbus-edrive/) | Greenline 6GK drives → two `com.victronenergy.motordrive`, read-only |
 
-The remaining Node-RED flows (12 V batteries, Greenline e-drive, solar priority,
-device-instance registry) are the `*.json` files at the top level.
+Deploy with `python deploy_cerbo.py <name>` (one SSH session, config guard,
+backups, verification — it encodes the rules in [`CLAUDE.md`](CLAUDE.md)).
+`python test_drivers.py` runs `dbus-batteries` and `dbus-edrive` off the boat
+against stubbed D-Bus and CAN.
 
 Superseded flows live in [`archive/`](archive/) — kept for rollback only, never
 deployed alongside the drivers that replaced them.
 
 **Start with [`specification.md`](specification.md)** — CAN topology, the CZone
-and REC-BMS protocols, the drivers and every flow are documented there.
+and REC-BMS protocols, and every driver are documented there.
 
 Other references: [`GreenlineFindings.md`](GreenlineFindings.md) (hybrid drive
 CAN decode), [`Decoded.md`](Decoded.md) and [`BatteryCAN.md`](BatteryCAN.md)

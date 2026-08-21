@@ -1,0 +1,20 @@
+# Everything here is deployed to a Linux box (Venus OS, armv7l). A CRLF in a
+# `#!/bin/sh` line makes the kernel look for an interpreter called "/bin/sh\r"
+# and the service never starts, so keep LF in the WORKING TREE too — not just
+# in the blobs. Without this, git's core.autocrlf=true on Windows checks these
+# out with CRLF and `scp`/`sftp` ships them exactly as they sit on disk.
+#
+# deploy_cerbo.py also strips CR on upload, so a checkout with the wrong
+# settings still deploys correctly. Both, on purpose: this one is silent and
+# easy to lose.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.sh    text eol=lf
+*.ini   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.CFG   text eol=lf
+run     text eol=lf
+
+*.pyc   binary

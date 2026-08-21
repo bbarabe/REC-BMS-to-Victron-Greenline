@@ -35,10 +35,12 @@ copy landed.
 
 | What | How | Who |
 |---|---|---|
-| `dbus-recbms/` (`dbus-recbms` + `dbus-solarpriority` services), `dbus-czone/` | `scp` to `/data/`, then `svc -t` | scriptable |
-| `*.json` Node-RED flows | import + Deploy in the Node-RED UI | **the user, by hand** |
+| `dbus-recbms/` (`dbus-recbms` + `dbus-solarpriority`), `dbus-czone/`, `dbus-batteries/`, `dbus-edrive/` | `scp` to `/data/`, then `svc -t` | scriptable |
+| `*.json` Node-RED flows (all retired, `archive/` only) | import + Deploy in the Node-RED UI | **the user, by hand** |
 
-**Never hot-deploy a flow** — do not splice `flows_einstein.json` on the Cerbo and
+No flow is deployed any more — everything is a driver, so the top row is the
+only live path. The rule still stands for anything that goes back:
+**never hot-deploy a flow** — do not splice `flows_einstein.json` on the Cerbo and
 do not restart Signal K to force a flow reload. Finish flow work in the repo and
 hand it over. Node-Red is *embedded in the Signal K server*, so restarting Node-Red
 means restarting Signal K and everything else it hosts.
@@ -55,6 +57,11 @@ python deploy_cerbo.py solarpriority --install # first install of a service
 python deploy_cerbo.py recbms --dry-run        # show the plan / config diff only
 python deploy_cerbo.py czone --verify-only     # no upload, no restart
 ```
+
+Packages: `recbms`, `solarpriority`, `czone`, `batteries`, `edrive`.
+`python test_drivers.py` runs `dbus-batteries` and `dbus-edrive` off the boat
+against stubbed D-Bus, velib and SocketCAN — run it before every deploy of
+either.
 
 It aborts (exit 3) when the live config's *values* differ from the repo's
 HEAD copy — fold the on-boat edit into the repo first, or `--force-config`.
@@ -76,9 +83,9 @@ write `IgnoreAcIn1`).
 just needs the copy and the restart.
 
 > **`scp -r` overwrites `config.ini`.** It holds the boat's calibration — the CVL
-> curve, `solar_lead_v`, the solar-boost clamps, `momentary_outputs`. Diff the live
-> copy against the repo *before* copying, and fold any on-boat edits back into the
-> repo first:
+> curve, `solar_lead_v`, the solar-boost clamps, `momentary_outputs`, the e-drive
+> DC-current fit and throttle divisor. Diff the live copy against the repo
+> *before* copying, and fold any on-boat edits back into the repo first:
 > ```sh
 > ssh root@$CERBO_HOST 'cat /data/dbus-recbms/config.ini' > /tmp/boat.ini
 > diff /tmp/boat.ini dbus-recbms/config.ini
@@ -97,21 +104,36 @@ Restart: `svc -t /service/<name>`. Stop: `svc -d`. Rollback: `uninstall.sh`, the
 re-import the matching flow from `archive/` (read `archive/README.md` first — the
 flows and the drivers claim the same instances and must never run together).
 
-## Node-RED flows
+## Device instances
 
-Hand the `.json` to the user to import and Deploy. After deploying anything that
-publishes a virtual device:
+The Instance Registry flow is retired (`archive/InstanceRegistry.json`). Each
+driver now pins the numbers it owns via
+`/Settings/Devices/<id>/ClassAndVrmInstance`, using a settings id **without** the
+`virtual_` prefix so the Node-RED palette's auto-cleanup can never remove it.
+The allocation table is in `specification.md`, "Device Instance Allocation".
 
-1. `InstanceRegistry.json` -> **Enforce + audit now**; expect no `RECONVERGE`.
-2. Orphan `/Settings/Devices/virtual_*` entries -> **Remove ORPHAN settings**.
-3. `svc -t /service/signalk-server` so Signal K drops cached dead paths.
-4. `python verify_pinning.py` — restarts Node-RED 3× and fails if any device
-   instance moves or a new Signal K path appears.
+**Never reuse an instance**, even after deleting a device — VRM and Signal K key
+their history off it, so a recycled number merges two devices' histories. New
+`dbus-batteries` sources draw monotonically from
+`/Settings/N2kBatteries/NextInstance`.
 
-Every virtual device needs a row in the registry node *before* it is deployed, with
-a hand-written, dot-free node ID. A device retired from the boat must have its row
-**removed** — leaving it there re-creates its settings entry on every enforcement
-pass and hides it from the orphan audit.
+A driver replacing a flow must have the flow's `/Settings/Devices/virtual_*`
+entries removed before it can claim the same numbers; each driver ships a
+`migrate.sh` that does exactly that and refuses to run while the flow's services
+are still on the bus.
+
+**localsettings silently refuses a duplicate instance.** Two
+`/Settings/Devices/*` entries may not claim one `ClassAndVrmInstance`: the
+second `SetValue` returns success and keeps the old value. Always re-read after
+pinning. And `RemoveSettings` wants the **leaf** path
+(`Devices/<id>/ClassAndVrmInstance`) — given the group (`Devices/<id>`) it
+returns `-1` per entry and changes nothing, silently. Both confirmed on the boat
+2026-08-21.
+
+**Disabling a flow tab + Deploy does not always drop its virtual services.**
+They can survive as zombies holding their instances (seen with the CZone
+migration). `svc -t /service/signalk-server` clears them — that is not a hot
+deploy, it is cleanup *after* the user has deployed by hand.
 
 ## DVCC access level
 
@@ -125,8 +147,21 @@ being ignored (`/RecBms/LeadFault`, InternalFailure warning) and falls back to
 the full target — so a lead fault after a settings reset is a symptom to fix,
 not a driver bug.
 
-## Deploy order when a flow depends on a driver path
+## Deploy order when one component depends on another's D-Bus path
 
-Driver first, always. A flow that reads a D-Bus path the running driver does not
-publish yet will silently sit on missing data (e.g. `SolarPriority.json` needs
-`/RecBms/TargetChargeVoltage`, which only exists in dbus-recbms >= 1.3.0).
+Publisher first, always. A consumer that reads a D-Bus path the running
+publisher does not have yet will silently sit on missing data — e.g. the
+retired `SolarPriority.json` needed `/RecBms/TargetChargeVoltage`, which only
+exists in dbus-recbms >= 1.3.0.
+
+## Runtime configuration lives in localsettings, not config.ini
+
+`dbus-czone`'s per-output `Type` and everything under `dbus-batteries`'
+`[sources]` are **first-run defaults**: once the setting exists in
+localsettings, the user's (or an app's) choice wins and a redeploy must never
+undo it. When adding a knob a UI should own, follow that pattern — seed from
+`config.ini`, persist to `/Settings/<Group>/…`, and expose it on the driver's
+own D-Bus service as well so a client can subscribe rather than poll.
+`dbus-batteries` is the worked example: `com.victronenergy.n2kbatteries`
+`/Sources/<key>/Enabled` and `/Settings/N2kBatteries/<key>/Enabled` are two
+faces of one value.

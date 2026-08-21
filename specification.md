@@ -2,7 +2,9 @@
 
 ## Overview
 
-This project contains Node-Red flows, two standalone Python D-Bus drivers (`dbus-recbms/` and `dbus-czone/`), and device configurations for a marine vessel's electrical and battery monitoring system running on a **Victron Cerbo GX** (Venus OS). The system integrates multiple CAN bus networks, Signal-K, and Victron's D-Bus to provide unified monitoring and control via VRM (Victron Remote Management).
+This project contains five standalone Python D-Bus drivers (`dbus-recbms/`, which ships both `dbus-recbms` and `dbus-solarpriority`, plus `dbus-czone/`, `dbus-batteries/` and `dbus-edrive/`) and device configurations for a marine vessel's electrical and battery monitoring system running on a **Victron Cerbo GX** (Venus OS). The system integrates multiple CAN bus networks and Victron's D-Bus to provide unified monitoring and control via VRM (Victron Remote Management).
+
+Every function used to be a Node-Red flow; as of 2026-08-21 none is. The retired flows are in [`archive/`](archive/) for rollback only, and nothing on the boat depends on Signal K or Node-RED any more — the drivers come up seconds after D-Bus at boot and survive Node-RED deploys and Venus firmware updates.
 
 ## Physical Architecture
 
@@ -12,7 +14,7 @@ There are two physically separate CAN bus networks, bridged by a Yacht Devices Y
 
 - **CAN1 (drive/BMS network)** — 250 kbps, limited devices:
   - REC-BMS (11-bit standard CAN frames): Victron/SMA CAN-BMS protocol at 0x351-0x404
-  - Greenline 6GK electric drive system — CANopen TPDOs (11-bit) plus HCU J1939 frames; decoded by `GreenlineEDriveFlow.json`, wire format in `GreenlineFindings.md`
+  - Greenline 6GK electric drive system — CANopen TPDOs (11-bit) plus HCU J1939 frames; decoded by `dbus-edrive/`, wire format in `GreenlineFindings.md`
   - Yanmar engines
   - No chartplotters, switching, or general NMEA 2000 devices on this bus
 
@@ -41,7 +43,11 @@ There are two physically separate CAN bus networks, bridged by a Yacht Devices Y
   - Battery monitors: device address 16 (`n2k-on-ve.can-socket.16`) provides PGN 127506/127508 battery data
   - All other NMEA 2000 devices
   - Receives forwarded traffic from CAN1 via the YDNB-07 bridge
-  - **Important**: The VE.Can port filters out 11-bit CAN frames at the hardware/driver level (sun4i_can). Only 29-bit extended frames reach userspace (`candump`). This is why BMS frames must be repackaged.
+  - **Important**: the VE.Can port (sun4i_can) does not pass the REC-BMS 11-bit
+    frames `0x351`-`0x404` to userspace, which is why the YDNB-07 must repackage
+    them as 29-bit. It is *not* a blanket 11-bit filter: the drives' CANopen
+    TPDOs `0x18x`/`0x28x`/`0x38x`/`0x48x` do arrive and `dbus-edrive` reads them
+    directly. Check any new 11-bit id with `candump` rather than assuming.
 
 ### YDNB-07 Bridge (Firmware 1.42)
 
@@ -231,7 +237,7 @@ The table above is the authoritative decode. `Decoded.md` holds the field-by-fie
 
 ### 12V Batteries
 
-Three 12V batteries are monitored by an NMEA 2000 device at address 16 (PGN 127506/127508). The two engine batteries are not on that monitor — their voltage comes from the Yanmar gateways' PGN 127489 (Engine Parameters, Dynamic) *Alternator Potential* field (0.01V resolution, ~2 Hz, transmitted even with engines off). 127489 carries no SOC or current.
+Three 12V batteries are monitored by an NMEA 2000 device at address 16 (PGN 127506/127508). The two engine batteries are not on that monitor — their voltage comes from the Yanmar gateways' PGN 127489 (Engine Parameters, Dynamic) *Alternator Potential* field (0.01V resolution, ~2 Hz). The gateways are powered from the **ignition**, not the engine: ignition on with the engine stopped still gives a reading, but with the ignition off 127489 is absent from the bus entirely and the engine batteries do not exist as far as the Cerbo is concerned (confirmed 2026-08-21). 127489 carries no SOC or current.
 
 | Signal-K Path | Name | Source | Available Data |
 |---------------|------|--------|---------------|
@@ -303,25 +309,113 @@ published"), so it lives in Venus's per-output `Settings/Type` — seeded from
 
 Install/migration/rollback procedure: `dbus-czone/README.md`.
 
-## Node-Red Flows
+## 12V Battery Driver (`dbus-batteries/`)
 
-### Batteries Forward (`BatteriesForward.json`)
+Standalone Python D-Bus service that replaces the Node-RED Batteries Forward
+flow. Runs under daemontools (`/service/dbus-batteries`, installed via
+`install.sh`, survives firmware updates through `/data/rc.local`), starts
+seconds after D-Bus at boot, and is untouched by Node-RED deploys.
 
-Reads 12V battery data from Signal-K and publishes to 5 Victron virtual battery devices.
+**Data path**: raw SocketCAN socket on `can0` (kernel filters for PGN 127508,
+127506 and 127489, 29-bit only) -> one `com.victronenergy.battery.n2kbat_<name>`
+per forwarded source. The flow read Signal K paths instead, so the batteries
+only appeared once the whole Signal K stack was up and its N2K decoder had
+converged.
 
-- **Signal-K subscribe** nodes for voltage, current (House only), and SOC
-- **SOC conversion**: Signal-K ratio (0.0-1.0) multiplied by 100 for Venus OS percentage
-- **1s publish tick** with 10-second staleness check
-- **5 virtual battery outputs** (12V preset): House, Bow, Stern (voltage/SOC from `electrical.batteries.*`), Port Engine and Starboard Engine (voltage only, from `propulsion.*.alternatorVoltage` / PGN 127489)
-- Engine batteries use `default_values: false` so the never-published SOC/current paths stay blank instead of showing a fake 50%; their assemblers also drop non-numeric payloads so a null Signal-K delta can't publish 0V
+| Key | Battery | Instance | Source |
+|---|---|---|---|
+| `bat1` | House | 201 | SiCOM addr `0x10`, PGN 127508 + 127506 |
+| `bat2` | Bow | 202 | same |
+| `bat3` | Stern | 203 | same |
+| `alt0` | Port Engine | 204 | Yanmar gateway src `0x8D`, PGN 127489, engine instance 0 |
+| `alt1` | Starboard Engine | 205 | Yanmar gateway src `0x8E`, PGN 127489, engine instance 1 |
 
-### Greenline E-Drive (`GreenlineEDriveFlow.json`)
+Instances carried over unchanged from the retired registry, so VRM history and
+Signal K paths survive the migration. Field decode:
 
-Passively decodes the two Greenline 6GK electric drives from `can0` and publishes them as two Victron virtual `motordrive` devices (port = instance 210, starboard = 211). Read-only: the flow never transmits, so it cannot influence the drive system.
+| PGN | Layout |
+|---|---|
+| 127508 Battery Status (single frame) | instance \| V (0.01 V, u16) \| I (0.1 A, s16) \| temperature (0.01 K, u16) \| SID |
+| 127506 DC Detailed Status (fast packet) | SID \| instance \| DC type \| SOC % \| SOH % \| time remaining (min, u16) \| ripple |
+| 127489 Engine Parameters, Dynamic (fast packet) | instance \| oil P \| oil T \| coolant T \| **alternator potential** (0.01 V, s16) \| … |
 
-**Data path**: `candump -L can0,<13 filters>` -> chunk-safe line parser -> per-drive state assembler -> two `victron-virtual` motordrive nodes. Same watchdog pattern as the retired Virtual BMS flow: `pkill` any stale capture before starting, restart 5 s after candump exits.
+127508 and 127506 are verified against `captures/mfd-boot.log` and confirmed
+live on the boat (House 14.15 V / −0.2 A / SOC 100, Bow 13.76 V, Stern 13.65 V).
+127489's alternator field is per the NMEA 2000 layout and is **still
+unverified**: it has never appeared in a capture in this repo, and at first
+deploy the Yanmar ignition was off, so the gateways were unpowered. Reserved codes
+(`0xFFFF`, `0x7FFF`) decode to *no value*, never to 655.35 V.
 
-Both frame families are needed. The **CANopen TPDOs** (11-bit `0x18x`/`0x28x`/`0x38x`/`0x48x`, `A` = port, `B` = starboard) carry IEEE floats at full resolution; the **HCU J1939 frames** (`61451`/`61452`/`61453`) carry quantized values, but two quantities have no float source at all. Note the source-address inversion: on the J1939 frames `0x64` is **starboard** and `0x65` is **port**.
+A DC source gets `/Dc/0/Voltage|Current|Power|Temperature`, `/Soc`, `/Soh`,
+`/TimeToGo` and — when a capacity is configured — `/InstalledCapacity`,
+`/Capacity` and `/ConsumedAmphours` (negative, BMV convention). An alternator
+source gets `/Dc/0/Voltage` only: 127489 carries no current and no SOC, and a
+never-updated `/Soc` showing a plausible number is worse than no `/Soc` at all
+(the flow's `default_values: false`, done properly).
+
+Staleness is two-stage: after `stale_after_s` (10 s) `/Connected` drops to 0 and
+every measurement is **blanked** — a frozen 12.6 V on a start battery reads
+exactly like a healthy one — and after `unpublish_after_s` (300 s) the battery
+leaves D-Bus entirely. A source never seen is never published. That is why the
+engine batteries are normally absent: the Yanmar gateways are unpowered with the
+ignition off, so 127489 is not on the bus at all, and a permanently disconnected
+VRM device is worse than none. The source keeps its settings, its name and its
+**reserved instance** and returns on the same number one frame after ignition.
+
+**Which batteries are forwarded is data, not code.** Every source the bus
+mentions is catalogued under a key derived from the wire (`bat<n>` for N2K
+battery instance *n*, `alt<n>` for engine instance *n*) — never from a list
+position. A catalogued but disabled source costs nothing: no instance, no
+service, no VRM entry. Two equivalent control surfaces, both persisting to the
+same localsettings values and both applied immediately (the battery service is
+created or torn down in place, no restart):
+
+- `com.victronenergy.settings` — `/Settings/N2kBatteries/<key>/Enabled`,
+  `/Instance`, `/CustomName`, `/ServiceSuffix`, `/Capacity`, plus
+  `/Settings/N2kBatteries/Catalog` (JSON) and `/NextInstance`.
+- `com.victronenergy.n2kbatteries` — `/Sources/<key>/Enabled`,
+  `/DeviceInstance`, `/CustomName`, `/Capacity` (all writable) alongside
+  read-only `/Kind`, `/N2kInstance`, `/SourceAddress`, `/Available`,
+  `/Published`, `/Age`, `/Fields`, and `/Catalog` for a one-read render of the
+  whole picker. `Enabled` is the standing choice, `Published` is the bus's
+  answer.
+
+This is the surface a forked Victron HTML5 MFD app is meant to drive. Only the
+*stable* description is persisted; liveness lives on `/Available` and `/Age`, so
+a present battery does not cause a localsettings write every second. Settings
+written by something else are picked up from `PropertiesChanged`, with a 30 s
+reconcile as backstop.
+
+`config.ini` values under `[sources]` are **first-run defaults only** — once a
+setting exists, the user's choice wins, the same contract as `dbus-czone`'s
+per-output `Type`. A battery that turns up and is not in `config.ini` is
+catalogued and left disabled (`auto_enable_new = false`); enabling it draws the
+next number from `instance_pool` (206-209), monotonically and never reused.
+
+Install/migration/rollback: `dbus-batteries/README.md`. Migration needs
+`migrate.sh` on the boat to delete `/Settings/Devices/virtual_bat<N>_virtual`,
+or localsettings will not hand 201-205 back.
+
+## E-Drive Driver (`dbus-edrive/`)
+
+Standalone Python D-Bus service that replaces the Node-RED Greenline E-Drive
+flow. Runs under daemontools (`/service/dbus-edrive`), starts seconds after
+D-Bus at boot, and is untouched by Node-RED deploys. Publishes the two drives as
+`com.victronenergy.motordrive.edrive_port` (instance 210) and `edrive_stbd`
+(211). **Read-only**: the socket is bound with a receive filter set and the
+driver never transmits, so it cannot influence the drive system.
+
+**Data path**: raw SocketCAN socket on `can0` — 8 filter entries for the 11-bit
+CANopen ids plus 5 for the J1939/N2K PGNs. No `candump` subprocess, no `pkill`,
+no watchdog, no 5 s restart loop, no chunk-safe line parsing.
+
+Both frame families are needed. The **CANopen TPDOs** (11-bit `0x18x`/`0x28x`/
+`0x38x`/`0x48x`, `A` = port node `0x0A`, `B` = starboard `0x0B`) carry IEEE
+floats at full resolution; the **HCU J1939 frames** (`61451`/`61452`/`61453`)
+carry quantized values, but two quantities have no float source at all. Note the
+source-address inversion: on the J1939 frames `0x64` is **starboard** and `0x65`
+is **port**. All three mappings live in `config.ini`, one `[drive.<key>]`
+section per motor.
 
 | CAN id / PGN | Content |
 |---|---|
@@ -335,29 +429,189 @@ Both frame families are needed. The **CANopen TPDOs** (11-bit `0x18x`/`0x28x`/`0
 | 65363 `0x18FF53xx` | byte 0 = instance, bytes 1–2 LE ÷ 9.280 = throttle % |
 | 127493 | byte 0 = instance, byte 1 bits 0–1 = gear (`0xFC` Fwd, `0xFD` Neutral, `0xFE` Rev) |
 
-**`0x48x` float 1 is torque, not power.** It was originally read as power × 100 W. The drives do not transmit motor power at all — the MFD computes it — so `/Dc/0/Power` is derived as voltage × current instead. Details and the calibration in `GreenlineFindings.md`.
+**`0x48x` float 1 is torque, not power × 100 W.** The drives do not transmit
+motor power at all — the MFD computes it — so `/Dc/0/Power` is derived as
+voltage × current instead. Details and the calibration in `GreenlineFindings.md`.
 
-**Temperatures**: all three the MFD shows per drive are published (solved 2026-08-18, see `edrive_temps.py` for a live read). The Victron `motordrive` class has exactly **nine** paths, so the mapping is forced: the MOSFET is what the coolant loop cools, so it feeds `/Coolant/Temperature`; `/Motor/Temperature` is the drive/motor temp; `/Controller/Temperature` is the MCU/HCU board, which only 61453 w2 reports and only in whole degrees. 61453 is quantized to 1 °C, so a sensor sitting on an integer boundary dithers ±1 °C frame to frame — exactly what the display shows.
+**Temperatures**: all three the MFD shows per drive are published (solved
+2026-08-18, see `edrive_temps.py` for a live read). The Victron `motordrive`
+class has exactly **nine** paths, so the mapping is forced: the MOSFET is what
+the coolant loop cools, so it feeds `/Coolant/Temperature`; `/Motor/Temperature`
+is the drive/motor temp; `/Controller/Temperature` is the MCU/HCU board, which
+only 61453 w2 reports and only in whole degrees. 61453 is quantized to 1 °C, so
+a sensor sitting on an integer boundary dithers ±1 °C frame to frame — exactly
+what the display shows.
 
 | motordrive path | Source |
 |---|---|
 | `/Dc/0/Voltage` | `0x38x` f1 |
-| `/Dc/0/Current` | 61452 w2 (measured) |
+| `/Dc/0/Current` | 61452 w2 (measured), else T·ω ÷ V |
 | `/Dc/0/Power` | voltage × current (derived) |
-| `/Motor/RPM` | `0x48x` f2 |
-| `/Motor/Temperature` | `0x28x` f2 (drive/motor) |
+| `/Motor/RPM` | `0x48x` f2, clamped to 0 below 1 rpm |
 | `/Motor/Direction` | 127493 gear |
+| `/Motor/Temperature` | `0x28x` f2 (drive/motor), else 61453 w1 |
 | `/Controller/Temperature` | 61453 w2 (MCU/HCU) |
-| `/Coolant/Temperature` | `0x28x` f1 (MOSFET) |
-| `/Connected` | frame staleness (6 s) |
+| `/Coolant/Temperature` | `0x28x` f1 (MOSFET), else 61453 w0 |
+| `/Connected` | frame staleness, per drive (6 s) |
 
-Torque (N·m or %), throttle % and phase current have **no** `motordrive` path; they leave the parser on a third output for Signal K / MQTT.
+The calibrated fits — DC current `800.409 − 0.024918 × w2`, throttle
+`raw ÷ 9.280`, phase peak `w4 ÷ 20` — live in `config.ini`, never in the code.
+The throttle scale is exact over the 0–8.1 % that was exercised; full travel
+extrapolates to raw ≈ 928 and is **unverified**.
 
-**2 s staleness tick**: without it the last values freeze forever when the bus goes quiet — the drives displayed a stale 22.7 V long after shutdown. The tick exists purely so `/Connected` drops to 0.
+Everything with no `motordrive` path is published under `/EDrive/` on the same
+service — `TorqueNm`, `TorquePercent`, `ThrottlePercent`, `PhaseCurrentRms`,
+`PhaseCurrentPeak`, `MechanicalPower`, `MosfetTemperature`, `Running`,
+`StatusByte`. In the flow this telemetry could only reach a debug node; on D-Bus
+it is visible to Signal K, MQTT and the HTML5 app like anything else.
 
-### Solar Priority driver (`dbus-recbms/solar_priority.py`) — DEPLOYED 2026-08-21
+Staleness is per drive, so one drive powered down does not blank the other, and
+only the drives' own frames count: 127493 (gear) and 65363 (throttle) come from
+the Yanmar gateway, which keeps broadcasting with the hybrid system down. The
+flow treated them as a heartbeat, so a drive that had been off for hours still
+read `/Connected = 1` with every measurement blank. With the hybrid system off
+both services now stay registered with `/Connected = 0` and blank values — the
+expected dock state, not a fault.
 
-The flow below, ported line-for-line to a standalone daemontools service (`/service/dbus-solarpriority`) that ships in the `dbus-recbms/` package but stays separate (own config `solar_priority.ini`, own log, own D-Bus service `com.victronenergy.switch.solarpriority` instance 221 carrying the toggle and the PV-capacity slider as two outputs). Inputs via velib `DbusMonitor` (last-known-good + heartbeat liveness, as in the flow); outputs `IgnoreAcIn1` and the dbus-recbms boost request over D-Bus. Differences from the flow are deliberate and listed in `dbus-recbms/README.md`: `IgnoreAcIn1` forced to 0 on exit/SIGTERM/exception, FAULT/emergency lockouts are hard 1 h holds (the flow's evidence release cleared them), transitions logged durably. The flow and the driver must never run together (both write `IgnoreAcIn1`); migration steps in the README. Once deployed, `SolarPriority.json` moves to `archive/` and instance 222 is retired.
+Install/migration/rollback: `dbus-edrive/README.md`. Migration needs
+`migrate.sh` on the boat to delete `/Settings/Devices/virtual_gl6gk_port|stbd`,
+or localsettings will not hand 210/211 back.
+
+
+## Solar Priority Driver (`dbus-recbms/solar_priority.py`) — DEPLOYED 2026-08-21
+
+The retired flow (algorithm described under **Retired Node-RED flows** below), ported line-for-line to a standalone daemontools service (`/service/dbus-solarpriority`) that ships in the `dbus-recbms/` package but stays separate (own config `solar_priority.ini`, own log, own D-Bus service `com.victronenergy.switch.solarpriority` instance 221 carrying the toggle and the PV-capacity slider as two outputs). Inputs via velib `DbusMonitor` (last-known-good + heartbeat liveness, as in the flow); outputs `IgnoreAcIn1` and the dbus-recbms boost request over D-Bus. Differences from the flow are deliberate and listed in `dbus-recbms/README.md`: `IgnoreAcIn1` forced to 0 on exit/SIGTERM/exception, FAULT/emergency lockouts are hard 1 h holds (the flow's evidence release cleared them), transitions logged durably. The flow and the driver must never run together (both write `IgnoreAcIn1`); migration steps in the README. `SolarPriority.json` is now in `archive/` and instance 222 is retired.
+
+## Device Instance Allocation
+
+Every device on the boat is published by a standalone driver, and each
+driver pins the numbers it owns through
+`/Settings/Devices/<id>/ClassAndVrmInstance` at startup, reconverging if
+localsettings granted something else. The settings ids deliberately have
+**no** `virtual_` prefix, so the Node-RED palette's auto-cleanup can never
+remove them.
+
+system-wide view):
+
+| Instance | Class | Service `com.victronenergy.…` | Device | Owner |
+|----------|-------|-------------------------------|--------|-------|
+| 200 | battery | `battery.recbms` | REC-BMS Main Bank | `dbus-recbms` |
+| 201 | battery | `battery.n2kbat_house` | House 12V | `dbus-batteries` |
+| 202 | battery | `battery.n2kbat_bow` | Bow 12V | `dbus-batteries` |
+| 203 | battery | `battery.n2kbat_stern` | Stern 12V | `dbus-batteries` |
+| 204 | battery | `battery.n2kbat_porteng` | Port Engine 12V | `dbus-batteries` |
+| 205 | battery | `battery.n2kbat_stbdeng` | Starboard Engine 12V | `dbus-batteries` |
+| 206–209 | battery | — | spare pool for newly discovered N2K batteries | `dbus-batteries` |
+| 210 | motordrive | `motordrive.edrive_port` | Port E-Motor | `dbus-edrive` |
+| 211 | motordrive | `motordrive.edrive_stbd` | Starboard E-Motor | `dbus-edrive` |
+| 220 | switch | `switch.recbms_maxcharge` | Max Charge Slider | `dbus-recbms` |
+| 221 | switch | `switch.solarpriority` | Solar Priority toggle + PV Capacity slider | `dbus-solarpriority` |
+| 222 | — | *(retired)* | was `virtual_sp_rated_switch`, folded into 221 output_2 | — |
+| 224 | switch | `switch.czone` | CZone switch bank (all circuits, one device) | `dbus-czone` |
+| 225–235 | — | *(retired)* | was `virtual_cz_vs_sw1`…`sw11`, replaced by the bank at 224 | — |
+| 236–255 | — | — | spare | — |
+
+Reserved block **200–255**, far above anything Venus auto-assigns (native
+devices allocate from 0 upward): 200–209 batteries, 210–219 motor drives,
+220–239 switches, 240–255 spare.
+
+**localsettings will not let two `/Settings/Devices/*` entries claim one
+instance, and it refuses the write silently** — `SetValue` reports success and
+keeps the old number (confirmed on the boat 2026-08-21, with the retired
+Node-RED `virtual_*` entries still in place: every driver restart logged
+`reconverged 206 -> 201` and nothing ever stuck). A driver must therefore
+re-read after pinning, and a flow's entries must be removed before its
+replacement can claim the same numbers. `RemoveSettings` takes the **leaf**
+path (`Devices/<id>/ClassAndVrmInstance`); handed the group (`Devices/<id>`) it
+returns `-1` for every entry and changes nothing, also silently.
+
+**Never reuse a number, even after deleting a device.** VRM and Signal K key
+their history off the instance, so a recycled number silently merges two
+different devices' histories. 222 and 225–235 are retired, not spare. The rule
+outlived the registry: `dbus-batteries` allocates from its pool monotonically
+through `/Settings/N2kBatteries/NextInstance`, and nothing anywhere derives an
+instance from an array index, discovery order, a loop counter, a timestamp or a
+hash.
+
+**Verification** (`verify_pinning.py`): snapshots the service→instance map,
+`virtual_*` settings entries and the Signal K model (tanks/electrical/
+propulsion), restarts Node-RED three times, and fails if any snapshot gains a
+service, changes an instance, or grows a new Signal K path. Still useful after a
+Venus firmware update, but its Node-RED restart loop no longer proves much — the
+drivers do not restart with Node-RED. Restarting the *drivers* is now the
+meaningful test.
+
+
+## Retired Node-RED flows (`archive/`)
+
+Every one of them was replaced by a standalone driver above, and each is kept
+only for rollback. **None may run alongside its driver** — see
+`archive/README.md` for the collisions and the rollback procedure. What follows
+describes them as they were on their retirement date; every fix and calibration
+since lives in the drivers.
+
+With the Instance Registry retired there are **no active Node-RED flows left**:
+nothing on the boat depends on Signal K or Node-RED any more.
+
+### Batteries Forward (`archive/BatteriesForward.json`) — RETIRED
+
+Subscribed to Signal K `electrical.batteries.1..3.*` and
+`propulsion.{port,starboard}.alternatorVoltage`, assembled them in flow context,
+and published five `victron-virtual` batteries on a 1 s tick with a 10 s
+staleness check. SOC arrived as a Signal K ratio and was multiplied by 100.
+Replaced by [`dbus-batteries/`](../dbus-batteries/), which reads the same three
+PGNs directly off `can0` and makes the choice of which batteries to forward a
+runtime setting rather than five hardcoded nodes.
+
+### Greenline E-Drive (`archive/GreenlineEDriveFlow.json`) — RETIRED
+
+Ran `candump -L can0,<13 filters>` as an exec-node subprocess, parsed the
+chunked stdout, and published two `victron-virtual` motordrives; a watchdog
+`pkill`ed any stale capture and restarted 5 s after candump exited. The wire
+decode it implemented is unchanged and now lives in
+[`dbus-edrive/`](../dbus-edrive/), which reads the bus with kernel filters and
+starts no subprocess.
+
+
+### Virtual BMS (`archive/Virtual BMS.json`) — RETIRED
+
+**Replaced by the standalone `dbus-recbms/` driver (see above). Kept in the repo for rollback only — do not deploy alongside the driver (they claim the same instances 200/220).**
+
+Reads repackaged BMS CAN frames from `can0` via `candump`, decodes them, and publishes to a Victron virtual battery device on D-Bus.
+
+**Data path**: candump can0 (filter `18FF0000:1FFFF800`) -> Line Parser (strips 29-bit wrapper: `rawid & 0x7FF`) -> CAN Frame Decoder -> State Assembler -> Path Filter -> victron-virtual battery
+
+Key features (all ported to the driver):
+- **candump watchdog**: Before every start, `pkill -f '[c]andump can0,18FF0000:1FFFF800'` clears any stale capture process (prevents duplicates after a hard Node-Red restart or manual re-trigger). The pattern matches this flow's exact command line — filter argument included — so manually-run or other-purpose candump processes are never touched. If candump exits for any reason, a watchdog restarts it after 5 seconds (restart count kept in flow context).
+- **Chunk-safe line parsing**: exec stdout arrives in chunks, not lines. The parser buffers partial lines across chunks, splits on newlines, and emits one message per CAN frame — no frames are lost when the pipe coalesces multiple lines.
+- **Frame length guard**: Each CAN ID has a minimum-length requirement; short/corrupt frames are dropped (with a rate-limited warning, max 1/min) instead of throwing mid-decode. Only successfully decoded frames refresh the staleness timestamp.
+- **Staged fallback**: If CAN data goes stale, progressively restricts charge/discharge limits (LIVE ≤60s → ALERT ≤2min → RESTRICT ≤5min → SURVIVAL). When BMS is stale, pack voltage is sourced from the Quattro's `/Dc/0/Voltage` (independent measurement), with fallback to last-known BMS voltage if the Quattro reading is also stale (>30s).
+- **Startup grace (cold-boot fix)**: A cold boot is not treated as CAN loss. Until the first frame ever decodes, the staleness clock is anchored to flow start (not epoch 0) and the flow holds a benign STARTUP phase for up to 3 minutes: CCL 0 (no blind charging), DCL 100A (inverter keeps running), DVL 52.0V (below resting pack voltage, so no low-battery cutoff), all alarms 0. Previously the first publish tick computed `age = now − 0`, jumped straight to SURVIVAL, and pushed DVL 54.0V — above the pack's resting ~53V — which tripped the Quattro's low-battery shutdown and raised a low-voltage alarm on every boot off shore power. If the grace window expires with still no frame, the normal ALERT → RESTRICT → SURVIVAL escalation proceeds from flow start. The virtual battery node's `default_values` is also off, so the service no longer flashes 48V/50% in the seconds before the first publish tick.
+- **CVL control**: "Max Charge" slider (40-100%) exposed on VRM dashboard (BMS group), maps **piecewise-linearly** to CVL **on the REC's own SOC scale** ([cvl] `curve` breakpoints in config.ini) and is clipped at 61.96V. Calibrated 2026-08-19 from three measured points: a settled hold at 58.6% ↔ 56.28V, a days-long ~0A hold at 62.3% ↔ 56.65V, and the REC's 100% sync point (raw 0x351 CVL, 62.70V). The two mid points both lie exactly on 0.100 V/% — the NMC mid-plateau is flatter than the 62→100% region (0.1605 V/%) — so the map has a knee at 62.3%: 40% → 54.42V, 60% → 56.42V, 62.3% → 56.65V, 100% → 62.70V (clip engages above ~95%; values ≥62.3% are unchanged from the earlier single-slope line). NMC steepens again below ~50%, so low slider values may settle a little high until a hold is measured there; new breakpoints can be appended to the curve as holds settle. The original 54.00→61.96V line sat inside the REC's scale at both ends (its "40%" ≈ 46% real, its "60%" held ≈ 62.5% real — the storage-mode mismatch the slider was built to prevent). The clip is user policy: never push the Quattro above 61.96V; only the EQ boost may ride on top (max 62.40V, still under the REC's 62.7V limit which is `min()`'d in regardless).
+- **Weekly equalization**: Every 7 days, adds +0.44V boost to the current slider CVL for 1 hour. Works at any slider position, not just 100%. EQ start is gated on persisted state having been restored; on first install the schedule is baselined so the first EQ runs 7 days later, not immediately.
+- **Persistent state** (`virtual-bms-state.json`): The slider position and last-equalization timestamp survive Node-Red restarts, redeploys, and reboots. Node-Red on Venus OS runs as a restricted user that cannot write to `/data` directly, so the startup exec discovers a writable directory (first writable of `$HOME/.node-red`, `$HOME`, `/data` — the Node-Red user dir is always writable since flows are saved there), reports it on the first line of its output, and the flow stores it in flow context (`state_dir`) for all subsequent writes. The "Restore Persisted State" node status shows the directory in use. State is restored 6s after startup (giving the virtual switch time to register on D-Bus, then the slider is pushed back to the VRM switch) and saved on every slider change and EQ completion. If pushing the slider value fails (switch not yet registered), a catch node re-runs the restore up to 5 times at 3s intervals. Saves are blocked until restore has run, so a startup echo can't clobber the file. If the file is missing, defaults are slider 100% and EQ baselined to now.
+- **Synthetic alarms** (since BMS does not send 0x35A; all thresholds from 0x373 cell extremes unless noted, and all report 0 when CAN is stale):
+  - `/Alarms/LowSoc`: warning at SOC < 20%, alarm at SOC < 10%
+  - `/Alarms/CellImbalance`: warning at cell delta > 50mV, alarm at > 100mV
+  - `/Alarms/LowVoltage`: warning at min cell < 3.30V, alarm at < 3.00V
+  - `/Alarms/HighVoltage`: warning at max cell > 4.20V, alarm at > 4.25V
+  - `/Alarms/LowTemperature`: warning at min cell < 5°C, alarm at < 0°C (NMC charging below freezing causes lithium plating)
+  - `/Alarms/HighTemperature`: warning at max cell > 45°C, alarm at > 50°C
+  - `/Alarms/HighChargeCurrent`: warning when modules are blocking charge (from 0x372)
+  - `/Alarms/HighDischargeCurrent`: warning when modules are blocking discharge (from 0x372)
+  - `/Alarms/InternalFailure`: alarm on CAN staleness (ALERT phase+) or modules offline (from 0x372)
+
+### CZone Control (`archive/CZoneProxy.json`) — RETIRED
+
+**Replaced by the standalone `dbus-czone/` driver (see above). Kept in the repo
+for rollback only — do not deploy it alongside the driver: both drive the same
+CZone circuits, and two writers on one bank will fight.**
+
+Reads PGN 127501 from `can0` with a `candump` subprocess and publishes eleven
+separate `victron-virtual-switch` devices (instances 225-235), one per circuit;
+commands go out as PGN 127502. Circuit names, the circuit count and the
+momentary/latching split are all hardcoded in the flow. The driver replaces all
+of that with discovery and a single multi-output bank.
 
 ### Solar Priority (`archive/SolarPriority.json`) — RETIRED, the algorithm description below still applies to the driver
 
@@ -416,100 +670,44 @@ Estimate = `min(P_rated, max(live PV, Σ per-charger max(faded capture, model)))
 
 **Setup required**: After import, (1) verify the six solar-charger input nodes point at the two MPPTs (pre-filled `solarcharger/278` and `/279`), (2) verify "AC Input Control", "AC Input Feedback" and "AC Out Power" point at the Quattro (pre-filled `vebus/276`), (3) verify the four `victron-input-system` nodes auto-discovered "Venus system" (AC Load, Battery SOC, Battery Power, Battery Voltage), (4) verify the four `battery/200` nodes ("BMS Target CVL" plus the three solar-boost paths) — **deploy `dbus-recbms` ≥ 1.3.0 before this flow**, or `/RecBms/TargetChargeVoltage` will not exist.
 
-### Instance Registry (`InstanceRegistry.json`)
+### Instance Registry (`archive/InstanceRegistry.json`) — RETIRED 2026-08-21
 
-Pins every virtual device the flows publish to a fixed dbus service name **and** a fixed VRM/device instance, so redeploys and restarts can never mint new instances. Previously instances were assigned dynamically (localsettings auto-allocation in registration order), which littered the Signal K data model with orphan paths (e.g. four generations of tank paths `tanks.freshWater.81/83/85/89` + matching `wasteWater.82/84/86/90` from one sender, and dead GPS services `vi1_uc1479909` / `vi2_uc1548484`).
+Pinned every virtual device the flows published to a fixed dbus service name
+**and** a fixed VRM/device instance, so redeploys and restarts could never mint
+new instances. Before it, instances were assigned dynamically (localsettings
+auto-allocation in registration order), which littered the Signal K data model
+with orphan paths (four generations of tank paths `tanks.freshWater.81/83/85/89`
++ matching `wasteWater.82/84/86/90` from one sender, dead GPS services
+`vi1_uc1479909` / `vi2_uc1548484`).
 
-**Why instances drifted**: the victron palette derives the dbus service name from the Node-RED node ID (`com.victronenergy.<class>.virtual_<nodeId>`) and proposes a default instance; localsettings then auto-assigns the next free number in registration order. Any regenerated node ID (copy/paste re-import, flow rebuild) or reset settings entry mints a brand-new service + instance — and Signal K keys its paths off both, so each generation leaves an orphan.
+**Why instances drifted**: the victron palette derives the dbus service name
+from the Node-RED node ID (`com.victronenergy.<class>.virtual_<nodeId>`) and
+proposes a default instance; localsettings then auto-assigns the next free
+number in registration order. Any regenerated node ID (copy/paste re-import,
+flow rebuild) or reset settings entry minted a brand-new service + instance —
+and Signal K keys its paths off both, so each generation left an orphan.
 
-**Design**:
-- The function node **"Instance Registry (single source of truth)"** holds the *only* table mapping each virtual device (node ID → service name, class, source identity) to a hand-assigned instance. Nothing anywhere may derive an instance from an array index, discovery order, a loop counter, a timestamp, or a hash.
-- Instances come from the reserved block **200–255**, far above anything Venus auto-assigns (native devices allocate from 0 upward): 200–209 batteries, 210–219 motor drives, 220–239 switches, 240–255 spare. Never reuse a number, even after deleting a device.
-- **Idempotent enforcement**: on startup (10s inject) and via the manual "Enforce + audit now" inject, the flow pre-seeds `/Settings/Devices/virtual_<id>/ClassAndVrmInstance` (AddSetting keeps an existing value, so re-runs never clobber), pins it with SetValue when it differs, then compares the live service's `/DeviceInstance`. Existing services are updated in place — the service name never changes, so a redeploy can never create a second copy. A `RECONVERGE` warning means the service registered before the pin landed (first-ever deploy only); one more deploy converges it.
-- **Audit + cleanup**: the audit lists `virtual_*` settings entries that are neither in the registry nor live (orphans from dead services); a separate manual inject removes them via `RemoveSettings`. Live-but-unregistered services (e.g. an older flow version still deployed, like CZone v5) are only warned about and never removed. After removing orphans, restart Signal K (`svc -t /service/signalk-server`) so its cached dead paths disappear.
+**Why it could be retired**: no `virtual_*` device is published any more. Every
+device on the boat now comes from a standalone driver, and each driver pins the
+numbers it owns through `/Settings/Devices/<id>/ClassAndVrmInstance` at startup,
+reconverging if localsettings granted something else. The settings ids
+deliberately have **no** `virtual_` prefix, so the palette's auto-cleanup can
+never remove them — the failure mode the registry was built to police cannot
+occur without a registry to police it.
 
-**Device instance allocation** (authoritative copy lives in the registry node — keep in sync):
-
-| Instance | Class | Service `com.victronenergy.…` | Device | Source identity |
-|----------|-------|-------------------------------|--------|-----------------|
-| 200 | battery | `battery.recbms` | REC-BMS Main Bank | dbus-recbms driver — REC-BMS, CAN-BMS 0x351–0x404 via YDNB-07 |
-| 201 | battery | `battery.virtual_bat1_virtual` | House 12V | N2K addr 16, PGN 127506/127508 |
-| 202 | battery | `battery.virtual_bat2_virtual` | Bow 12V | N2K addr 16, PGN 127506/127508 |
-| 203 | battery | `battery.virtual_bat3_virtual` | Stern 12V | N2K addr 16, PGN 127506/127508 |
-| 204 | battery | `battery.virtual_bat4_virtual` | Port Engine 12V | PGN 127489 src 141, engine instance 0 |
-| 205 | battery | `battery.virtual_bat5_virtual` | Starboard Engine 12V | PGN 127489 src 142, engine instance 1 |
-| 210 | motordrive | `motordrive.virtual_gl6gk_port` | Port E-Motor | CANopen node 0x0A, PGN 127493 instance 0 |
-| 211 | motordrive | `motordrive.virtual_gl6gk_stbd` | Starboard E-Motor | CANopen node 0x0B, PGN 127493 instance 1 |
-| 220 | switch | `switch.recbms_maxcharge` | Max Charge Slider | dbus-recbms driver, VRM control only |
-| 221 | switch | `switch.virtual_sp_switch_001` | Solar Priority Toggle | VRM control only |
-| 222 | switch | `switch.virtual_sp_rated_switch` | PV Capacity Slider | VRM control only |
-| 224 | switch | `switch.czone` | CZone switch bank (all circuits, one multi-output device) | dbus-czone driver — CZone PGN 127501/127502 |
-| 225–235 | — | *(retired)* | was `virtual_cz_vs_sw1`…`sw11`, eleven single switches from `archive/CZoneProxy.json` | replaced by the single bank at 224 |
-| 236–255 | — | — | spare | — |
-
-Instances 225–235 are **retired, not spare** — the never-reuse rule applies. They
-were deliberately removed from the registry node's table when `dbus-czone` took
-over: a row there would re-create `/Settings/Devices/virtual_cz_vs_swN` on every
-enforcement pass *and* hide those entries from the orphan audit, which is exactly
-what the migration needs to delete.
-
-**Rules for adding a device**: hand-write a stable, dot-free node ID (never let Node-RED generate one); add a registry row using the next free number in the correct block; deploy. Never let a virtual device register without a registry row.
-
-**External services**: instances owned by standalone (non-Node-RED) dbus services — currently 200 and 220 (`dbus-recbms`) and 224 (`dbus-czone`) — are listed in the registry node's `EXTERNAL` table. The sanity check reserves their numbers, but enforcement/audit ignores them: each service pins its own instance via `/Settings/Devices/<id>/ClassAndVrmInstance`, using settings ids without the `virtual_` prefix so the palette's auto-cleanup never removes them.
-
-**Verification** (`verify_pinning.py`): snapshots the service→instance map, `virtual_*` settings entries and the Signal K model (tanks/electrical/propulsion), restarts Node-RED three times, and fails if any snapshot gains a service, changes an instance, or grows a new Signal K path. Password via `CERBO_PASS` env var or prompt. Run it after every change to the registry or to flows containing virtual devices.
-
-### Retired flows (`archive/`)
-
-Both were replaced by the standalone drivers above and are kept only for
-rollback. **Neither may run alongside its driver** — see `archive/README.md`
-for the collisions and the rollback procedure. What follows describes them as
-they were on their retirement date; every fix and calibration since lives in
-the drivers.
-
-### Virtual BMS (`archive/Virtual BMS.json`) — RETIRED
-
-**Replaced by the standalone `dbus-recbms/` driver (see above). Kept in the repo for rollback only — do not deploy alongside the driver (they claim the same instances 200/220).**
-
-Reads repackaged BMS CAN frames from `can0` via `candump`, decodes them, and publishes to a Victron virtual battery device on D-Bus.
-
-**Data path**: candump can0 (filter `18FF0000:1FFFF800`) -> Line Parser (strips 29-bit wrapper: `rawid & 0x7FF`) -> CAN Frame Decoder -> State Assembler -> Path Filter -> victron-virtual battery
-
-Key features (all ported to the driver):
-- **candump watchdog**: Before every start, `pkill -f '[c]andump can0,18FF0000:1FFFF800'` clears any stale capture process (prevents duplicates after a hard Node-Red restart or manual re-trigger). The pattern matches this flow's exact command line — filter argument included — so manually-run or other-purpose candump processes are never touched. If candump exits for any reason, a watchdog restarts it after 5 seconds (restart count kept in flow context).
-- **Chunk-safe line parsing**: exec stdout arrives in chunks, not lines. The parser buffers partial lines across chunks, splits on newlines, and emits one message per CAN frame — no frames are lost when the pipe coalesces multiple lines.
-- **Frame length guard**: Each CAN ID has a minimum-length requirement; short/corrupt frames are dropped (with a rate-limited warning, max 1/min) instead of throwing mid-decode. Only successfully decoded frames refresh the staleness timestamp.
-- **Staged fallback**: If CAN data goes stale, progressively restricts charge/discharge limits (LIVE ≤60s → ALERT ≤2min → RESTRICT ≤5min → SURVIVAL). When BMS is stale, pack voltage is sourced from the Quattro's `/Dc/0/Voltage` (independent measurement), with fallback to last-known BMS voltage if the Quattro reading is also stale (>30s).
-- **Startup grace (cold-boot fix)**: A cold boot is not treated as CAN loss. Until the first frame ever decodes, the staleness clock is anchored to flow start (not epoch 0) and the flow holds a benign STARTUP phase for up to 3 minutes: CCL 0 (no blind charging), DCL 100A (inverter keeps running), DVL 52.0V (below resting pack voltage, so no low-battery cutoff), all alarms 0. Previously the first publish tick computed `age = now − 0`, jumped straight to SURVIVAL, and pushed DVL 54.0V — above the pack's resting ~53V — which tripped the Quattro's low-battery shutdown and raised a low-voltage alarm on every boot off shore power. If the grace window expires with still no frame, the normal ALERT → RESTRICT → SURVIVAL escalation proceeds from flow start. The virtual battery node's `default_values` is also off, so the service no longer flashes 48V/50% in the seconds before the first publish tick.
-- **CVL control**: "Max Charge" slider (40-100%) exposed on VRM dashboard (BMS group), maps **piecewise-linearly** to CVL **on the REC's own SOC scale** ([cvl] `curve` breakpoints in config.ini) and is clipped at 61.96V. Calibrated 2026-08-19 from three measured points: a settled hold at 58.6% ↔ 56.28V, a days-long ~0A hold at 62.3% ↔ 56.65V, and the REC's 100% sync point (raw 0x351 CVL, 62.70V). The two mid points both lie exactly on 0.100 V/% — the NMC mid-plateau is flatter than the 62→100% region (0.1605 V/%) — so the map has a knee at 62.3%: 40% → 54.42V, 60% → 56.42V, 62.3% → 56.65V, 100% → 62.70V (clip engages above ~95%; values ≥62.3% are unchanged from the earlier single-slope line). NMC steepens again below ~50%, so low slider values may settle a little high until a hold is measured there; new breakpoints can be appended to the curve as holds settle. The original 54.00→61.96V line sat inside the REC's scale at both ends (its "40%" ≈ 46% real, its "60%" held ≈ 62.5% real — the storage-mode mismatch the slider was built to prevent). The clip is user policy: never push the Quattro above 61.96V; only the EQ boost may ride on top (max 62.40V, still under the REC's 62.7V limit which is `min()`'d in regardless).
-- **Weekly equalization**: Every 7 days, adds +0.44V boost to the current slider CVL for 1 hour. Works at any slider position, not just 100%. EQ start is gated on persisted state having been restored; on first install the schedule is baselined so the first EQ runs 7 days later, not immediately.
-- **Persistent state** (`virtual-bms-state.json`): The slider position and last-equalization timestamp survive Node-Red restarts, redeploys, and reboots. Node-Red on Venus OS runs as a restricted user that cannot write to `/data` directly, so the startup exec discovers a writable directory (first writable of `$HOME/.node-red`, `$HOME`, `/data` — the Node-Red user dir is always writable since flows are saved there), reports it on the first line of its output, and the flow stores it in flow context (`state_dir`) for all subsequent writes. The "Restore Persisted State" node status shows the directory in use. State is restored 6s after startup (giving the virtual switch time to register on D-Bus, then the slider is pushed back to the VRM switch) and saved on every slider change and EQ completion. If pushing the slider value fails (switch not yet registered), a catch node re-runs the restore up to 5 times at 3s intervals. Saves are blocked until restore has run, so a startup echo can't clobber the file. If the file is missing, defaults are slider 100% and EQ baselined to now.
-- **Synthetic alarms** (since BMS does not send 0x35A; all thresholds from 0x373 cell extremes unless noted, and all report 0 when CAN is stale):
-  - `/Alarms/LowSoc`: warning at SOC < 20%, alarm at SOC < 10%
-  - `/Alarms/CellImbalance`: warning at cell delta > 50mV, alarm at > 100mV
-  - `/Alarms/LowVoltage`: warning at min cell < 3.30V, alarm at < 3.00V
-  - `/Alarms/HighVoltage`: warning at max cell > 4.20V, alarm at > 4.25V
-  - `/Alarms/LowTemperature`: warning at min cell < 5°C, alarm at < 0°C (NMC charging below freezing causes lithium plating)
-  - `/Alarms/HighTemperature`: warning at max cell > 45°C, alarm at > 50°C
-  - `/Alarms/HighChargeCurrent`: warning when modules are blocking charge (from 0x372)
-  - `/Alarms/HighDischargeCurrent`: warning when modules are blocking discharge (from 0x372)
-  - `/Alarms/InternalFailure`: alarm on CAN staleness (ALERT phase+) or modules offline (from 0x372)
-
-### CZone Control (`archive/CZoneProxy.json`) — RETIRED
-
-**Replaced by the standalone `dbus-czone/` driver (see above). Kept in the repo
-for rollback only — do not deploy it alongside the driver: both drive the same
-CZone circuits, and two writers on one bank will fight.**
-
-Reads PGN 127501 from `can0` with a `candump` subprocess and publishes eleven
-separate `victron-virtual-switch` devices (instances 225-235), one per circuit;
-commands go out as PGN 127502. Circuit names, the circuit count and the
-momentary/latching split are all hardcoded in the flow. The driver replaces all
-of that with discovery and a single multi-output bank.
+The allocation table those rules produced is now maintained under
+**Device Instance Allocation** above.
 
 ## Key Technical Notes
 
-- The Cerbo's VE.Can `can0` port (sun4i_can driver) only passes 29-bit extended CAN frames to userspace. 11-bit standard frames are filtered at the hardware/kernel level. This is why the YDNB-07 must repackage BMS frames.
+- **11-bit visibility on `can0` is partial, not all-or-nothing.** The REC-BMS
+  frames at `0x351`-`0x404` do **not** reach userspace on the Cerbo's VE.Can
+  port (sun4i_can), which is why the YDNB-07 repackages them as 29-bit
+  `0x18FF0NNN`. The Greenline drives' CANopen TPDOs at `0x18x`/`0x28x`/`0x38x`/
+  `0x48x` **do** arrive, at 10 Hz, and `dbus-edrive` reads them directly with an
+  SFF receive filter — an earlier blanket "11-bit frames are filtered" note here
+  was wrong (`GreenlineFindings.md`, "can0 visibility notes"). Assume nothing
+  about a new 11-bit id: check with `candump` before designing around it.
 - Signal-K SOC values are ratios (0.0-1.0), not percentages. Multiply by 100 for Venus OS.
 - The YDNB-07 programming language requires `match()` filter bodies on separate lines (no single-line `{ }` blocks).
 - The YDNB-07 supports up to 20 `match()` filters. Currently 16 are used for BMS CAN IDs.

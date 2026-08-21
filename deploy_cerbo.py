@@ -95,8 +95,71 @@ PACKAGES = {
             ("com.victronenergy.switch.czone", "/Connected"),
         ],
     },
+    "batteries": {
+        "dir": "dbus-batteries",
+        "service": "dbus-batteries",
+        "install_arg": "",
+        "version_file": "dbus_batteries.py",
+        "files": ["dbus_batteries.py", "config.ini", "README.md", "install.sh",
+                  "uninstall.sh", "migrate.sh", "service/run", "service/log/run"],
+        "configs": ["config.ini"],
+        # the Node-RED flow's virtual batteries must be gone: while their
+        # settings entries exist localsettings will not hand 201-205 to the
+        # driver, and VRM would see five brand-new devices (run migrate.sh)
+        "preflight": ("dbus -y 2>/dev/null | grep -c 'virtual_bat[0-9]_virtual' || true",
+                      "0", "Node-RED Batteries Forward services still on the bus "
+                           "(virtual_bat*_virtual): disable the flow tab + Deploy, "
+                           "then run /data/dbus-batteries/migrate.sh. If they "
+                           "linger after the Deploy, they are zombies: "
+                           "svc -t /service/signalk-server"),
+        "verify": [
+            ("com.victronenergy.battery.n2kbat_house", "/Mgmt/ProcessVersion"),
+            ("com.victronenergy.battery.n2kbat_house", "/DeviceInstance"),
+            ("com.victronenergy.battery.n2kbat_house", "/Dc/0/Voltage"),
+            ("com.victronenergy.battery.n2kbat_house", "/Soc"),
+            # NOT the engine batteries: they are only on D-Bus while the
+            # Yanmar ignition is on, so read their state from the manager
+            ("com.victronenergy.n2kbatteries", "/Sources/bat1/Published"),
+            ("com.victronenergy.n2kbatteries", "/Sources/alt0/Published"),
+            ("com.victronenergy.n2kbatteries", "/Sources/alt0/Age"),
+            ("com.victronenergy.n2kbatteries", "/SourceCount"),
+            ("com.victronenergy.n2kbatteries", "/EnabledCount"),
+            ("com.victronenergy.n2kbatteries", "/Catalog"),
+        ],
+    },
+    "edrive": {
+        "dir": "dbus-edrive",
+        "service": "dbus-edrive",
+        "install_arg": "",
+        "version_file": "dbus_edrive.py",
+        "files": ["dbus_edrive.py", "config.ini", "README.md", "install.sh",
+                  "uninstall.sh", "migrate.sh", "service/run", "service/log/run"],
+        "configs": ["config.ini"],
+        # same story for 210/211 (run migrate.sh)
+        "preflight": ("dbus -y 2>/dev/null | grep -c 'virtual_gl6gk_' || true",
+                      "0", "Node-RED Greenline E-Drive services still on the bus "
+                           "(virtual_gl6gk_*): disable the flow tab + Deploy, "
+                           "then run /data/dbus-edrive/migrate.sh. If they "
+                           "linger after the Deploy, they are zombies: "
+                           "svc -t /service/signalk-server"),
+        "verify": [
+            ("com.victronenergy.motordrive.edrive_port", "/Mgmt/ProcessVersion"),
+            ("com.victronenergy.motordrive.edrive_port", "/DeviceInstance"),
+            ("com.victronenergy.motordrive.edrive_port", "/Connected"),
+            ("com.victronenergy.motordrive.edrive_port", "/Motor/RPM"),
+            ("com.victronenergy.motordrive.edrive_stbd", "/DeviceInstance"),
+            ("com.victronenergy.motordrive.edrive_stbd", "/Connected"),
+        ],
+    },
 }
 EXEC_SUFFIXES = (".py", ".sh", "/run")
+# Everything shipped is text destined for a Linux box. A CRLF in a `#!/bin/sh`
+# line makes the kernel look for an interpreter named "/bin/sh" with a trailing
+# carriage return, and the service never starts. A Windows checkout with
+# core.autocrlf=true has CRLF on disk and sftp copies it byte for byte, so the
+# line endings are normalised here rather than trusted. (.gitattributes also
+# pins the working tree to LF; this is the belt to that pair of braces.)
+TEXT_SUFFIXES = (".py", ".sh", ".ini", ".md", "/run")
 
 
 def die(msg, code=2):
@@ -158,7 +221,11 @@ class Cerbo:
         if self.sftp is None:
             self.sftp = self.c.open_sftp()
         self.run("mkdir -p '%s'" % posixpath.dirname(remote))
-        self.sftp.put(local, remote)
+        data = open(local, "rb").read()
+        if remote.endswith(TEXT_SUFFIXES):
+            data = data.replace(b"\r\n", b"\n")
+        with self.sftp.open(remote, "wb") as fh:
+            fh.write(data)
         if remote.endswith(EXEC_SUFFIXES):
             self.run("chmod 755 '%s'" % remote)
 
