@@ -8,6 +8,7 @@ Usage:
 
 Reports, in time order:
   * PGN 127502 Switch Bank Control  — every frame (who commanded what)
+  * PGN 65280  CZone button traffic  — every frame (who pressed what)
   * PGN 127501 Switch Bank Status   — only when the decoded state changes,
                                       tracked per (source, bank instance)
   * CZone/BEP proprietary frames whose payload changed (candidate command path)
@@ -30,9 +31,25 @@ SRC = {
     0xE3: "Victron Cerbo GX", 0xFE: "*** Node-RED (null address) ***",
 }
 
-SWNAME = {1: "Bilge1", 2: "Bilge2", 3: "Horn", 4: "Helm", 5: "Nav",
-          6: "Anchor", 7: "Red", 8: "Fly", 9: "Underwater", 10: "Bow1",
-          11: "Bow2"}
+# Bank-index -> short label, 1-based, from the boat's own CZone configuration
+# (python zcf_parse.py 48-56.zcf).
+SWNAME = {1: "BilgeFW", 2: "BilgeAFT", 3: "Horn", 4: "Helm", 5: "Nav",
+          6: "Anchor", 7: "Red", 8: "Fly", 9: "Underwater", 10: "Bow",
+          11: "BowIR"}
+
+# PGN 65280 (button traffic) carries the CZone CIRCUIT ID, not the bank index.
+# This bank's IDs start at 5, so output N is circuit N+4; see specification.md,
+# "A circuit ID is not a bank index".
+CIRCUIT_ID_BASE = 5
+
+# BEP header; B&G/Navico MFDs send 0x9913 with the same layout.
+CZ_HDR = (0x9927, 0x9913)
+
+# Command byte. The two families track the circuit's type: absolute ON/release
+# on momentary circuits, toggle press/release on latching ones.
+CZ_CMD = {0x01: "ON", 0x11: "ON", 0xF1: "ON", 0x42: "release",
+          0x71: "toggle", 0x72: "toggle", 0x40: "release/OFF",
+          0x62: "release", 0x91: "unknown-0x91"}
 
 VAL = {0: "OFF", 1: "ON", 2: "err", 3: "--"}
 
@@ -124,6 +141,15 @@ def main():
                 last501[key] = sw
                 print("%s  STAT 127501 from %-30s bank=%-3d %s%s"
                       % (clock, who, inst, fmt_bank(sw), delta))
+
+        elif pgn == 65280 and len(data) >= 8 and                 (data[0] | data[1] << 8) in CZ_HDR:
+            circuit = data[2] | data[3] << 8
+            out = circuit - CIRCUIT_ID_BASE + 1
+            print("%s  BTN  65280  from %-30s circuit=%-3d %-11s %-12s "
+                  "target=%d flags=%02X  [%s]"
+                  % (clock, who, circuit, SWNAME.get(out, "out%d?" % out),
+                     CZ_CMD.get(data[6], "cmd=%02X" % data[6]),
+                     data[5], data[7], payload.strip()))
 
         elif show_all and (130816 <= pgn <= 131071 or 65280 <= pgn <= 65535):
             # Fast-packet byte 0 is (sequence << 5) | frame_index and ticks on

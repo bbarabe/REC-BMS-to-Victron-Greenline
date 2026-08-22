@@ -25,12 +25,16 @@ deployed alongside the drivers that replaced them.
 **Start with [`specification.md`](specification.md)** — CAN topology, the CZone
 and REC-BMS protocols, and every driver are documented there.
 
-Other references: [`GreenlineFindings.md`](GreenlineFindings.md) (hybrid drive
+Other references: [`CZoneEcosystem.md`](CZoneEcosystem.md) (what the
+open-source CZone projects know, and what would misbehave on this bus),
+[`GreenlineFindings.md`](GreenlineFindings.md) (hybrid drive
 CAN decode), [`Decoded.md`](Decoded.md) and [`BatteryCAN.md`](BatteryCAN.md)
 (BMS frames), [`ydnb07.md`](ydnb07.md) + [`YDNB.CFG`](YDNB.CFG) (CAN bridge).
 
 Helper scripts: `cerbo_ssh.py` (read-only command runner), `nmea_capture.py` /
-`nmea_decode.py` (bus capture and switching-event decode), `verify_pinning.py`
+`nmea_decode.py` (bus capture and switching-event decode), `zcf_parse.py`
+(read a CZone `.zcf`: circuits, channels, categories, momentary/latching),
+`verify_pinning.py`
 (device-instance regression check), `edrive_temps.py` (live e-drive MOSFET /
 MCU-HCU / drive temperatures). All take the host from `CERBO_HOST` and the
 password from `CERBO_PASS`.

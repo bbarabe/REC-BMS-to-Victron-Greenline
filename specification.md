@@ -163,6 +163,9 @@ bitmask:
 | `0x0400` | 10 | Lighting |
 | `0x1000` | 12 | Pump |
 
+The same masks appear in the `.zcf` control records, so the two sources
+corroborate each other — see "The CZone configuration file" below.
+
 Behaviours that matter when implementing this:
 
 - **The query works from the unclaimed source address `0xFE`.** No address
@@ -183,25 +186,134 @@ are refused with an ISO Acknowledgement of `1` (NAK). Discovery must use the
 PGN 65299 query above, and there is no point requesting 127501 — it is
 broadcast every 2 s regardless.
 
-### Switch type is not published
+### Switch type is not on the bus — it is in the `.zcf`
 
 The latching/momentary distinction is absent from every message the UC1 sends.
 It is not in the PGN 130820 record (whose trailer is fully accounted for by the
-category mask), not in any of the UC1's other proprietary PGNs, and there is no
-field anywhere on the bus that separates the momentary circuits from the
-latching ones.
+category mask), not in any of the UC1's other proprietary PGNs, and no field
+broadcast on the bus separates the momentary circuits from the latching ones.
 
 Note that the **category is not a proxy for it**: the horn is categorised
 *Navigation* alongside the nav and anchor lights but is momentary, while the
 bilge pumps are momentary under *Pump*.
 
-The MFD does not need the information either — it sends the same
-press-and-release for every circuit and lets the UC1's circuit logic decide.
+Nothing driving a circuit over PGN 127502 needs the information: the MFD, the
+keypads and a driver all send the same press-and-release and let the UC1's
+circuit logic decide. (The keypads' *own* PGN 65280 traffic does distinguish
+the two — see below — but that is a report of which kind of button was
+pressed, not a description of the circuit, and it only appears when somebody
+presses one.)
+
+It *is* recorded in the CZone configuration file, one level below the bus: see
+"The CZone configuration file" below. `zcf_parse.py` reads it straight out of
+[`48-56.zcf`](48-56.zcf) and prints the `momentary_outputs` line to paste into
+`config.ini`. That file is not on the bus, though — it lives on a laptop or
+inside the MFD — so a driver still cannot discover the split at runtime.
 
 Consequence for a driver: the type has to be configured rather than discovered.
 `dbus-czone` keeps it in Venus's own per-output `Settings/Type`, seeded from
 `config.ini` and editable in the GUI, so a change to the CZone configuration
-does not require a code change.
+does not require a code change. What the `.zcf` buys is that the seed is now
+*derived from the boat's own configuration* instead of guessed.
+
+### The CZone configuration file (`.zcf`)
+
+[`48-56.zcf`](48-56.zcf) is this boat's CZone configuration as written by the
+CZone Configuration Tool. Read it with:
+
+```sh
+python zcf_parse.py 48-56.zcf --raw
+```
+
+The format was reverse-engineered by [negrusti/esp32-czone][ez] and is
+documented in `zcf_parse.py`'s docstring. Every structural claim in it was
+re-verified here against two independently produced files — ours and the one
+shipped with [gerryvel/SR-Aktor][sr] — including both CRC-8s (poly 0x07), the
+`08 ?? 05 0E` control-section marker, the record layout and the loads section.
+
+Three fields matter:
+
+- **Commander byte 3 is the switch type.** `0x09` momentary, `0x01`/`0x03`/
+  `0x04` latching. It sits in the *commander* (button) record, not the circuit
+  — which matches how the UC1 behaves: the type is a property of the press,
+  and the circuit logic applies it. On this boat it splits 11/11 in agreement
+  with `momentary_outputs`.
+- **Control-record field 1 is the category bitmask**, the same value PGN 130820
+  puts in its trailer. Confirmed on all 11 circuits.
+- **The output entry gives the physical channel**, as
+  `(dipswitch << 8) | channel`.
+
+Field 0 was `0x0000` and field 2 `0x0020` on all 14 circuits across both files,
+momentary ones included, so neither is the type.
+
+[ez]: https://github.com/negrusti/esp32-czone
+[sr]: https://github.com/gerryvel/SR-Aktor
+
+**This boat's bank** (dipswitch 1, all 11 circuits on bank instance 1):
+
+| Output | Circuit ID | Channel | Name | Category | Type |
+|---|---|---|---|---|---|
+| 1 | 5 | 12 | Bilge Pump FW | Pump | momentary |
+| 2 | 6 | 13 | Bilge Pump AFT | Pump | momentary |
+| 3 | 7 | 14 | Horn | Navigation | momentary |
+| 4 | 8 | 0 | Illumination Helm | Lighting | latching |
+| 5 | 9 | 2 | Navigation Lights | Navigation | latching |
+| 6 | 10 | 3 | Anchor Light | Navigation | latching |
+| 7 | 11 | 4 | Red Light | Lighting | latching |
+| 8 | 12 | 1 | Illumination Fly | (none) | latching |
+| 9 | 13 | 5 | Underwater Light | Lighting | latching |
+| 10 | 14 | 6 | Bow light | Lighting | latching |
+| 11 | 15 | 7 | Bow IR light | Lighting | latching |
+
+**A circuit ID is not a bank index.** The bank enumerates its circuits in
+ascending circuit-ID order, and this configuration's IDs start at 5 — so
+output *N* on PGN 127501/127502 and in a PGN 65299 query is circuit ID *N+4*.
+PGN 65280 (below) carries the **circuit ID**; everything else carries the bank
+index. Reading one as the other silently names the wrong circuit.
+
+The channel map also rules out any assumption that a CZone module lays its
+outputs out in one contiguous block: this UC1 uses channels 0-7 and 12-14.
+
+### PGN 65280 — what the keypads and the MFD actually send
+
+Not needed to drive a circuit (`dbus-czone` uses 127502), but it is the traffic
+a listener sees when someone presses a physical button, and it is the one place
+on the bus where the switch type shows through.
+
+```
+27 99 | 05 00 | 00 | 01 | F1 | 00
+  |       |      |    |    |    +-- flags; 0x08 on B&G marks the toggle family
+  |       |      |    |    +------- command byte, see below
+  |       |      |    +------------ target module address (dipswitch)
+  |       |      +----------------- varies; 0/1/2 seen
+  |       +------------------------ u16 CIRCUIT ID (not the bank index)
+  +-------------------------------- mfg 295 BEP Marine, industry group 4
+```
+
+Two command families, and they follow the circuit's type:
+
+| Command | Meaning | Seen on |
+|---|---|---|
+| `F1` (also `01`, `11`) | absolute ON | momentary circuits |
+| `42` | release of the above | momentary circuits |
+| `71`, `72` | toggle press; the MFD alternates the two | latching circuits |
+| `40`, `62` | release of a toggle press | latching circuits |
+| `91` | unexplained; 12 frames on the horn | — |
+
+In [`captures/czone.log`](captures/czone.log) circuits 5 and 7 (Bilge Pump FW,
+Horn — both momentary) use `F1`/`42`, while circuits 9 and 10 (Navigation
+Lights, Anchor Light — both latching) use `71`/`72` with `40`/`62`. The same
+split is documented independently in [SR-Aktor][sr] from a B&G Vulcan. It is a
+usable passive check on a circuit's type, but only for circuits somebody
+actually presses while you are capturing.
+
+The `id - 4` output mapping is confirmed on the wire, not just from the file:
+each `71`/`72` on circuit 10 is followed 1 ms later by a PGN 127501 change on
+**Anchor**, output 6. `nmea_decode.py` decodes this PGN and does the mapping.
+
+**The header is not always `27 99`.** B&G/Navico MFDs use `13 99` for the same
+layout — in [`captures/mfd-boot.log`](captures/mfd-boot.log) the MFD at src
+`0x17` sends `08FF0017 # 13 99 05 00 00 00 00 00`. Match on either.
 
 ## Battery Systems
 
@@ -303,9 +415,10 @@ reverts the switch to the real CZone state after 9 s.
 the driver owns both sides of its D-Bus service — its own updates never re-enter
 as commands, unlike the virtual-switch nodes in the flow.
 
-The momentary/latching split is not published by CZone (see "Switch type is not
-published"), so it lives in Venus's per-output `Settings/Type` — seeded from
-`dbus-czone/config.ini`, persisted, and editable in the GUI.
+The momentary/latching split is not broadcast by CZone (see "Switch type is not
+on the bus"), so it lives in Venus's per-output `Settings/Type` — seeded from
+`dbus-czone/config.ini`, persisted, and editable in the GUI. The seed itself is
+derived from the boat's `.zcf` with `zcf_parse.py`, not guessed.
 
 Install/migration/rollback procedure: `dbus-czone/README.md`.
 

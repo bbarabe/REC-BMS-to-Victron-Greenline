@@ -31,10 +31,13 @@ MFD and the keypads share — and mirrors exactly what the MFD sends:
     the release and is ignored. Sent as press + release.
   * MOMENTARY circuits: the output FOLLOWS the bit. 01 = on, 00 = off.
 
-That distinction is not published by CZone — it is absent from every
-message the UC1 sends — so it lives in Venus's own per-output
-`Settings/Type`: seeded from config.ini, persisted in localsettings, and
-changeable by the user in the GUI without touching this code.
+That distinction is absent from every message the UC1 sends, so it lives
+in Venus's own per-output `Settings/Type`: seeded from config.ini,
+persisted in localsettings, and changeable by the user in the GUI without
+touching this code. It IS recorded in the CZone configuration file, which
+never appears on the bus — `zcf_parse.py` at the repo root reads it and
+prints the config.ini seed line, so that seed is derived rather than
+guessed. See specification.md, "The CZone configuration file".
 
 Baselines:
   https://github.com/victronenergy/velib_python   (dbusdummyservice.py)

@@ -74,13 +74,18 @@ There is **no keep-alive and no echo guard**. CZone latches a bank-1 press
 natively, and unlike the Node-RED flow this driver owns both sides of the
 D-Bus service, so its own updates never re-enter as commands.
 
-### The one thing CZone does not tell us
+### The one thing CZone does not broadcast
 
 The latching/momentary split is absent from every message the UC1 sends, so it
 lives in Venus's own per-output `Settings/Type`:
 seeded from `momentary_outputs` in `config.ini`, then persisted. **Change it
 in the Venus GUI** if you reconfigure a circuit in the CZone Configuration
 Tool; the config file is only the first-run default.
+
+The split *is* recorded in the CZone configuration file, which is not on the
+bus. To reseed `config.ini` from the boat's own configuration rather than by
+hand, run `python zcf_parse.py 48-56.zcf` at the repo root and paste the
+`momentary_outputs` line it prints.
 
 ## Install
 
