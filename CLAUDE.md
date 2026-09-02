@@ -20,12 +20,46 @@ All helper scripts (`cerbo_ssh.py`, `nmea_capture.py`, `verify_pinning.py`,
 `edrive_temps.py`) read those two variables. `cerbo_ssh.py` is the read-only
 command runner: `python cerbo_ssh.py "svstat /service/dbus-recbms"`.
 
-**Use one SSH session and keep it alive.** The Cerbo is a small armv7l box with
-little SSH headroom: opening a connection per command — or polling port 22 — exhausts
-it, and it then stops answering *entirely* for a good while. Connect once, run every
-command of the task over that one transport (each `exec_command` is a cheap extra
-channel; open SFTP from the same client), and set a 30s keepalive. A failed connect
-means stop and wait, never retry in a loop — the retries are what cause the outage.
+**Use one SSH session and keep it alive — always through `./cerbo`.** The Cerbo is
+a small armv7l box with little SSH headroom: opening a connection per command — or
+polling port 22 — exhausts it, and it then stops answering *entirely* for a good
+while. `./cerbo` is the only sanctioned way in. It starts a local daemon
+(`cerbo_daemon.py`) that holds **one** paramiko transport and runs every command as
+a cheap extra channel on it; SFTP for `get`/`put` rides the same transport. Only
+`./cerbo up` costs a handshake.
+
+```sh
+export CERBO_HOST=<cerbo-ip>      # not stored here: this repo is public
+export CERBO_PASS=<root-password>
+
+./cerbo up                                  # open the session (idempotent)
+./cerbo 'uptime'                            # shorthand for `run`
+./cerbo run 'svstat /service/dbus-recbms' 120   # optional timeout in seconds
+./cerbo batch cmds.txt                      # one command per line, same session
+./cerbo get /data/conf/settings.xml ./settings.xml
+./cerbo put ./dbus-czone/config.ini /data/dbus-czone/config.ini
+./cerbo status                              # alive? and the box's uptime
+./cerbo down                                # close it
+```
+
+Rules that go with it:
+
+- **Never open your own connection.** No bare `ssh`/`scp`, no per-command paramiko,
+  no `ssh` in a loop. `cerbo_ssh.py` is the legacy one-shot runner and is kept only
+  for the odd single read; prefer `./cerbo`.
+- **Batch, don't chatter.** Put the whole task's commands in one `./cerbo batch`
+  file rather than issuing them one tool call at a time.
+- **A failed connect means stop and wait.** `./cerbo` enforces this: it stamps a
+  backoff file and refuses to connect again for 10 minutes
+  (`CERBO_BACKOFF_SECS`). Do not clear the stamp to "just try once more" — the
+  retries are what cause the outage. If it says the transport is dead, the fix is
+  `./cerbo down`, wait, then `./cerbo up`.
+- **The session self-closes** after 30 min idle (`CERBO_IDLE_EXIT`), so a forgotten
+  daemon never holds the box's one slot.
+- **OpenSSH `ControlMaster` does not work here** — tried 2026-09-02: the master
+  connects, then every multiplexed session is refused with
+  `Master refused session request: Permission denied` and sshd stops answering.
+  Use `./cerbo`.
 
 Because a session can still be lost mid-task, make each step individually
 verifiable: re-check `grep -m1 '^VERSION'` after a restart rather than assuming the

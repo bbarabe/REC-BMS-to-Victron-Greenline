@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# ONE live SSH session to the Cerbo, reused by every command.
+#
+#   export CERBO_HOST=<ip>        # never stored here: this repo is public
+#   export CERBO_PASS=<root-password>
+#
+#   ./cerbo up                        # open the session (idempotent)
+#   ./cerbo run 'svstat /service/dbus-recbms'
+#   ./cerbo 'uptime'                  # same thing, shorthand
+#   ./cerbo batch cmds.txt            # one command per line, same session
+#   ./cerbo get /data/conf/settings.xml ./settings.xml
+#   ./cerbo put ./dbus-czone/config.ini /data/dbus-czone/config.ini
+#   ./cerbo status                    # alive? how long has the box been up?
+#   ./cerbo down                      # close it
+#
+# A local daemon (cerbo_daemon.py) holds a single paramiko transport; every
+# command is a new channel on it, so only `up` costs a handshake. SFTP for
+# get/put rides the same transport.
+#
+# On a failed connect it stamps a backoff file and REFUSES to connect again
+# until it expires -- the retries are what exhaust the Cerbo's sshd. Wait it
+# out; do not loop.
+set -uo pipefail
+
+HOST="${CERBO_HOST:?set CERBO_HOST}"
+: "${CERBO_PASS:?set CERBO_PASS}"
+RUN_DIR="${TMPDIR:-/tmp}"
+SOCK="$RUN_DIR/cerbo-${HOST}.sock"
+LOG="$RUN_DIR/cerbo-${HOST}.log"
+BACKOFF="$RUN_DIR/cerbo-backoff-${HOST}"
+BACKOFF_SECS="${CERBO_BACKOFF_SECS:-600}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+die() { echo "cerbo: $*" >&2; exit 1; }
+
+# Speak one JSON request to the daemon, print {out}, forward {err}, return rc.
+say() {
+  python3 - "$SOCK" "$1" <<'PYCLIENT'
+import json, socket, sys
+sock, payload = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(300)
+try:
+    s.connect(sock)
+except OSError as e:
+    print(f"cerbo: no live session ({e})", file=sys.stderr); sys.exit(97)
+s.sendall(payload.encode() + b"\n")
+buf = b""
+while not buf.endswith(b"\n"):
+    ch = s.recv(65536)
+    if not ch: break
+    buf += ch
+r = json.loads(buf.decode())
+sys.stdout.write(r.get("out", ""))
+if r.get("err"): sys.stderr.write(r["err"])
+sys.exit(0 if r.get("ok") else (r.get("rc") or 1))
+PYCLIENT
+}
+
+jq_str() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"; }
+
+alive() { say '{"op":"ping"}' >/dev/null 2>&1; }
+
+check_backoff() {
+  [[ -f "$BACKOFF" ]] || return 0
+  local left=$(( BACKOFF_SECS - ( $(date +%s) - $(cat "$BACKOFF") ) ))
+  if (( left > 0 )); then
+    die "last connect failed; the Cerbo's sshd is likely exhausted.
+     Wait ${left}s. Do NOT retry in a loop. Override: rm -f '$BACKOFF'"
+  fi
+  rm -f "$BACKOFF"
+}
+
+up() {
+  alive && { echo "cerbo: session already up"; return 0; }
+  check_backoff
+  rm -f "$SOCK"
+  setsid python3 "$HERE/cerbo_daemon.py" "$SOCK" >"$LOG" 2>&1 &
+  for _ in $(seq 1 40); do
+    grep -q READY "$LOG" 2>/dev/null && { echo "cerbo: session up -> root@$HOST"; return 0; }
+    grep -q CONNECT-FAILED "$LOG" 2>/dev/null && break
+    sleep 0.5
+  done
+  date +%s > "$BACKOFF"
+  die "connect failed: $(tail -n 2 "$LOG" 2>/dev/null | tr '\n' ' ')
+     Backing off ${BACKOFF_SECS}s before any further attempt."
+}
+
+need() { alive || up; }
+
+case "${1:-}" in
+  up)     up ;;
+  status)
+    if alive; then echo "cerbo: session ALIVE ($SOCK)"; say "$(python3 -c '
+import json;print(json.dumps({"op":"run","cmd":"uptime"}))')"
+    else
+      echo "cerbo: session DOWN"
+      [[ -f "$BACKOFF" ]] && echo "cerbo: backoff active until $(( $(cat "$BACKOFF") + BACKOFF_SECS ))"
+    fi ;;
+  down)   say '{"op":"stop"}' >/dev/null 2>&1; rm -f "$SOCK"; echo "cerbo: session closed" ;;
+  run)    shift; need; say "$(python3 -c 'import json,sys;print(json.dumps({"op":"run","cmd":sys.argv[1],"timeout":float(sys.argv[2])}))' "$1" "${2:-60}")" ;;
+  batch)
+    shift; need; [[ -f "${1:-}" ]] || die "batch needs a file of commands"
+    rc=0
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      printf '\n########## %s\n' "$line"
+      say "$(python3 -c 'import json,sys;print(json.dumps({"op":"run","cmd":sys.argv[1],"timeout":120}))' "$line")" || rc=$?
+    done < "$1"; exit $rc ;;
+  get)    shift; need; say "$(python3 -c 'import json,sys;print(json.dumps({"op":"get","remote":sys.argv[1],"local":sys.argv[2]}))' "$1" "$2")" ;;
+  put)    shift; need; say "$(python3 -c 'import json,sys;print(json.dumps({"op":"put","local":sys.argv[1],"remote":sys.argv[2]}))' "$1" "$2")" ;;
+  ""|-h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)      need; say "$(python3 -c 'import json,sys;print(json.dumps({"op":"run","cmd":sys.argv[1],"timeout":60}))' "$1")" ;;
+esac
