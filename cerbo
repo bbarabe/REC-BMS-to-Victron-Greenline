@@ -7,7 +7,8 @@
 #   ./cerbo up                        # open the session (idempotent)
 #   ./cerbo run 'svstat /service/dbus-recbms'
 #   ./cerbo 'uptime'                  # same thing, shorthand
-#   ./cerbo batch cmds.txt            # one command per line, same session
+#   ./cerbo batch cmds.txt            # one command per line, own shell each
+#   ./cerbo script setup.sh           # whole file as ONE shell (vars persist)
 #   ./cerbo get /data/conf/settings.xml ./settings.xml
 #   ./cerbo put ./dbus-czone/config.ini /data/dbus-czone/config.ini
 #   ./cerbo status                    # alive? how long has the box been up?
@@ -98,6 +99,9 @@ import json;print(json.dumps({"op":"run","cmd":"uptime"}))')"
     fi ;;
   down)   say '{"op":"stop"}' >/dev/null 2>&1; rm -f "$SOCK"; echo "cerbo: session closed" ;;
   run)    shift; need; say "$(python3 -c 'import json,sys;print(json.dumps({"op":"run","cmd":sys.argv[1],"timeout":float(sys.argv[2])}))' "$1" "${2:-60}")" ;;
+  script)
+    shift; need; [[ -f "${1:-}" ]] || die "script needs a file"
+    say "$(python3 -c 'import json,sys;print(json.dumps({"op":"run","cmd":open(sys.argv[1]).read(),"timeout":300}))' "$1")" ;;
   batch)
     shift; need; [[ -f "${1:-}" ]] || die "batch needs a file of commands"
     rc=0

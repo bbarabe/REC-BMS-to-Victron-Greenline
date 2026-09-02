@@ -35,7 +35,8 @@ export CERBO_PASS=<root-password>
 ./cerbo up                                  # open the session (idempotent)
 ./cerbo 'uptime'                            # shorthand for `run`
 ./cerbo run 'svstat /service/dbus-recbms' 120   # optional timeout in seconds
-./cerbo batch cmds.txt                      # one command per line, same session
+./cerbo batch cmds.txt                      # one command per line, own shell each
+./cerbo script setup.sh                     # whole file as ONE shell (vars persist)
 ./cerbo get /data/conf/settings.xml ./settings.xml
 ./cerbo put ./dbus-czone/config.ini /data/dbus-czone/config.ini
 ./cerbo status                              # alive? and the box's uptime
@@ -49,6 +50,10 @@ Rules that go with it:
   for the odd single read; prefer `./cerbo`.
 - **Batch, don't chatter.** Put the whole task's commands in one `./cerbo batch`
   file rather than issuing them one tool call at a time.
+- **`batch` runs each line in its own shell**, so a variable set on one line is
+  empty on the next — and a command that then reads from an unset path blocks on
+  stdin until the timeout. Use `./cerbo script` when the commands need shared
+  state, or keep each line self-contained.
 - **A failed connect means stop and wait.** `./cerbo` enforces this: it stamps a
   backoff file and refuses to connect again for 10 minutes
   (`CERBO_BACKOFF_SECS`). Do not clear the stamp to "just try once more" — the
