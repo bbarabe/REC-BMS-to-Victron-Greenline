@@ -46,6 +46,17 @@ explains itself in /RecBms/LeadFault. It also pins
 /Settings/SystemSetup/BmsInstance to its own instance when that is still on
 automatic, so no other battery service can take over the CVL.
 
+v1.5.0 sustain: a request-and-forget control (/RecBms/Sustain/Request, same
+shape as the solar boost) that makes the driver read the Max Charge slider as
+the PRESENT SOC instead of its set value -- so the chargers hold the bank
+where it is rather than moving it. Mode 1 (floor) lets the held SOC ratchet
+upward only, mode 2 (ceiling) downward only, and both stay inside the real
+slider target. Solar Priority's one-way charge/discharge uses it so that
+shore only ever sustains the bank while solar (or the loads) do the moving.
+It expires by itself after [sustain] hold_s and dies with the process, so a
+dead requester can never leave the charger pinned. The slider value itself
+is published as /RecBms/TargetSoc.
+
 v1.3.1 capacity fix: 0x35F bytes 4-5 are the capacity CONFIGURED in the BMS
 (1400 Ah), not a firmware version — reading them as one published a bogus
 "1400" to /FirmwareVersion. They now feed /RecBms/ConfiguredCapacity, and
@@ -73,7 +84,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -207,6 +218,11 @@ class Config:
         self.boost_service = sb.get("target_service", "com.victronenergy.system")
         self.boost_path = sb.get(
             "target_path", "/Debug/BatteryOperationalLimits/SolarVoltageOffset")
+
+        su = cp["sustain"] if cp.has_section("sustain") else {}
+        self.sustain_enabled = str(su.get("enabled", "true")).lower() != "false"
+        self.sustain_hold_s = float(su.get("hold_s", 120))
+        self.sustain_step = max(0.0, float(su.get("step_pct", 1)))
 
 
 # ----------------------------------------------------------------------------
@@ -343,6 +359,36 @@ def register_service(svc):
         svc.register()
 
 
+SUSTAIN_FLOOR = 1      # held SOC may only rise (solar charges, shore holds)
+SUSTAIN_CEILING = 2    # held SOC may only fall (loads drain, nothing charges)
+
+
+def sustain_ratchet(mode, held, soc, slider, lo, hi, step=1.0):
+    """(held, effective) for this tick. Pure, so it can be tested off the boat.
+
+    mode      SUSTAIN_FLOOR or SUSTAIN_CEILING
+    held      the ratchet so far: the highest (floor) / lowest (ceiling) SOC
+              seen since the hold began; carried unclipped so a slider that
+              is moved back out of the way restores it
+    soc       the bank's present SOC, or None when the BMS is not live
+    slider    the real Max Charge slider; the CVL never crosses it
+    lo/hi     the slider's range (the CVL curve is only calibrated inside it)
+    step      hysteresis: the ratchet moves only once the bank is a full
+              step past it. Without it every charger burst that nudged the
+              hi-res SOC by a few hundredths would lift the CVL a few
+              millivolts and the next burst would start from there.
+    effective the SOC the CVL curve is evaluated at
+    """
+    if soc is not None:
+        if mode == SUSTAIN_FLOOR and soc >= held + step:
+            held = soc
+        elif mode == SUSTAIN_CEILING and soc <= held - step:
+            held = soc
+    # a floor never asks for more than the owner set; a ceiling never for less
+    eff = min(held, slider) if mode == SUSTAIN_FLOOR else max(held, slider)
+    return held, max(lo, min(hi, eff))
+
+
 def fmt(unit, digits):
     def cb(path, value):
         if value is None:
@@ -387,6 +433,11 @@ class RecBmsDriver:
         # systemcalc and would otherwise survive us); the standing solar
         # lead, by contrast, is (re)established immediately.
         self.boost = {"active": False, "req_ts": 0.0, "volts": 0.0}
+        # Sustain (v1.5.0): read the slider as the present SOC. Never
+        # persisted: like the boost it is re-requested by its owner and
+        # expires on its own, so a restart always comes up on the real slider.
+        self.sustain = {"active": False, "mode": 0, "req_ts": 0.0,
+                        "soc": None, "logged_soc": None}
         self.last_target = None
         self._last_offset_warn = 0.0
         # Lead verification (v1.4.0): what DVCC actually sends the MPPTs
@@ -599,6 +650,30 @@ class RecBmsDriver:
         svc.add_path("/RecBms/DvccEffectiveChargeVoltage", None,
                      gettextcallback=v2)
 
+        # The Max Charge slider as this driver reads it each tick (the SOC
+        # the CVL curve is evaluated at when nothing overrides it). Published
+        # so a client can subscribe instead of scraping the switch service.
+        svc.add_path("/RecBms/TargetSoc", None, gettextcallback=fmt("%", 0))
+
+        # Sustain (v1.5.0): a request-and-forget control that makes the
+        # driver interpret the slider as the PRESENT SOC, so the chargers
+        # hold the bank where it is instead of moving it. Write 1 to hold a
+        # floor (the held SOC follows the bank upward only -- solar may raise
+        # it, the charger never lowers it), 2 to hold a ceiling (follows
+        # downward only -- loads may lower it, nothing raises it), 0 to
+        # release. Both stay inside the real slider target. It ALWAYS
+        # expires after [sustain] hold_s -- see _service_sustain() -- so a
+        # requester that dies cannot leave the bank pinned. Reads back -1
+        # while a hold is active (see _service_sustain).
+        svc.add_path("/RecBms/Sustain/Request", 0, writeable=True,
+                     onchangecallback=self._sustain_requested)
+        svc.add_path("/RecBms/Sustain/Active", 0)
+        svc.add_path("/RecBms/Sustain/Mode", 0)
+        svc.add_path("/RecBms/Sustain/Soc", None, gettextcallback=fmt("%", 1))
+        svc.add_path("/RecBms/Sustain/SecondsLeft", 0,
+                     gettextcallback=fmt_int("s"))
+        svc.add_path("/RecBms/Sustain/Status", "idle")
+
         register_service(svc)
         self.batt = svc
         log.info("registered com.victronenergy.battery.%s instance %d",
@@ -711,6 +786,10 @@ class RecBmsDriver:
             return False, "disabled in config"
         if self.lead_fault["active"]:
             return False, "solar lead fault (" + self.lead_fault["msg"] + ")"
+        if self.sustain["active"] and self.sustain["mode"] == SUSTAIN_CEILING:
+            # a boost charges the bank from solar; a ceiling hold exists
+            # precisely so that nothing does
+            return False, "sustain ceiling active"
         if volts <= 0 or volts > c.boost_max_v:
             return False, "%.2fV outside 0..%.2fV" % (volts, c.boost_max_v)
         bms = self.bms
@@ -791,6 +870,106 @@ class RecBmsDriver:
             else s["/Info/MaxChargeVoltage"]
         if was:
             log.info("solar boost cleared (%s)", reason)
+
+    # ---------------------------------------------------------- sustain
+    # "Interpret the Max Charge slider as the present SOC." The slider ->
+    # CVL curve is calibrated on settled holds, so evaluating it at the SOC
+    # the bank is AT gives the voltage at which the chargers neither fill
+    # nor drain it. The held SOC ratchets in one direction only, so a
+    # sustained bank can still be moved the way its owner wants (solar in
+    # floor mode, loads in ceiling mode) and never the other way. The BMS
+    # driver owns it because the SOC, the curve and the slider all live here.
+
+    def _live_soc(self):
+        bms = self.bms
+        if "_lastUpdate" not in bms or \
+                (time.time() - bms["_lastUpdate"]) > self.cfg.live_timeout:
+            return None
+        soc = bms["socHiRes"] if bms.get("socHiRes") is not None else bms.get("soc")
+        return float(soc) if soc is not None else None
+
+    def _sustain_requested(self, path, value):
+        try:
+            mode = int(value)
+        except (TypeError, ValueError):
+            return False
+        if mode == 0:
+            self._sustain_clear("released by requester")
+            return True
+        if mode not in (SUSTAIN_FLOOR, SUSTAIN_CEILING):
+            return False
+        if not self.cfg.sustain_enabled:
+            self.batt["/RecBms/Sustain/Status"] = "refused: disabled in config"
+            return False
+        su = self.sustain
+        if su["active"] and su["mode"] == mode:
+            # the owner re-asserting its hold: keep the ratchet, refresh expiry
+            su["req_ts"] = time.time()
+            return True
+        soc = self._live_soc()
+        if soc is None:
+            log.warning("sustain refused (mode %d): BMS not live", mode)
+            self.batt["/RecBms/Sustain/Status"] = "refused: BMS not live"
+            return False
+        self.sustain = {"active": True, "mode": mode, "req_ts": time.time(),
+                        "soc": soc, "logged_soc": soc}
+        s = self.batt
+        s["/RecBms/Sustain/Active"] = 1
+        s["/RecBms/Sustain/Mode"] = mode
+        s["/RecBms/Sustain/Soc"] = round(soc, 1)
+        s["/RecBms/Sustain/Status"] = "floor" if mode == SUSTAIN_FLOOR else "ceiling"
+        log.info("sustain %s at %.1f%% (slider read as the present SOC; "
+                 "expires in %.0fs unless re-asserted)",
+                 "floor" if mode == SUSTAIN_FLOOR else "ceiling", soc,
+                 self.cfg.sustain_hold_s)
+        return True
+
+    def _sustain_clear(self, reason):
+        was = self.sustain["active"]
+        held = self.sustain["soc"]
+        self.sustain = {"active": False, "mode": 0, "req_ts": 0.0,
+                        "soc": None, "logged_soc": None}
+        s = self.batt
+        s["/RecBms/Sustain/Request"] = 0
+        s["/RecBms/Sustain/Active"] = 0
+        s["/RecBms/Sustain/Mode"] = 0
+        s["/RecBms/Sustain/Soc"] = None
+        s["/RecBms/Sustain/SecondsLeft"] = 0
+        s["/RecBms/Sustain/Status"] = reason
+        if was:
+            log.info("sustain cleared at %.1f%% (%s); slider back in force",
+                     held if held is not None else -1, reason)
+
+    def _service_sustain(self, now, soc, slider):
+        """Runs every tick. Expires the hold, ratchets the held SOC in the
+        hold's direction, keeps it inside the real slider target and
+        publishes the telemetry. Returns the SOC the CVL curve should be
+        evaluated at, or None when the slider itself applies."""
+        c = self.cfg
+        su = self.sustain
+        if not su["active"]:
+            return None
+        elapsed = now - su["req_ts"]
+        if elapsed >= c.sustain_hold_s:
+            self._sustain_clear("expired after %.0fs" % c.sustain_hold_s)
+            return None
+        # velib's SetValue short-circuits a write of the value the path
+        # already holds (no callback), so a re-assert of the same mode would
+        # never refresh the expiry, and a release (0) would be lost if the
+        # path read 0. Reading the request back as -1 while active makes
+        # every 0/1/2 write a change; the state lives in /Active and /Mode.
+        self.batt["/RecBms/Sustain/Request"] = -1
+        su["soc"], held = sustain_ratchet(su["mode"], su["soc"], soc, slider,
+                                          c.slider_min, c.slider_max,
+                                          c.sustain_step)
+        if held != su["logged_soc"]:
+            log.info("sustain %s now at %.1f%%",
+                     "floor" if su["mode"] == SUSTAIN_FLOOR else "ceiling", held)
+            su["logged_soc"] = held
+        s = self.batt
+        s["/RecBms/Sustain/Soc"] = round(held, 1)
+        s["/RecBms/Sustain/SecondsLeft"] = int(c.sustain_hold_s - elapsed)
+        return held
 
     # ------------------------------------------------ lead verification
     def _settings_get(self, path):
@@ -1153,12 +1332,22 @@ class RecBmsDriver:
                 return bms[key]
             return safe.get(key)
 
-        # ---- CVL control: slider + weekly equalization ----
+        # 0x355 bytes 4-5 carry SOC at 0.01% resolution — prefer it
+        soc = bms["socHiRes"] if bms.get("socHiRes") is not None else v("soc")
+
+        # ---- CVL control: slider (or sustain) + weekly equalization ----
         slider = float(self.settings["chargeslider"] or c.slider_default)
-        slider_cvl = self._slider_cvl(slider)
+        # Sustain (v1.5.0): while held, the curve is evaluated at the SOC the
+        # bank is at, not at the slider. The BMS' own SOC is used even in
+        # fallback (it is the last value the BMS sent; the ratchet simply
+        # stops moving), never the safe substitute.
+        held = self._service_sustain(now, soc if live else None, slider)
+        slider_cvl = self._slider_cvl(held if held is not None else slider)
         eq = self.eq
         eq_last = float(self.settings["eqlast"] or 0)
-        eq_eligible = live
+        # An equalization is a deliberate charge from shore; it waits while
+        # a sustain hold is in force (eqlast is untouched, so it stays due).
+        eq_eligible = live and held is None
         eq_due = (now - eq_last) >= c.eq_interval_s
         eq_label = ""
 
@@ -1172,7 +1361,8 @@ class RecBmsDriver:
                 eq_label = "EQ done"
             elif not eq_eligible:
                 eq["active"] = False
-                log.warning("equalization aborted (BMS not live)")
+                log.warning("equalization aborted (%s)",
+                            "sustain hold" if live else "BMS not live")
                 final_cvl = slider_cvl
                 eq_label = "EQ aborted"
             else:
@@ -1202,8 +1392,6 @@ class RecBmsDriver:
 
         volts = v("voltage")
         amps = v("current") if live else 0.0
-        # 0x355 bytes 4-5 carry SOC at 0.01% resolution — prefer it
-        soc = bms["socHiRes"] if bms.get("socHiRes") is not None else v("soc")
         cell_min, cell_max = v("minCellV"), v("maxCellV")
         cell_min_t, cell_max_t = v("minCellT"), v("maxCellT")
 
@@ -1234,6 +1422,7 @@ class RecBmsDriver:
         target = round(final_cvl, 2)
         lead = self._service_boost(now, target)
         s["/RecBms/TargetChargeVoltage"] = target
+        s["/RecBms/TargetSoc"] = slider
         s["/RecBms/SolarLead"] = round(lead, 2)
         s["/Info/MaxChargeVoltage"] = round(target - lead, 2)
         self._last_pub_cvl = round(target - lead, 2)

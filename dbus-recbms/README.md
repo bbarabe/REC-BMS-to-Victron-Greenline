@@ -250,6 +250,50 @@ Things dvcc.py does that are worth knowing:
   to 0 as well — solar is off during a CAN outage on shore; when inverting
   the MPPTs still get 0 + inverter draw, so they keep carrying loads.
 
+## Sustain (v1.5.0)
+
+A request-and-forget control that makes the driver **read the Max Charge
+slider as the present SOC**: the CVL curve is evaluated at the SOC the bank is
+at, so the chargers hold it where it is instead of moving it. It exists for
+Solar Priority's one-way charge/discharge (below) — shore should only ever
+*sustain* the bank while solar, or the loads, do the moving — but any client
+may use it.
+
+| path | |
+|---|---|
+| `/RecBms/Sustain/Request` | **writeable** — `1` floor, `2` ceiling, `0` release. Reads back `-1` while active, so a repeated write (re-assert) and a release are both seen (a D-Bus write of the value a path already holds never reaches the driver) |
+| `/RecBms/Sustain/Active` | 0/1 |
+| `/RecBms/Sustain/Mode` | the mode in force |
+| `/RecBms/Sustain/Soc` | the SOC the CVL is evaluated at |
+| `/RecBms/Sustain/SecondsLeft` | countdown to automatic expiry |
+| `/RecBms/Sustain/Status` | `idle` / `floor` / `ceiling` / why it ended or was refused |
+| `/RecBms/TargetSoc` | the slider itself, as the driver reads it each tick |
+
+The held SOC is a **one-way ratchet with hysteresis**. A *floor* follows the
+bank upward only, and only in whole steps (`step_pct`, 1 %): solar may raise
+it and the held level steps up with it, the charger never lets it fall. A
+*ceiling* follows it downward only, in the same steps: the loads may lower it,
+nothing raises it. The step matters: the Quattro's re-absorb bursts nudge the
+hi-res SOC by hundredths of a percent, and without it every nudge would lift
+the CVL a few millivolts for the next burst to start from. Neither crosses the real slider — a floor is capped at the slider,
+a ceiling floored at it — and a boost is refused while a ceiling is held,
+since a boost charges from solar. An equalization that falls due during a
+hold waits (its timestamp is untouched, so it stays due) rather than charging
+from shore.
+
+**It is never sticky.** Like the boost it expires by itself after `[sustain]
+hold_s` (120 s) unless re-asserted (re-asserting the same mode refreshes the
+expiry and keeps the ratchet; a different mode re-samples), it is never
+persisted, and it dies with the process — a restart always comes back on the
+real slider. A request is refused while the BMS is not live: there is no
+present SOC to pin.
+
+The pin is only as good as the CVL curve. It is calibrated on settled holds,
+so at rest the chargers neither fill nor drain; a freshly solar-charged bank
+sits above its curve point for a while (the charger simply idles until it
+relaxes) and below ~50 % the curve is known to settle a little high. Both are
+within the deadband one-way mode uses.
+
 ## Solar Priority driver (`solar_priority.py`, dbus-solarpriority)
 
 The Node-RED **Solar Priority** flow (`SolarPriority.json`, Decision Engine
@@ -258,8 +302,10 @@ its own file, config (`solar_priority.ini`), daemontools service
 (`/service/dbus-solarpriority`), log (`/var/log/dbus-solarpriority`) and
 D-Bus service. It talks to dbus-recbms only over D-Bus — the same paths the
 flow used (`/RecBms/TargetChargeVoltage`, the `SolarBoost/*` trio,
-`/RecBms/SolarLead`, `/RecBms/LeadFault`) — so `dbus_recbms.py` is untouched
-and either service can be installed, restarted or removed without the other.
+`/RecBms/SolarLead`, `/RecBms/LeadFault`) plus, since engine 4.3,
+`/RecBms/TargetSoc` and `Sustain/*` (dbus-recbms ≥ 1.5.0; on an older build
+one-way mode simply stays off) — so either service can be installed,
+restarted or removed without the other.
 
 Why a driver: the same two reasons as the BMS (boots seconds after D-Bus,
 immune to Node-RED deploys) plus one that matters more here — the flow
@@ -308,7 +354,8 @@ ActiveInput value that means "on shore".
 **Diagnostics** on the switch service: `/SolarPriority/State` (shore / probe
 / solar / burndown / suspend), `/Status` (the flow's node-status line),
 `/StatusFill`, `/LastTransition` + `/LastTransitionTime`, `/EstimateW`,
-`/NeedW`, `/Desired`. Transitions are logged:
+`/NeedW`, `/Desired`, and for one-way mode `/OneWay` (`""` / `charge` /
+`discharge`), `/TargetSoc`, `/Sustain` (the mode last requested). Transitions are logged:
 `tail -f /var/log/dbus-solarpriority/current | tai64nlocal`.
 
 **Migration from the flow** (the two must never run together — both write
@@ -334,6 +381,43 @@ ActiveInput value that means "on shore".
 
 Rollback: `sh uninstall.sh solarpriority`, re-enable the flow tab, restore
 the registry rows.
+
+### One-way charge / discharge (engine 4.3)
+
+The Max Charge slider is a destination, and while it is far from the SOC the
+bank is only allowed to move **toward** it — every watt-hour of solar goes
+into the move, shore never fights it.
+
+**Charging** (target more than `oneway_enter_pct` = 5 % above the SOC): the
+normal shore → probe → solar cycle does the charging — whenever the sun
+carries the loads, shore is dropped and the surplus fills the bank up to the
+real target. Whenever shore is connected (shore, suspend) the engine asks
+dbus-recbms to **sustain a floor**: the Quattro holds the bank where solar
+left it and feeds the loads, and never charges it. The held level rises with
+the bank and the next probe releases it, so the morning's solar charges
+freely. Burn-downs (surplus and harvest) are off — they spend the band into
+the loads, a step backward — and the probe is not held back by a bank that
+sits above the sustain CVL (it runs against the real target).
+
+**Discharging** (target more than 5 % below the SOC): dbus-recbms sustains a
+**ceiling** the whole time, so nothing charges the bank: solar covers what it
+can of the loads and the rest comes from the bank, day and night. Shore is
+left as soon as the charger is quiet and the usual gates allow (cooldown,
+backoff, lockout, SOC ≥ `min_soc`), straight into `solar` with no probe. The
+deficit, surge, SOC-drift and ceiling-stall exits are off — the bank draining
+*is* the plan. What still ends it: the SOC floor, a heater-class load
+(suspend, on shore under the ceiling, resume without the re-ramp boost), and
+the AC-control faults. No measurement boosts are requested.
+
+Both stand down within `oneway_exit_pct` = 1 % of the target and the normal
+engine finishes the last bit (the charger tops up to the slider, or a
+burn-down spends the band). Moving the slider re-evaluates on the next tick,
+including flipping direction. `oneway_enter_pct = 0` turns the feature off.
+The status line is prefixed `1-WAY CHARGE 62->80% |` / `1-WAY DISCHARGE 90->70% |`,
+the discharge stint reads `DRAIN | …`, and engagement, completion and the
+sustain requests are logged.
+
+`python test_solar_priority.py` drives both halves off the boat.
 
 ## Deploying updates
 

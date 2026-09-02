@@ -17,7 +17,8 @@ Node-RED any more.
 Deploy with `python deploy_cerbo.py <name>` (one SSH session, config guard,
 backups, verification — it encodes the rules in [`CLAUDE.md`](CLAUDE.md)).
 `python test_drivers.py` runs `dbus-batteries` and `dbus-edrive` off the boat
-against stubbed D-Bus and CAN.
+against stubbed D-Bus and CAN; `python test_solar_priority.py` does the Solar
+Priority engine and dbus-recbms' sustain control.
 
 Superseded flows live in [`archive/`](archive/) — kept for rollback only, never
 deployed alongside the drivers that replaced them.

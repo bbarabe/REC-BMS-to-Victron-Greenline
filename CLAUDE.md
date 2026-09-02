@@ -61,7 +61,10 @@ python deploy_cerbo.py czone --verify-only     # no upload, no restart
 Packages: `recbms`, `solarpriority`, `czone`, `batteries`, `edrive`.
 `python test_drivers.py` runs `dbus-batteries` and `dbus-edrive` off the boat
 against stubbed D-Bus, velib and SocketCAN — run it before every deploy of
-either.
+either. `python test_solar_priority.py` does the same for dbus-recbms' sustain
+control and the Solar Priority engine (one-way charge/discharge); the stand-ins
+live in `test_stubs.py`. `solarpriority` reads `/RecBms/TargetSoc` and
+`Sustain/*`, so deploy `recbms` first (publisher first, as always).
 
 It aborts (exit 3) when the live config's *values* differ from the repo's
 HEAD copy — fold the on-boat edit into the repo first, or `--force-config`.
