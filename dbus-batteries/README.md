@@ -140,16 +140,18 @@ com.victronenergy.n2kbatteries
 ```
 
 `/Catalog` is a JSON array — one object per source with `key`, `kind`, `n2k`,
-`src`, `fields`, `enabled`, `published`, `instance`, `name`, `suffix` and
-`capacity` — so a client can render the whole picker from a single read:
+`fields`, `enabled`, `instance`, `name`, `suffix` and `capacity` — so a client
+can render the whole picker from a single read. Source address and published
+state are on `/Sources/<key>/SourceAddress` and `/Published` only: two senders
+sharing an instance flip the address on every frame, and while it was in the
+blob that meant a localsettings write and a settings reconcile most seconds.
 
 ```json
-[{"key":"bat1","kind":"dc","n2k":1,"src":16,"fields":["current","soc","soh","voltage"],
-  "enabled":1,"instance":201,"name":"House","suffix":"house","capacity":130,
-  "published":1},
- {"key":"alt0","kind":"alternator","n2k":0,"src":null,"fields":[],
+[{"key":"bat1","kind":"dc","n2k":1,"fields":["current","soc","soh","voltage"],
+  "enabled":1,"instance":201,"name":"House","suffix":"house","capacity":130},
+ {"key":"alt0","kind":"alternator","n2k":0,"fields":[],
   "enabled":1,"instance":204,"name":"Port Engine","suffix":"porteng",
-  "capacity":0,"published":0}]
+  "capacity":0}]
 ```
 
 That second entry is the live state at the dock: configured, instance reserved,
@@ -157,7 +159,9 @@ never yet seen.
 
 Only the *stable* description is persisted; liveness lives on `/Available` and
 `/Age`, so a battery that is present does not cause a localsettings write every
-second.
+second. `/Age` itself is refreshed every `age_refresh_s` (10 s), not every tick.
+Every service publishes a tick's changes as one `ItemsChanged`, with values
+quantised to the `[publish]` steps, so a steady battery costs no bus traffic.
 
 Writes to the settings made by something else (an app talking to the MQTT
 bridge, or `dbus -y`) are picked up from the `PropertiesChanged` signal, with a

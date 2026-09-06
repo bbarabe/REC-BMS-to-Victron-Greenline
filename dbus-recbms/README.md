@@ -275,7 +275,17 @@ it and the held level steps up with it, the charger never lets it fall. A
 *ceiling* follows it downward only, in the same steps: the loads may lower it,
 nothing raises it. The step matters: the Quattro's re-absorb bursts nudge the
 hi-res SOC by hundredths of a percent, and without it every nudge would lift
-the CVL a few millivolts for the next burst to start from. Neither crosses the real slider — a floor is capped at the slider,
+the CVL a few millivolts for the next burst to start from.
+
+The hold also **starts one step in its own direction** (`snap_pct`, 1 %): a
+floor requested with the bank at 59.8 % holds 60.8 %. This compensates the
+solar lead — the Quattro is commanded `solar_lead_v` (0.15 V, about 1.5 % on
+the curve) under the point, and a floor at the exact SOC was measured
+settling 1.4 % low overnight (2026-09-02). Snapped one step up, its command
+lands 0.05 V under the true point, so with its usual overshoot it holds
+within roughly −0.2 % to +1 % of where the bank was; and the ratchet's first
+move then needs the bank two full steps above its start, beyond anything the
+charger's overshoot can do. Neither crosses the real slider — a floor is capped at the slider,
 a ceiling floored at it — and a boost is refused while a ceiling is held,
 since a boost charges from solar. An equalization that falls due during a
 hold waits (its timestamp is untouched, so it stays due) rather than charging
@@ -287,6 +297,20 @@ expiry and keeps the ratchet; a different mode re-samples), it is never
 persisted, and it dies with the process — a restart always comes back on the
 real slider. A request is refused while the BMS is not live: there is no
 present SOC to pin.
+
+**Charge current limit** (`charge_limit_a`, 5 A): while a hold is in force
+the published CCL becomes *present PV current + 5 A*. DVCC gives the MPPTs the
+whole limit (plus DC loads) and the Quattro only the remainder after their
+smoothed current, so every MPPT keeps a few amps of headroom — tracker
+active, free to ramp a few amps per 3 s DVCC cycle — while the Quattro can
+never bulk. This is what stops the re-absorb the Quattro does on every AC
+re-accept: measured 2026-09-02, 0.6–2 kW for thirteen minutes with the pack
+*above* its commanded voltage, over 100 Wh of shore into a bank that was
+supposed to be sustained. No CVL stops that, and `/Dc/0/MaxChargeCurrent` on
+the vebus service accepts a write and ignores it on this firmware. The cap is
+lifted during a solar boost (the measurement needs the MPPTs truly
+unthrottled) and not applied when PV current cannot be read;
+`/RecBms/Sustain/ChargeLimit` shows the limit in force.
 
 The pin is only as good as the CVL curve. It is calibrated on settled holds,
 so at rest the chargers neither fill nor drain; a freshly solar-charged bank
@@ -409,6 +433,16 @@ deficit, surge, SOC-drift and ceiling-stall exits are off — the bank draining
 (suspend, on shore under the ceiling, resume without the re-ramp boost), and
 the AC-control faults. No measurement boosts are requested.
 
+While charging one-way the solar stint is also judged more patiently than
+the 4.2 engine does: shore comes back only when the bank's **ten-minute
+mean** is below **−200 W** (`oneway_deficit_w`, `oneway_deficit_ms`), a probe
+is ended only by a real surge (load above 1.5× the estimate), and the 3 s
+surge exit is off. Measured 2026-09-02: the 4.2 rule left solar over a
+one-minute −51 W dip, and every reconnect made the Quattro re-absorb at
+0.6–2 kW for ten-plus minutes, well over 100 Wh of shore into the bank. On a
+1440 Ah bank a small deficit costs nothing; a reconnect does. The 2 % SOC
+drift exit and the heater-class suspend still apply.
+
 Both stand down within `oneway_exit_pct` = 1 % of the target and the normal
 engine finishes the last bit (the charger tops up to the slider, or a
 burn-down spends the band). Moving the slider re-evaluates on the next tick,
@@ -418,6 +452,54 @@ the discharge stint reads `DRAIN | …`, and engagement, completion and the
 sustain requests are logged.
 
 `python test_solar_priority.py` drives both halves off the boat.
+
+### Two limits on one-way charge (engine 4.5)
+
+Both from 2026-09-06, with the slider at 100 % and no shore power at the
+dock:
+
+- **100 % is a full charge, not a destination.** A target at or above
+  `oneway_full_pct` (100) asks for every charger at its maximum, so one-way
+  charge does not engage there and the 4.2 engine runs: on shore the Quattro
+  charges at the full CVL, and solar carries the loads whenever it can. With
+  the floor in force at 100 % the Quattro only ever held the bank where solar
+  left it, and the bank could never get full. `oneway_full_pct = 0` removes
+  the exception. Any target below it (95 % and down) is one-way as before.
+- **No floor without shore.** The floor is asked for only while the Quattro
+  reports the shore input as its *active* input, not merely while the engine
+  has asked for it. With no AC available the Quattro inverts whatever it is
+  told; the floor then did nothing but pin the CVL at the present SOC and
+  stop solar charging (a 1 kW load had sent the engine to `suspend`, and it
+  sat there on the bank at 80 % with the sun out). The floor now follows the
+  shore relay within a tick, both ways; the status line reads `NO SHORE?`
+  while it is withheld and `/SolarPriority/Sustain` shows 0.
+
+### Pre-probe checks (engine 4.4)
+
+From the evening of 2026-09-01 in Home Assistant: five probes went out on
+estimates of 374–1381 W while every unthrottled reading after 17:42 was
+86–296 W against a need of about 300 W, and three of them ended on the load
+rising. Three checks, all on data the engine already had:
+
+- **A measurement beats the model.** While an unthrottled capture is younger
+  than `cap_trumps_mdl_ms` (15 min) the panel model may not raise that
+  charger's evidence above it. The model still estimates while throttled with
+  no recent measurement; it just cannot outbid one. Four of the five probes
+  were the model outbidding a fresh reading (its ceiling is 20× the present
+  yield, which is where 1381 W came from).
+- **Array balance.** Both chargers get the same voltage, so throttling and sun
+  angle move them together, within their tilt. An obstruction on one string
+  does not. Each fresh capture is divided by its rated share
+  (`mdl_share6/7`); when the smaller is under `shade_balance_min` (0.4) of
+  the larger, no probe. Measured: 0.06–0.35 whenever the flybridge array was
+  obstructed, 0.68–0.75 when it was not, 0.7 in the morning with the brow
+  array tilted away from the sun. The status line shows `bal 0.15 [SHADE]`.
+- **The need is judged against a slower running average too**
+  (`load_slow_ms`, 5 min), the larger of it and the 60 s average.
+
+Every probe entry now logs the breakdown (`cap`, `mdl`, live PV, Voc, MPPT
+modes, balance) and every probe exit the PV, per-array yield and balance, so
+an evening can be judged from Home Assistant without guessing.
 
 ## Deploying updates
 

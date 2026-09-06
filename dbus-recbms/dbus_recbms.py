@@ -71,6 +71,7 @@ Baselines:
 import configparser
 import glob
 import logging
+import math
 import os
 import platform
 import socket
@@ -84,7 +85,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -184,6 +185,19 @@ class Config:
         self.lead_fault_alarm = \
             str(v.get("lead_fault_alarm", "true")).lower() != "false"
 
+        # [publish] — telemetry quantisation. A value only goes on D-Bus when
+        # it moves to a different step, and every tick's changes go out as ONE
+        # ItemsChanged. Control paths (CVL/CCL/DCL, targets, lead, alarms,
+        # sustain/boost) are published at full resolution regardless.
+        pb = cp["publish"] if cp.has_section("publish") else {}
+        self.voltage_step = float(pb.get("voltage_step", 0.05))
+        self.current_step = float(pb.get("current_step", 0.5))
+        self.power_step = float(pb.get("power_step", 10))
+        self.temperature_step = float(pb.get("temperature_step", 0.5))
+        self.soc_step = float(pb.get("soc_step", 0.1))
+        self.ah_step = float(pb.get("ah_step", 1))
+        self.time_step = float(pb.get("time_step", 60))
+
         f = cp["fallback"] if cp.has_section("fallback") else {}
         self.live_timeout = float(f.get("live_timeout_s", 60))
         self.alert_timeout = float(f.get("alert_timeout_s", 120))
@@ -223,6 +237,8 @@ class Config:
         self.sustain_enabled = str(su.get("enabled", "true")).lower() != "false"
         self.sustain_hold_s = float(su.get("hold_s", 120))
         self.sustain_step = max(0.0, float(su.get("step_pct", 1)))
+        self.sustain_snap = max(0.0, float(su.get("snap_pct", 1)))
+        self.sustain_ccl_a = max(0.0, float(su.get("charge_limit_a", 5)))
 
 
 # ----------------------------------------------------------------------------
@@ -389,6 +405,20 @@ def sustain_ratchet(mode, held, soc, slider, lo, hi, step=1.0):
     return held, max(lo, min(hi, eff))
 
 
+def _q(value, step):
+    """Round to the nearest multiple of `step`; None passes through.
+
+    Integer steps give ints, fractional ones a float rounded to the step's
+    own number of decimals so 0.1 never comes back as 0.30000000000000004.
+    """
+    if value is None:
+        return None
+    n = round(value / step) * step
+    if float(step).is_integer():
+        return int(round(n))
+    return round(n, max(0, -int(math.floor(math.log10(step)))))
+
+
 def fmt(unit, digits):
     def cb(path, value):
         if value is None:
@@ -442,6 +472,7 @@ class RecBmsDriver:
         self._last_offset_warn = 0.0
         # Lead verification (v1.4.0): what DVCC actually sends the MPPTs
         self.eff_cv = None                  # (volts or None, ts) from systemcalc
+        self.pv_current = None              # (amps or None, ts) from systemcalc
         self._last_pub_cvl = None           # /Info/MaxChargeVoltage we published
         self._last_offset = 0.0             # offset we last wrote
         self.lead_fault = {"active": False, "since": 0.0, "msg": "",
@@ -673,9 +704,16 @@ class RecBmsDriver:
         svc.add_path("/RecBms/Sustain/SecondsLeft", 0,
                      gettextcallback=fmt_int("s"))
         svc.add_path("/RecBms/Sustain/Status", "idle")
+        # the charge current limit in force for the hold (None: not capped)
+        svc.add_path("/RecBms/Sustain/ChargeLimit", None, gettextcallback=a1)
 
         register_service(svc)
         self.batt = svc
+        # Everything publishes through _pub. Outside a tick it IS the
+        # service (immediate PropertiesChanged, for the rare event writes);
+        # inside a tick it is velib's batching context, so the ~40 paths a
+        # tick touches go out as one ItemsChanged instead of one signal each.
+        self._pub = svc
         log.info("registered com.victronenergy.battery.%s instance %d",
                  c.batt_suffix, self.batt_instance)
 
@@ -820,7 +858,7 @@ class RecBmsDriver:
         # little margin the measurement window would open on an array that has
         # barely started, and that reading would be recorded as its capacity.
         # Refuse rather than return a number that is wrong and looks real.
-        packv = self.batt["/Dc/0/Voltage"]
+        packv = self._pub["/Dc/0/Voltage"]
         if packv is None:
             return False, "no pack voltage"
         margin = (float(target) + volts) - float(packv)
@@ -840,15 +878,15 @@ class RecBmsDriver:
         ok, why = self._boost_allowed(volts)
         if not ok:
             log.warning("solar boost refused (%.2fV): %s", volts, why)
-            self.batt["/RecBms/SolarBoost/Status"] = "refused: " + why
+            self._pub["/RecBms/SolarBoost/Status"] = "refused: " + why
             return False
         if not self._boost_write(self.cfg.solar_lead + volts):
-            self.batt["/RecBms/SolarBoost/Status"] = "refused: systemcalc write failed"
+            self._pub["/RecBms/SolarBoost/Status"] = "refused: systemcalc write failed"
             return False
         self.boost = {"active": True, "req_ts": time.time(), "volts": volts}
-        self.batt["/RecBms/SolarBoost/Applied"] = round(volts, 2)
-        self.batt["/RecBms/SolarBoost/Active"] = 1
-        self.batt["/RecBms/SolarBoost/Status"] = "ramp"
+        self._pub["/RecBms/SolarBoost/Applied"] = round(volts, 2)
+        self._pub["/RecBms/SolarBoost/Active"] = 1
+        self._pub["/RecBms/SolarBoost/Status"] = "ramp"
         log.info("solar boost +%.2fV for %.0fs (measure %.0f..%.0fs)", volts,
                  self.cfg.boost_hold_s, self.cfg.boost_measure_start_s,
                  self.cfg.boost_measure_start_s + self.cfg.boost_measure_len_s)
@@ -858,7 +896,7 @@ class RecBmsDriver:
         was = self.boost["active"]
         self.boost = {"active": False, "req_ts": 0.0, "volts": 0.0}
         self._boost_write(self.cfg.solar_lead)   # keep the standing lead
-        s = self.batt
+        s = self._pub
         s["/RecBms/SolarBoost/Request"] = 0.0
         s["/RecBms/SolarBoost/Applied"] = 0.0
         s["/RecBms/SolarBoost/Active"] = 0
@@ -899,7 +937,7 @@ class RecBmsDriver:
         if mode not in (SUSTAIN_FLOOR, SUSTAIN_CEILING):
             return False
         if not self.cfg.sustain_enabled:
-            self.batt["/RecBms/Sustain/Status"] = "refused: disabled in config"
+            self._pub["/RecBms/Sustain/Status"] = "refused: disabled in config"
             return False
         su = self.sustain
         if su["active"] and su["mode"] == mode:
@@ -908,19 +946,42 @@ class RecBmsDriver:
             return True
         soc = self._live_soc()
         if soc is None:
-            log.warning("sustain refused (mode %d): BMS not live", mode)
-            self.batt["/RecBms/Sustain/Status"] = "refused: BMS not live"
-            return False
+            # No SOC yet (a restart's first second, or a stale BMS): take the
+            # request as PENDING and sample the bank on the first live tick.
+            # Refusing it here left the full slider CVL on the Quattro for
+            # the engine's 30 s re-assert cycle after every dbus-recbms
+            # restart (2026-09-02). It expires like any hold if the BMS
+            # never comes back.
+            self.sustain = {"active": True, "mode": mode, "req_ts": time.time(),
+                            "soc": None, "logged_soc": None}
+            s = self._pub
+            s["/RecBms/Sustain/Active"] = 1
+            s["/RecBms/Sustain/Mode"] = mode
+            s["/RecBms/Sustain/Soc"] = None
+            s["/RecBms/Sustain/Status"] = "pending: no SOC yet"
+            log.info("sustain %s requested before the BMS is live; pending",
+                     "floor" if mode == SUSTAIN_FLOOR else "ceiling")
+            return True
+        # Snap the hold one step in its own direction. A floor evaluated at
+        # the bank's exact SOC leaves the Quattro commanded solar_lead_v
+        # under the curve point, and it holds there: measured 2026-09-02,
+        # a floor at 59.8 % settled at 58.4 % overnight (0.15 V lead = 1.5 %
+        # on the curve, less the Quattro's +0.03 V overshoot). One step up
+        # puts its command 0.05 V under the true point instead, and the
+        # ratchet's first move then needs the bank a full two steps above
+        # where it started -- out of reach of the charger's own overshoot.
+        snap = self.cfg.sustain_snap if mode == SUSTAIN_FLOOR else -self.cfg.sustain_snap
+        held = soc + snap
         self.sustain = {"active": True, "mode": mode, "req_ts": time.time(),
-                        "soc": soc, "logged_soc": soc}
-        s = self.batt
+                        "soc": held, "logged_soc": held}
+        s = self._pub
         s["/RecBms/Sustain/Active"] = 1
         s["/RecBms/Sustain/Mode"] = mode
-        s["/RecBms/Sustain/Soc"] = round(soc, 1)
+        s["/RecBms/Sustain/Soc"] = round(held, 1)
         s["/RecBms/Sustain/Status"] = "floor" if mode == SUSTAIN_FLOOR else "ceiling"
-        log.info("sustain %s at %.1f%% (slider read as the present SOC; "
-                 "expires in %.0fs unless re-asserted)",
-                 "floor" if mode == SUSTAIN_FLOOR else "ceiling", soc,
+        log.info("sustain %s at %.1f%% (bank at %.1f%%, snapped %+.1f%%; slider read "
+                 "as that SOC, expires in %.0fs unless re-asserted)",
+                 "floor" if mode == SUSTAIN_FLOOR else "ceiling", held, soc, snap,
                  self.cfg.sustain_hold_s)
         return True
 
@@ -929,7 +990,7 @@ class RecBmsDriver:
         held = self.sustain["soc"]
         self.sustain = {"active": False, "mode": 0, "req_ts": 0.0,
                         "soc": None, "logged_soc": None}
-        s = self.batt
+        s = self._pub
         s["/RecBms/Sustain/Request"] = 0
         s["/RecBms/Sustain/Active"] = 0
         s["/RecBms/Sustain/Mode"] = 0
@@ -953,12 +1014,22 @@ class RecBmsDriver:
         if elapsed >= c.sustain_hold_s:
             self._sustain_clear("expired after %.0fs" % c.sustain_hold_s)
             return None
+        if su["soc"] is None:
+            # pending: nothing to hold until the bank's SOC is known
+            if soc is None:
+                self._pub["/RecBms/Sustain/SecondsLeft"] = int(c.sustain_hold_s - elapsed)
+                return None
+            snap = c.sustain_snap if su["mode"] == SUSTAIN_FLOOR else -c.sustain_snap
+            su["soc"] = su["logged_soc"] = soc + snap
+            self._pub["/RecBms/Sustain/Status"] = "floor" if su["mode"] == SUSTAIN_FLOOR else "ceiling"
+            log.info("sustain %s at %.1f%% (bank at %.1f%%, snapped %+.1f%%; was pending)",
+                     "floor" if su["mode"] == SUSTAIN_FLOOR else "ceiling", su["soc"], soc, snap)
         # velib's SetValue short-circuits a write of the value the path
         # already holds (no callback), so a re-assert of the same mode would
         # never refresh the expiry, and a release (0) would be lost if the
         # path read 0. Reading the request back as -1 while active makes
         # every 0/1/2 write a change; the state lives in /Active and /Mode.
-        self.batt["/RecBms/Sustain/Request"] = -1
+        self._pub["/RecBms/Sustain/Request"] = -1
         su["soc"], held = sustain_ratchet(su["mode"], su["soc"], soc, slider,
                                           c.slider_min, c.slider_max,
                                           c.sustain_step)
@@ -966,7 +1037,7 @@ class RecBmsDriver:
             log.info("sustain %s now at %.1f%%",
                      "floor" if su["mode"] == SUSTAIN_FLOOR else "ceiling", held)
             su["logged_soc"] = held
-        s = self.batt
+        s = self._pub
         s["/RecBms/Sustain/Soc"] = round(held, 1)
         s["/RecBms/Sustain/SecondsLeft"] = int(c.sustain_hold_s - elapsed)
         return held
@@ -1040,8 +1111,40 @@ class RecBmsDriver:
         except Exception:
             v = None
         self.eff_cv = (v, time.time())
-        self.batt["/RecBms/DvccEffectiveChargeVoltage"] = v
+        self._pub["/RecBms/DvccEffectiveChargeVoltage"] = v
+        # PV current for the sustain charge limit (same 3 s cadence as DVCC)
+        try:
+            raw = self.sbus.call_blocking(
+                self.cfg.boost_service, "/Dc/Pv/Current", BUSITEM, "GetValue", "", [], timeout=2)
+            a = float(raw)
+            if not (0 <= a <= 500):
+                a = None
+        except Exception:
+            a = None
+        self.pv_current = (a, time.time())
         return True
+
+    def _sustain_ccl(self, now, held, ccl):
+        """The charge current limit to publish while a hold is in force.
+
+        DVCC hands the MPPTs the whole BMS limit (plus DC loads) and the
+        Quattro only what remains after their smoothed current. Publishing
+        "present PV current + charge_limit_a" therefore leaves every MPPT a
+        few amps above what it already makes -- tracker active, free to ramp
+        a few amps per DVCC cycle -- while the Quattro can never bulk. That
+        is what stops the 0.6-2 kW re-absorb it does on every AC re-accept
+        (measured 2026-09-02, 13 min and >100 Wh of shore per reconnect),
+        which no CVL can, since it happens with the pack above its command.
+        Lifted during a solar boost (the measurement needs the MPPTs truly
+        unthrottled) and whenever PV current cannot be read."""
+        c = self.cfg
+        if held is None or c.sustain_ccl_a <= 0 or self.boost["active"]:
+            return ccl, None
+        a, ts = self.pv_current if self.pv_current else (None, 0.0)
+        if a is None or (now - ts) > 15:
+            return ccl, None
+        cap = a + c.sustain_ccl_a
+        return min(ccl, cap), round(cap, 1)
 
     def _verify_lead(self, now):
         """Compare what DVCC really sends the MPPTs against what we expect
@@ -1095,7 +1198,7 @@ class RecBmsDriver:
         the Quattro's CVL."""
         c = self.cfg
         b = self.boost
-        s = self.batt
+        s = self._pub
         self.last_target = target
         boost_v = 0.0
         if b["active"]:
@@ -1290,6 +1393,14 @@ class RecBmsDriver:
         return min(cvl, c.cvl_max)
 
     def _tick(self):
+        with self.batt as ctx:
+            self._pub = ctx
+            try:
+                return self._tick_inner()
+            finally:
+                self._pub = self.batt
+
+    def _tick_inner(self):
         c = self.cfg
         bms = self.bms
         now = time.time()
@@ -1387,6 +1498,8 @@ class RecBmsDriver:
         # ---- resolve outputs ----
         if live:
             ccl, dcl, dvl = v("ccl"), v("dcl"), v("dvl")
+            ccl, applied = self._sustain_ccl(now, held, ccl)
+            self._pub["/RecBms/Sustain/ChargeLimit"] = applied
         else:
             ccl, dcl, dvl = fb
 
@@ -1411,7 +1524,7 @@ class RecBmsDriver:
         if live and self.current_ema is not None and self.current_ema > 0.05:
             ttf = int((installed - remaining) / self.current_ema * 3600)
 
-        s = self.batt
+        s = self._pub
         # The Quattro's absorption holds +0.05..0.15V ABOVE its commanded
         # CVL (measured 2026-08-19: SVS on, BMS/Quattro/sense meters all
         # within 10mV, VebusChargeState=absorption, pack held steady at
@@ -1429,16 +1542,16 @@ class RecBmsDriver:
         s["/Info/MaxChargeCurrent"] = ccl
         s["/Info/MaxDischargeCurrent"] = dcl
         s["/Info/BatteryLowVoltage"] = dvl
-        s["/Dc/0/Voltage"] = volts
-        s["/Dc/0/Current"] = amps
-        s["/Dc/0/Power"] = round(volts * amps, 1)
-        s["/Dc/0/Temperature"] = v("temperature")
-        s["/Soc"] = round(soc, 2)
+        s["/Dc/0/Voltage"] = _q(volts, c.voltage_step)
+        s["/Dc/0/Current"] = _q(amps, c.current_step)
+        s["/Dc/0/Power"] = _q(volts * amps, c.power_step)
+        s["/Dc/0/Temperature"] = _q(v("temperature"), c.temperature_step)
+        s["/Soc"] = _q(soc, c.soc_step)
         s["/Soh"] = bms.get("soh")
-        s["/Capacity"] = round(remaining, 1)
-        s["/ConsumedAmphours"] = round(remaining - installed, 1)  # BMV convention: negative
+        s["/Capacity"] = _q(remaining, c.ah_step)
+        s["/ConsumedAmphours"] = _q(remaining - installed, c.ah_step)  # BMV convention: negative
         s["/InstalledCapacity"] = installed
-        s["/TimeToGo"] = ttg
+        s["/TimeToGo"] = _q(ttg, c.time_step)
 
         s["/Alarms/LowVoltage"] = (2 if cell_min < 3.00 else 1 if cell_min < 3.30 else 0) if live else 0
         s["/Alarms/HighVoltage"] = (2 if cell_max > 4.25 else 1 if cell_max > 4.20 else 0) if live else 0
@@ -1479,7 +1592,7 @@ class RecBmsDriver:
 
         s["/RecBms/Phase"] = phase_name
         s["/RecBms/EqStatus"] = eq_label
-        s["/RecBms/TimeToFull"] = ttf
+        s["/RecBms/TimeToFull"] = _q(ttf, c.time_step)
         force = (1 if bms.get("forceCharge") else 0) if live else 0
         s["/RecBms/ForceChargeRequest"] = force
         if c.forward_charge_request:

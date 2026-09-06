@@ -61,7 +61,7 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 log = logging.getLogger("dbus-edrive")
 
@@ -134,6 +134,21 @@ def _f32(buf, off):
 # ============================================================================
 # Config
 # ============================================================================
+def _q(value, step):
+    """Round to the nearest multiple of `step`; None passes through.
+
+    Integer steps give ints (D-Bus 'i'), fractional ones a float rounded to
+    the step's own number of decimals so 0.1 never comes back as
+    0.30000000000000004.
+    """
+    if value is None:
+        return None
+    n = round(value / step) * step
+    if float(step).is_integer():
+        return int(round(n))
+    return round(n, max(0, -int(math.floor(math.log10(step)))))
+
+
 def _flag(raw, default=False):
     if raw is None:
         return default
@@ -173,6 +188,23 @@ class Config:
         self.product_name = p.get("product_name", "Greenline 6GK E-Drive")
         self.publish_extra = _flag(p.get("publish_extra"), True)
         self.rpm_deadband = float(p.get("rpm_deadband", 1.0))
+        # Quantisation steps. A value is only put on D-Bus when it has moved
+        # to a different step, so the second-decimal jitter of an idle drive
+        # (61.83 V, 0.07 A, 0.02 Nm ...) no longer costs a bus signal a
+        # second per path. Rounding is done here, once, at publish time; the
+        # decoded floats stay exact for the fallbacks that derive from them.
+        self.voltage_step = float(p.get("voltage_step", 0.1))
+        self.current_step = float(p.get("current_step", 0.5))
+        self.power_step = float(p.get("power_step", 10))
+        self.temperature_step = float(p.get("temperature_step", 0.5))
+        self.torque_step = float(p.get("torque_step", 0.5))
+        self.throttle_step = float(p.get("throttle_step", 0.5))
+        self.phase_current_step = float(p.get("phase_current_step", 1))
+        # Standstill deadbands, same idea as rpm_deadband: a stopped drive
+        # reports a few tenths of a Nm and an amp or so of noise, which the
+        # steps above still let through as a change every tick.
+        self.torque_deadband = float(p.get("torque_deadband", 1.0))
+        self.current_deadband = float(p.get("current_deadband", 1.0))
 
         k = cp["calibration"] if cp.has_section("calibration") else {}
         # 61452 w2 -> motor DC current, fit r=0.9994 against the MFD's MOTOR
@@ -648,83 +680,104 @@ class EDriveDriver:
         return True
 
     def _publish(self, d):
+        """One ItemsChanged per drive per tick, carrying only what moved.
+
+        velib's context manager collects every change made inside the block
+        and emits a single ItemsChanged when it closes, instead of one
+        PropertiesChanged per path. With eleven paths jittering every second
+        that was ~9 signals/s per drive, each fanned out to the seven or so
+        listeners on this Cerbo (systemcalc, vrmlogger, the GUI, Signal K,
+        flashmq ...) — measured 2026-09-05 as three quarters of all bus
+        traffic and enough load to trip the watchdog. Quantised values
+        (see Config) mean an idle drive usually changes nothing at all.
+        """
         c = self.cfg
         svc = d.svc
         if svc is None:
             return
         fresh = d.fresh(c.stale_after_s)
-        if d.connected != fresh:
-            if d.connected and not fresh:
-                log.info("%s: no CAN frames for %.0fs — disconnected",
-                         d.key, time.time() - d.last_seen)
-                d.forget()
-            elif fresh:
-                log.info("%s: connected", d.key)
-            d.connected = fresh
-            svc["/Connected"] = 1 if fresh else 0
+        with svc as s:
+            if d.connected != fresh:
+                if d.connected and not fresh:
+                    log.info("%s: no CAN frames for %.0fs — disconnected",
+                             d.key, time.time() - d.last_seen)
+                    d.forget()
+                elif fresh:
+                    log.info("%s: connected", d.key)
+                d.connected = fresh
+                s["/Connected"] = 1 if fresh else 0
 
-        if not fresh:
-            for p in ("/Dc/0/Voltage", "/Dc/0/Current", "/Dc/0/Power",
-                      "/Motor/RPM", "/Motor/Direction", "/Motor/Temperature",
-                      "/Controller/Temperature", "/Coolant/Temperature"):
-                svc[p] = None
-            if c.publish_extra:
-                for p in ("/EDrive/TorqueNm", "/EDrive/TorquePercent",
-                          "/EDrive/ThrottlePercent", "/EDrive/PhaseCurrentRms",
-                          "/EDrive/PhaseCurrentPeak", "/EDrive/MechanicalPower",
-                          "/EDrive/MosfetTemperature", "/EDrive/Running",
-                          "/EDrive/StatusByte"):
-                    svc[p] = None
-            return
+            if not fresh:
+                for p in ("/Dc/0/Voltage", "/Dc/0/Current", "/Dc/0/Power",
+                          "/Motor/RPM", "/Motor/Direction", "/Motor/Temperature",
+                          "/Controller/Temperature", "/Coolant/Temperature"):
+                    s[p] = None
+                if c.publish_extra:
+                    for p in ("/EDrive/TorqueNm", "/EDrive/TorquePercent",
+                              "/EDrive/ThrottlePercent", "/EDrive/PhaseCurrentRms",
+                              "/EDrive/PhaseCurrentPeak", "/EDrive/MechanicalPower",
+                              "/EDrive/MosfetTemperature", "/EDrive/Running",
+                              "/EDrive/StatusByte"):
+                        s[p] = None
+                return
 
-        # clamp the tiny signed float noise around standstill so VRM never
-        # shows -1 rpm on a drive that is not turning
-        if d.rpm is not None:
-            svc["/Motor/RPM"] = 0 if abs(d.rpm) < c.rpm_deadband else int(round(d.rpm))
-        svc["/Dc/0/Voltage"] = None if d.voltage is None else round(d.voltage, 2)
+            # clamp the tiny signed float noise around standstill so VRM never
+            # shows -1 rpm on a drive that is not turning; the clamped values
+            # feed everything derived below, so a stopped drive is exactly 0
+            rpm = d.rpm
+            if rpm is not None and abs(rpm) < c.rpm_deadband:
+                rpm = 0
+            torque = d.torque
+            if torque is not None and abs(torque) < c.torque_deadband:
+                torque = 0.0
+            if rpm is not None:
+                s["/Motor/RPM"] = int(round(rpm))
+            s["/Dc/0/Voltage"] = _q(d.voltage, c.voltage_step)
 
-        # Prefer the measured DC current from 61452. Fall back to mechanical
-        # power / V (ignores drive losses, so a few % optimistic) when the HCU
-        # frame is missing.
-        amps = d.dc_current
-        if amps is None and d.torque is not None and d.rpm is not None \
-                and d.voltage is not None and d.voltage > 1:
-            amps = (d.torque * d.rpm * math.pi / 30) / d.voltage
-        svc["/Dc/0/Current"] = None if amps is None else round(amps, 2)
-        if amps is not None and d.voltage is not None and d.voltage > 1:
-            svc["/Dc/0/Power"] = round(d.voltage * amps)
-        else:
-            svc["/Dc/0/Power"] = None
+            # Prefer the measured DC current from 61452. Fall back to
+            # mechanical power / V (ignores drive losses, so a few % optimistic)
+            # when the HCU frame is missing.
+            amps = d.dc_current
+            if amps is None and torque is not None and rpm is not None \
+                    and d.voltage is not None and d.voltage > 1:
+                amps = (torque * rpm * math.pi / 30) / d.voltage
+            if amps is not None and abs(amps) < c.current_deadband:
+                amps = 0.0
+            s["/Dc/0/Current"] = _q(amps, c.current_step)
+            if amps is not None and d.voltage is not None and d.voltage > 1:
+                s["/Dc/0/Power"] = _q(d.voltage * amps, c.power_step)
+            else:
+                s["/Dc/0/Power"] = None
 
-        # Three sensors, three paths. Prefer the 0x28x floats over the 1 °C
-        # 61453 words wherever both carry the same sensor.
-        t_motor = d.motor_temp if d.motor_temp is not None else d.drive_temp_1c
-        t_mosfet = d.mosfet_temp if d.mosfet_temp is not None else d.mosfet_temp_1c
-        svc["/Motor/Temperature"] = None if t_motor is None else round(t_motor, 1)
-        svc["/Controller/Temperature"] = (None if d.mcu_temp is None
-                                          else round(d.mcu_temp, 1))
-        svc["/Coolant/Temperature"] = None if t_mosfet is None else round(t_mosfet, 1)
-        svc["/Motor/Direction"] = d.direction
+            # Three sensors, three paths. Prefer the 0x28x floats over the 1 °C
+            # 61453 words wherever both carry the same sensor.
+            t_motor = d.motor_temp if d.motor_temp is not None else d.drive_temp_1c
+            t_mosfet = (d.mosfet_temp if d.mosfet_temp is not None
+                        else d.mosfet_temp_1c)
+            s["/Motor/Temperature"] = _q(t_motor, c.temperature_step)
+            s["/Controller/Temperature"] = _q(d.mcu_temp, c.temperature_step)
+            s["/Coolant/Temperature"] = _q(t_mosfet, c.temperature_step)
+            s["/Motor/Direction"] = d.direction
 
-        if not c.publish_extra:
-            return
-        svc["/EDrive/TorqueNm"] = None if d.torque is None else round(d.torque, 2)
-        svc["/EDrive/TorquePercent"] = d.torque_pct
-        svc["/EDrive/ThrottlePercent"] = (None if d.throttle is None
-                                          else round(d.throttle, 2))
-        svc["/EDrive/PhaseCurrentRms"] = (None if d.phase_irms is None
-                                          else round(d.phase_irms, 1))
-        svc["/EDrive/PhaseCurrentPeak"] = (None if d.phase_ipk is None
-                                           else round(d.phase_ipk, 1))
-        svc["/EDrive/MechanicalPower"] = (
-            None if d.torque is None or d.rpm is None
-            else int(round(d.torque * d.rpm * math.pi / 30)))
-        svc["/EDrive/MosfetTemperature"] = (None if t_mosfet is None
-                                            else round(t_mosfet, 1))
-        svc["/EDrive/Running"] = (None if d.status is None
-                                  else int(d.status == STATUS_RUNNING))
-        svc["/EDrive/StatusByte"] = d.status
-
+            if not c.publish_extra:
+                return
+            irms, ipk = d.phase_irms, d.phase_ipk
+            if irms is not None and abs(irms) < c.current_deadband:
+                irms = 0.0
+            if ipk is not None and abs(ipk) < c.current_deadband:
+                ipk = 0.0
+            s["/EDrive/TorqueNm"] = _q(torque, c.torque_step)
+            s["/EDrive/TorquePercent"] = d.torque_pct
+            s["/EDrive/ThrottlePercent"] = _q(d.throttle, c.throttle_step)
+            s["/EDrive/PhaseCurrentRms"] = _q(irms, c.phase_current_step)
+            s["/EDrive/PhaseCurrentPeak"] = _q(ipk, c.phase_current_step)
+            s["/EDrive/MechanicalPower"] = (
+                None if torque is None or rpm is None
+                else _q(torque * rpm * math.pi / 30, c.power_step))
+            s["/EDrive/MosfetTemperature"] = _q(t_mosfet, c.temperature_step)
+            s["/EDrive/Running"] = (None if d.status is None
+                                    else int(d.status == STATUS_RUNNING))
+            s["/EDrive/StatusByte"] = d.status
 
 def main():
     cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")

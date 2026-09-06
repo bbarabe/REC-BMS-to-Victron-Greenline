@@ -30,6 +30,11 @@ What it does (see README.md "Solar Priority driver"):
     it), shore is left as soon as the gates allow, and the loads drain the
     bank day and night while solar covers what it can. Ends within
     ONEWAY_EXIT_PCT of the target; the normal engine finishes the last bit.
+    Two limits (4.5): a target at or above ONEWAY_FULL_PCT (100 %) means a
+    full charge from every charger at its maximum, so one-way charge stays
+    off; and the floor is only asked for while the Quattro is actually on
+    shore (ActiveInput = the shore input) -- with no AC available the
+    Quattro inverts regardless, and a floor would only throttle solar.
 
 Differences from the flow (all deliberate):
   - inputs come from a velib DbusMonitor (signal-driven cache). Values stay
@@ -64,8 +69,8 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.1.0"
-ENGINE_VERSION = "4.3"
+VERSION = "1.4.0"
+ENGINE_VERSION = "4.5"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-solarpriority")
@@ -120,6 +125,25 @@ ENGINE_DEFAULTS = {
     # one-way charge / discharge (4.3): engage when the Max Charge target is
     # further than ENTER from the SOC, stand down within EXIT of it. 0 = off.
     "ONEWAY_ENTER_PCT": 5, "ONEWAY_EXIT_PCT": 1,
+    # pre-probe checks (4.4), from the evening of 2026-09-01 in Home
+    # Assistant: five probes on model estimates of 374-1381 W while every
+    # unthrottled reading after 17:42 was 86-296 W; the arrays' balance
+    # against their rated shares was 0.06-0.35 whenever the flybridge was
+    # obstructed and 0.68-0.75 when it was not; three probes ended on the
+    # load rising past the 60 s average.
+    "CAP_TRUMPS_MDL_MS": 900000, "SHADE_BALANCE_MIN": 0.4, "LOAD_SLOW_MS": 300000,
+    # one-way charge: how much deficit solar may run before shore is
+    # reconnected. Measured 2026-09-02: the 4.2 rule (-50 W over 90 s) left
+    # solar over a one-minute -51 W dip, and every reconnect made the
+    # Quattro re-absorb at 0.6-2 kW for ten-plus minutes (>100 Wh of shore
+    # into the bank) -- far more than the dip. On a bank this size a small
+    # deficit is nothing; a reconnect is not.
+    "ONEWAY_DEFICIT_W": 200, "ONEWAY_DEFICIT_MS": 600000,
+    # 4.5: a target at or above this is a request for a FULL charge from
+    # every charger at its maximum, so one-way charge never engages there
+    # (2026-09-06: at 100 % the floor held the Quattro at the present SOC
+    # and only solar could move the bank -- it could never get full). 0 = off.
+    "ONEWAY_FULL_PCT": 100,
 }
 
 
@@ -151,6 +175,10 @@ class Config:
         self.battery_instance = int(i.get("battery_instance", 200))
         self.ac_in = int(i.get("shore_ac_input", 1))     # 1 or 2
         self.tick_ms = int(i.get("tick_ms", 1000))
+        # EstimateW / NeedW are published in steps of this many watts, and a
+        # tick's changes go out as one ItemsChanged (2026-09-05: at 0.1 W
+        # these two were a bus signal a second each for nothing).
+        self.power_step = float(i.get("power_step", 5))
 
         e = cp["engine"] if cp.has_section("engine") else {}
         self.engine = {}
@@ -173,10 +201,10 @@ class Val:
 
 class Inputs:
     """What the engine sees each tick. All Val or None (missing)."""
-    FIELDS = ("soc", "batt", "load_now", "load_avg", "feed", "ac_out",
+    FIELDS = ("soc", "batt", "load_now", "load_avg", "load_slow", "feed", "ac_out",
               "voc6", "voc7", "y6", "y7", "m6", "m7", "batt_v", "cvl",
               "boost_active", "boost_window", "boost_eff", "lead",
-              "target_soc", "sustain_active")
+              "target_soc", "sustain_active", "dc_load")
 
     def __init__(self):
         for f in self.FIELDS:
@@ -214,7 +242,7 @@ def fresh_state(now, t):
         "refillReady": None, "refillShoreFed": False, "harvestSince": 0,
         "suspendTrigStart": 0, "suspendStart": 0, "suspendBase": 0,
         "resumeStart": 0, "suspendPrev": None,
-        "battWin": [], "mdl6": None, "mdl7": None, "vocRef": None,
+        "battWin": [], "battWinLong": [], "mdl6": None, "mdl7": None, "vocRef": None,
         "lastBoostTs": 0, "lockoutUntil": 0,
         "oneway": None, "sustainSent": 0, "sustainAssert": 0,
     }
@@ -284,6 +312,18 @@ class Engine:
         battMean = None
         if len(st["battWin"]) >= 5:
             battMean = sum(w for _, w in st["battWin"]) / len(st["battWin"])
+        # 4.4: the long mean for one-way charge (cleared on entering solar,
+        # so it never carries the shore stint's charging)
+        if batt is not None:
+            bl = st["battWinLong"]
+            bl.append((now, batt.v))
+            while bl and bl[0][0] < now - t["ONEWAY_DEFICIT_MS"]:
+                bl.pop(0)
+            if len(bl) > 900:
+                del bl[:len(bl) - 900]
+        battMeanLong = None
+        if len(st["battWinLong"]) >= 60:
+            battMeanLong = sum(w for _, w in st["battWinLong"]) / len(st["battWinLong"])
 
         # ---- Capacity capture ----
         def capture(cap, mode, yld):
@@ -363,9 +403,27 @@ class Engine:
         capSum = faded(st["cap6"]) + faded(st["cap7"])
         vocMax = max(voc6.v if voc6 else 0, voc7.v if voc7 else 0)
         dayOk = (m6 is not None and m6.v > 0) or (m7 is not None and m7.v > 0)
-        evidence = (max(faded(st["cap6"]), me6["w"] if me6 else 0) +
-                    max(faded(st["cap7"]), me7["w"] if me7 else 0))
+        # 4.4: an unthrottled reading IS the capacity. While one is younger
+        # than CAP_TRUMPS_MDL_MS the model may not outbid it -- the model's
+        # job is to estimate while throttled, not to argue with a measurement.
+        def evid(cap, me):
+            c = faded(cap)
+            if cap is not None and (now - cap["ts"]) <= t["CAP_TRUMPS_MDL_MS"]:
+                return c
+            return max(c, me["w"] if me else 0)
+        evidence = evid(st["cap6"], me6) + evid(st["cap7"], me7)
         est = min(pRated, max(pvNow, evidence)) if (dayOk and vocMax >= t["VOC_DAY_V"]) else 0.0
+        # 4.4: array balance. Both chargers get the same voltage, so
+        # throttling and sun angle move them together (within their tilt);
+        # an obstruction on one string does not. Judged on fresh unthrottled
+        # captures against the rated shares; None when there is no fresh pair.
+        balance = None
+        c6, c7 = st["cap6"], st["cap7"]
+        if (c6 is not None and c7 is not None and (now - c6["ts"]) <= t["CAP_FRESH_MS"]
+                and (now - c7["ts"]) <= t["CAP_FRESH_MS"]):
+            p6, p7 = c6["w"] / t["MDL_SHARE6"], c7["w"] / t["MDL_SHARE7"]
+            balance = (min(p6, p7) / max(p6, p7)) if max(p6, p7) > 0 else None
+        shaded = balance is not None and balance < t["SHADE_BALANCE_MIN"]
         if st["vocRef"] is None or now - st["vocRef"]["ts"] >= t["MDL_VOC_TAU_MS"]:
             st["vocRef"] = {"v": vocMax, "ts": now}
         vocRising = vocMax > st["vocRef"]["v"] + t["VOC_RISE_V"]
@@ -458,6 +516,7 @@ class Engine:
         def enter_solar(reason):
             st["state"] = "solar"
             st["desired"] = 1
+            st["battWinLong"] = []
             st["socEntry"] = soc.v
             st["solarSince"] = now
             st["lastTransition"] = now
@@ -507,7 +566,12 @@ class Engine:
         # the charging; or nothing charges and the loads do the draining.
         tgt = inp.target_soc
         oneway = st["oneway"]
-        if not enabled or missing or tgt is None:
+        # 4.5: at (or above) ONEWAY_FULL_PCT the slider asks for a full
+        # charge from everything -- the Quattro at its full CVL too, not a
+        # floor -- so the feature stands aside.
+        full = (tgt is not None and t["ONEWAY_FULL_PCT"] > 0
+                and tgt.v >= t["ONEWAY_FULL_PCT"])
+        if not enabled or missing or tgt is None or full:
             oneway = None
         else:
             delta = tgt.v - soc.v
@@ -534,6 +598,8 @@ class Engine:
                     why = "no data: " + ",".join(missing)
                 elif tgt is None:
                     why = "no Max Charge target"
+                elif full:
+                    why = "target %.0f%% is a full charge: every charger at its maximum" % tgt.v
                 else:
                     why = "SOC %.1f%% at target %.0f%%" % (soc.v, tgt.v)
                 self.log("ONE-WAY %s done (%s); normal engine resumes" % (st["oneway"], why))
@@ -564,7 +630,17 @@ class Engine:
         else:
             discharge = -batt.v
             sinceTrans = now - st["lastTransition"]
-            needW = max(t["MIN_EST_W"], loadAvg.v * t["SOLAR_MARGIN"])
+            loadSlow = inp.load_slow
+            loadJudge = max(loadAvg.v, loadSlow.v) if loadSlow is not None else loadAvg.v
+            needW = max(t["MIN_EST_W"], loadJudge * t["SOLAR_MARGIN"])
+            # 4.4: "charger quiet" must mean the QUATTRO is quiet. Battery
+            # power alone cannot tell shore charging from solar filling the
+            # lead band, and under a one-way floor that band is wide enough
+            # for solar to keep the bank at +250 W for hours -- which held the
+            # engine on shore in full sun (2026-09-02 10:08). The Quattro's
+            # DC output is battery power plus DC loads minus PV.
+            dcLoad = inp.dc_load.v if inp.dc_load is not None else 0.0
+            quattroW = batt.v + max(0.0, dcLoad) - pvNow
 
             if st["state"] == "shore":
                 shoreMissing = (feed.v == 240 and sinceTrans > t["FEEDBACK_GRACE_MS"])
@@ -600,7 +676,7 @@ class Engine:
                     # (the sustain ceiling makes it so). Solar need not cover
                     # the load -- the deficit IS the plan.
                     ready = (not shoreMissing and soc.v >= t["MIN_SOC"]
-                             and batt.v <= t["SURPLUS_QUIET_W"])
+                             and quattroW <= t["SURPLUS_QUIET_W"])
                 else:
                     # Charging one-way: aboveCvl is judged against the
                     # sustain CVL (pinned at the SOC), which a freshly
@@ -608,8 +684,8 @@ class Engine:
                     # the real target once sustain is released, so it is no
                     # reason to wait.
                     ready = (not shoreMissing and (not aboveCvl or owc)
-                             and soc.v >= t["MIN_SOC"]
-                             and batt.v <= t["SURPLUS_QUIET_W"] and (est >= needW or explore))
+                             and soc.v >= t["MIN_SOC"] and not shaded
+                             and quattroW <= t["SURPLUS_QUIET_W"] and (est >= needW or explore))
                 if ready:
                     if not st["readySince"]:
                         st["readySince"] = now
@@ -634,7 +710,7 @@ class Engine:
                 # dbus-recbms would refuse it under a sustain ceiling anyway.
                 if (not boosting and dayOk and vocMax >= t["VOC_DAY_V"] and not vocRising
                         and not aboveCvl and not shoreMissing and soc.v >= t["MIN_SOC"]
-                        and batt.v <= t["SURPLUS_QUIET_W"] and not owd
+                        and quattroW <= t["SURPLUS_QUIET_W"] and not owd
                         and (now - st["lastBoostTs"]) >=
                         (t["BOOST_RETRY_MS"] if capSum <= 0 else t["BOOST_INTERVAL_MS"])):
                     st["lastBoostTs"] = now
@@ -651,7 +727,12 @@ class Engine:
                     enter_solar("one-way discharge %.1f%% -> %.0f%%" % (soc.v, tgt.v))
                 elif ready and gateOk and (now - st["readySince"]) >= t["READY_MS"]:
                     enter_probe(("est %.0fW" % est if est >= needW else "exploratory") +
-                                " vs load %.0fW" % loadAvg.v)
+                                " vs load %.0fW need %.0fW" % (loadJudge, needW) +
+                                " | cap %.0f+%.0f mdl %.0f+%.0f PV %.0fW Voc %.0fV mode %s/%s bal %s" % (
+                                    faded(st["cap6"]), faded(st["cap7"]),
+                                    me6["w"] if me6 else 0, me7["w"] if me7 else 0, pvNow, vocMax,
+                                    int(m6.v) if m6 else "-", int(m7.v) if m7 else "-",
+                                    "%.2f" % balance if balance is not None else "-"))
                 elif harvest and sinceTrans >= t["COOLDOWN_MS"] and (now - st["harvestSince"]) >= t["READY_MS"]:
                     enter_burndown("harvest: band full at %.2fV" % battV.v, True)
                 elif surplus:
@@ -679,11 +760,13 @@ class Engine:
                     if plantConf is not None and plantConf < needW:
                         s += " (dim)"
                     if batt.v > t["SURPLUS_QUIET_W"]:
-                        s += " [chg +%.0fW]" % batt.v
+                        s += " [chg +%.0fW%s]" % (batt.v, "" if quattroW > t["SURPLUS_QUIET_W"] else " solar")
                     if harvestArmed:
                         s += " [hv-armed]" if leadOn else " [hv-off: no lead]"
                     if leadFault:
                         s += " [LEAD FAULT]"
+                    if balance is not None:
+                        s += " bal %.2f" % balance + (" [SHADE]" if shaded else "")
                     s += " Voc %.0fV SOC %.0f%%" % (vocMax, soc.v)
                     if now < st["lockoutUntil"]:
                         s += " [LOCKOUT %dm]" % math.ceil((st["lockoutUntil"] - now) / 60000)
@@ -697,14 +780,19 @@ class Engine:
 
             elif st["state"] == "probe":
                 elapsed = now - st["probeStart"]
-                if loadAvg.v * t["SOLAR_MARGIN"] > st["probeEst"] or loadNow.v > st["probeEst"] * 1.5:
+                bigLoad = loadNow.v > st["probeEst"] * 1.5
+                if not owc:
+                    bigLoad = bigLoad or loadAvg.v * t["SOLAR_MARGIN"] > st["probeEst"]
+                if bigLoad:
                     if not st["surgeStart"]:
                         st["surgeStart"] = now
                 else:
                     st["surgeStart"] = 0
 
                 if st["surgeStart"] and now - st["surgeStart"] >= t["SURGE_MS"]:
-                    toShore("big load during probe (%.0fW)" % loadNow.v)
+                    toShore("big load during probe (%.0fW, avg %.0fW vs est %.0fW) | PV %.0fW bal %s" % (
+                        loadNow.v, loadAvg.v, st["probeEst"], pvNow,
+                        "%.2f" % balance if balance is not None else "-"))
                     status[0] = "blue"
                 elif (elapsed >= t["WAKE_MS"] and pvNow < 10
                       and not (m6 and m6.v == 2) and not (m7 and m7.v == 2)):
@@ -727,11 +815,13 @@ class Engine:
                         lockout()
                         toShore("FAULT: AC control ineffective")
                         status[0] = "red"
-                    elif battAvg > -t["DISCHARGE_TOL_W"]:
+                    elif battAvg > -(t["ONEWAY_DEFICIT_W"] if owc else t["DISCHARGE_TOL_W"]):
                         enter_solar("PV %.0fW, batt %.0fW" % (pvAvg, battAvg))
                     else:
                         escalateBackoff()
-                        toShore("probe failed: PV %.0fW, batt %.0fW" % (pvAvg, battAvg))
+                        toShore("probe failed: PV %.0fW, batt %.0fW | y %.0f+%.0f Voc %.0fV bal %s" % (
+                            pvAvg, battAvg, y6.v if y6 else 0, y7.v if y7 else 0, vocMax,
+                            "%.2f" % balance if balance is not None else "-"))
                         status[0] = "blue"
 
             elif st["state"] == "burndown":
@@ -827,13 +917,21 @@ class Engine:
                 draining = battV is not None and effCvl is not None and battV.v > effCvl + 0.01
                 settling = draining or (now - st["solarSince"]) < t["SOLAR_SETTLE_MS"]
 
-                dischargeAvg = -battMean if battMean is not None else discharge
-                if dischargeAvg > t["DISCHARGE_TOL_W"] and not settling:
+                if owc:
+                    # one-way charge: the ten-minute mean against the
+                    # one-way tolerance; a surge alone never ends it
+                    # (heater-class loads still suspend)
+                    tol = t["ONEWAY_DEFICIT_W"]
+                    dischargeAvg = -battMeanLong if battMeanLong is not None else -float(t["ONEWAY_DEFICIT_W"])
+                else:
+                    tol = t["DISCHARGE_TOL_W"]
+                    dischargeAvg = -battMean if battMean is not None else discharge
+                if dischargeAvg > tol and not settling:
                     if not st["loadExceedStart"]:
                         st["loadExceedStart"] = now
                 else:
                     st["loadExceedStart"] = 0
-                if discharge > t["SURGE_W"] and not draining:
+                if discharge > t["SURGE_W"] and not draining and not owc:
                     if not st["surgeStart"]:
                         st["surgeStart"] = now
                 else:
@@ -917,8 +1015,15 @@ class Engine:
         # is connected (shore, suspend) -- solar must be free to charge the
         # rest of the time. Discharging, it is a ceiling the whole time.
         # Re-asserted every ASSERT_MS: dbus-recbms expires it on its own.
+        # 4.5: "connected" means the Quattro reports the shore input as its
+        # active input, not merely that the engine asked for it. With no AC
+        # available (2026-09-06: a 1 kW load on solar, no shore power) the
+        # Quattro keeps inverting whatever it is told, and a floor then does
+        # nothing but pin the CVL at the present SOC and stop solar charging.
+        onShore = feed is not None and feed.v == FEED_SHORE
         if owc:
-            want = SUSTAIN_FLOOR if st["state"] in ("shore", "suspend") else SUSTAIN_OFF
+            want = (SUSTAIN_FLOOR if st["state"] in ("shore", "suspend") and onShore
+                    else SUSTAIN_OFF)
         elif owd:
             want = SUSTAIN_CEILING
         else:
@@ -953,6 +1058,20 @@ def shared_bus():
     return dbus.SystemBus()
 
 
+def _q(value, step):
+    """Round to the nearest multiple of `step`; None passes through.
+
+    Integer steps give ints, fractional ones a float rounded to the step's
+    own number of decimals so 0.1 never comes back as 0.30000000000000004.
+    """
+    if value is None:
+        return None
+    n = round(value / step) * step
+    if float(step).is_integer():
+        return int(round(n))
+    return round(n, max(0, -int(math.floor(math.log10(step)))))
+
+
 def new_service(name, bus):
     import inspect
     if "register" in inspect.signature(VeDbusService.__init__).parameters:
@@ -982,6 +1101,7 @@ INPUT_MAP = {
     ("system", "/Dc/Battery/Soc"):        ("soc", _rng(0, 100)),
     ("system", "/Dc/Battery/Power"):      ("batt", lambda v: abs(v) <= 30000),
     ("system", "/Dc/Battery/Voltage"):    ("batt_v", _rng(20, 80)),
+    ("system", "/Dc/System/Power"):       ("dc_load", _rng(-5000, 5000)),
     ("vebus", "/Ac/ActiveIn/ActiveInput"): ("feed", lambda v: True),
     ("vebus", "/Ac/Out/L1/P"):            ("ac_out", _rng(-20000, 20000)),
     ("battery", "/RecBms/TargetChargeVoltage"): ("cvl", _rng(20, 80)),
@@ -1009,6 +1129,7 @@ class SolarPriorityDriver:
         self.inp.feed_shore = 0 if cfg.ac_in == 1 else 1
         self.ignore_path = "/Ac/Control/IgnoreAcIn%d" % cfg.ac_in
         self.load_window = []
+        self.load_window_slow = []
         self.last_status = None
         self.engine = Engine(cfg.engine, self._ms(), logger=self._engine_log)
         self.sbus = shared_bus()
@@ -1286,6 +1407,15 @@ class SolarPriorityDriver:
             if len(w) > 300:
                 del w[:len(w) - 300]
             self.inp.load_avg = Val(sum(x for _, x in w) / len(w), now)
+            # 4.4: a slower running average for the pre-probe need
+            ws = self.load_window_slow
+            ws.append((now, v))
+            cutoff = now - self.cfg.engine["LOAD_SLOW_MS"]
+            while ws and ws[0][0] < cutoff:
+                ws.pop(0)
+            if len(ws) > 1500:
+                del ws[:len(ws) - 1500]
+            self.inp.load_slow = Val(sum(x for _, x in ws) / len(ws), now)
 
     def _store_fault(self, service, value):
         if self.monitor.get_device_instance(service) != self.cfg.battery_instance:
@@ -1321,25 +1451,36 @@ class SolarPriorityDriver:
         for (c2, path) in INPUT_MAP:
             if c2 == cls:
                 self._store(service, path, self.monitor.get_value(service, path), now)
+        if cls == "battery" and instance == self.cfg.battery_instance:
+            # A restarted dbus-recbms comes up on the plain slider: re-assert
+            # the sustain on the next tick rather than at the 30 s cycle.
+            self.engine.st["sustainSent"] = None
 
     def _device_removed(self, service, instance):
         log.warning("service vanished: %s (instance %s)", service, instance)
         # Values stay last-known-good; the heartbeat check takes it from here.
 
     # -------------------------------------------------------------- outputs
-    def _write(self, cls, instance, path, value, what):
+    def _write(self, cls, instance, path, value, what, on_error=None):
         name = self._svc(cls, instance)
         if name is None:
             log.warning("%s: no %s service with instance %d", what, cls, instance)
             return False
+
+        def failed(e):
+            log.warning("%s: write %s%s failed: %s", what, name, path, e)
+            if on_error is not None:
+                on_error(e)
         try:
-            self.monitor.set_value_async(
-                name, path, value,
-                error_handler=lambda e: log.warning("%s: write %s%s failed: %s", what, name, path, e))
+            self.monitor.set_value_async(name, path, value, error_handler=failed)
             return True
         except Exception as e:
             log.warning("%s: write %s%s failed: %s", what, name, path, e)
             return False
+
+    def _sustain_failed(self, e):
+        # dbus-recbms refused or is absent: ask again next tick, not in 30 s
+        self.engine.st["sustainSent"] = None
 
     def _safe_start(self):
         self._write("vebus", self.cfg.vebus_instance, self.ignore_path, 0, "safe start")
@@ -1354,9 +1495,13 @@ class SolarPriorityDriver:
             b = self._svc("battery", self.cfg.battery_instance)
             if b:
                 self.monitor.set_value(b, "/RecBms/SolarBoost/Request", 0.0)
-                if self.engine.st.get("sustainSent"):
-                    self.monitor.set_value(b, "/RecBms/Sustain/Request", 0)
-            log.info("shutdown: IgnoreAcIn%d=0, boost and sustain released", self.cfg.ac_in)
+            # The sustain hold is deliberately NOT released here: it expires
+            # in dbus-recbms on its own (120 s) if we really die, and a
+            # planned restart re-asserts it within seconds. Releasing it put
+            # the full slider CVL on the Quattro for the restart gap, and it
+            # answered with a 1.4 kW re-absorb burst (seen 2026-09-02).
+            log.info("shutdown: IgnoreAcIn%d=0, boost released (sustain left to expire)",
+                     self.cfg.ac_in)
         except Exception as e:
             log.warning("shutdown write failed: %s", e)
 
@@ -1382,29 +1527,33 @@ class SolarPriorityDriver:
         # sustain before boost: a probe releases the hold and asks for a
         # boost in the same tick, and the boost is gated on the target
         if out.sustain is not None:
-            self._write("battery", self.cfg.battery_instance, "/RecBms/Sustain/Request",
-                        int(out.sustain), "sustain")
+            if not self._write("battery", self.cfg.battery_instance, "/RecBms/Sustain/Request",
+                               int(out.sustain), "sustain", on_error=self._sustain_failed):
+                self._sustain_failed(None)
         if out.boost is not None:
             self._write("battery", self.cfg.battery_instance, "/RecBms/SolarBoost/Request",
                         float(out.boost), "boost")
         if out.transition:
             log.info("%s", out.transition)
-            self.sw["/SolarPriority/LastTransition"] = out.transition
-            self.sw["/SolarPriority/LastTransitionTime"] = int(now / 1000)
 
-        s = self.sw
-        s["/SolarPriority/State"] = out.state
-        if out.status_text != self.last_status:
-            s["/SolarPriority/Status"] = out.status_text
-            self.last_status = out.status_text
-        s["/SolarPriority/StatusFill"] = out.status_fill
-        s["/SolarPriority/EstimateW"] = round(out.est, 1)
-        s["/SolarPriority/NeedW"] = round(out.need_w, 1)
-        s["/SolarPriority/Desired"] = int(self.engine.st["desired"])
-        s["/SolarPriority/OneWay"] = out.oneway
-        s["/SolarPriority/TargetSoc"] = self.inp.target_soc.v if self.inp.target_soc else None
-        s["/SolarPriority/Sustain"] = int(self.engine.st["sustainSent"] or 0)
-        s["/SwitchableOutput/output_1/State"] = 1 if self.inp.enabled else 0
+        # one ItemsChanged per tick, carrying only what moved
+        with self.sw as s:
+            if out.transition:
+                s["/SolarPriority/LastTransition"] = out.transition
+                s["/SolarPriority/LastTransitionTime"] = int(now / 1000)
+            s["/SolarPriority/State"] = out.state
+            if out.status_text != self.last_status:
+                s["/SolarPriority/Status"] = out.status_text
+                self.last_status = out.status_text
+            s["/SolarPriority/StatusFill"] = out.status_fill
+            s["/SolarPriority/EstimateW"] = _q(out.est, self.cfg.power_step)
+            s["/SolarPriority/NeedW"] = _q(out.need_w, self.cfg.power_step)
+            s["/SolarPriority/Desired"] = int(self.engine.st["desired"])
+            s["/SolarPriority/OneWay"] = out.oneway
+            s["/SolarPriority/TargetSoc"] = (self.inp.target_soc.v
+                                             if self.inp.target_soc else None)
+            s["/SolarPriority/Sustain"] = int(self.engine.st["sustainSent"] or 0)
+            s["/SwitchableOutput/output_1/State"] = 1 if self.inp.enabled else 0
         return True
 
 

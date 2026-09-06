@@ -42,6 +42,7 @@ import configparser
 import glob
 import json
 import logging
+import math
 import os
 import platform
 import socket
@@ -53,7 +54,7 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 BUSITEM = "com.victronenergy.BusItem"
 SETTINGS_SVC = "com.victronenergy.settings"
 SETTINGS_IF = "com.victronenergy.Settings"
@@ -212,6 +213,20 @@ class FastPacket:
 # ============================================================================
 # Config
 # ============================================================================
+def _q(value, step):
+    """Round to the nearest multiple of `step`; None passes through.
+
+    Integer steps give ints, fractional ones a float rounded to the step's
+    own number of decimals so 0.1 never comes back as 0.30000000000000004.
+    """
+    if value is None:
+        return None
+    n = round(value / step) * step
+    if float(step).is_integer():
+        return int(round(n))
+    return round(n, max(0, -int(math.floor(math.log10(step)))))
+
+
 def _kv_map(raw, cast=str):
     """'bat1: House, alt0: Port Engine' -> {'bat1': 'House', ...}.
 
@@ -257,6 +272,17 @@ class Config:
 
         p = cp["publish"] if cp.has_section("publish") else {}
         self.publish_ms = int(p.get("rate_ms", 1000))
+        # Quantisation steps: a value only goes on D-Bus when it moves to a
+        # different step, and a tick's changes go out as ONE ItemsChanged per
+        # service. Sender resolution is 0.01 V / 0.1 A, and at 1 Hz that
+        # jitter was a bus signal per path per second (2026-09-05).
+        self.voltage_step = float(p.get("voltage_step", 0.05))
+        self.current_step = float(p.get("current_step", 0.2))
+        self.power_step = float(p.get("power_step", 5))
+        self.temperature_step = float(p.get("temperature_step", 0.5))
+        # /Sources/<key>/Age changes every second by definition; refreshing
+        # it every tick was six bus signals a second for nothing.
+        self.age_refresh_s = float(p.get("age_refresh_s", 10))
         self.stale_after_s = float(p.get("stale_after_s", 10))
         self.unpublish_after_s = float(p.get("unpublish_after_s", 300))
         self.product_name = p.get("product_name", "N2K battery")
@@ -447,20 +473,25 @@ class Source:
         return None if not self.last_seen else round(time.time() - self.last_seen, 1)
 
     def describe(self):
-        """The stable half of the catalog — no timestamps, so it can be
-        persisted to localsettings without a write every second."""
+        """The stable half of the catalog — nothing that moves on its own, so
+        it can be persisted to localsettings without a write every second.
+
+        Source address and published state are deliberately NOT here: they
+        live on /Sources/<key>/SourceAddress and /Published. Two senders
+        sharing a battery instance flip the address on every frame, and with
+        it in the blob that was a localsettings write, a PropertiesChanged and
+        a full settings reconcile most seconds (2026-09-05).
+        """
         return {
             "key": self.key,
             "kind": self.kind,
             "n2k": self.n2k_instance,
-            "src": self.src_addr,
             "fields": sorted(self.fields),
             "enabled": 1 if self.enabled else 0,
             "instance": self.instance,
             "name": self.name,
             "suffix": self.suffix,
             "capacity": self.capacity,
-            "published": 1 if self.svc is not None else 0,
         }
 
 
@@ -481,6 +512,7 @@ class BatteryDriver:
         self._sock = None
         self._watch = None
         self._catalog_json = None
+        self._age_written = 0.0
         self._cap_logged = False
 
         Source.stale_after_s = cfg.stale_after_s
@@ -744,8 +776,11 @@ class BatteryDriver:
         prefix = "/Settings/%s/" % self.cfg.settings_group
 
         def handler(_changes, path=None, **_kw):
-            if path and str(path).startswith(prefix):
-                GLib.idle_add(self._reconcile_once)
+            if not path or not str(path).startswith(prefix):
+                return
+            if str(path).endswith("/Catalog"):
+                return          # our own write; reconciling on it is a loop
+            GLib.idle_add(self._reconcile_once)
 
         try:
             self.sbus.add_signal_receiver(
@@ -1011,55 +1046,58 @@ class BatteryDriver:
         return True
 
     def _publish(self, s, force=False):
+        """One ItemsChanged per battery per tick, carrying only what moved."""
         if s.svc is None:
             return
+        c = self.cfg
         fresh = s.fresh
-        if s.connected != fresh or force:
-            if s.connected and not fresh:
-                log.warning("%s: no N2K data for %.0fs — disconnected",
-                            s.key, time.time() - s.last_seen)
-                s.forget()
-            s.connected = fresh
-            s.svc["/Connected"] = 1 if fresh else 0
+        with s.svc as svc:
+            if s.connected != fresh or force:
+                if s.connected and not fresh:
+                    log.warning("%s: no N2K data for %.0fs — disconnected",
+                                s.key, time.time() - s.last_seen)
+                    s.forget()
+                s.connected = fresh
+                svc["/Connected"] = 1 if fresh else 0
 
-        # Installed capacity is configuration, not a measurement: it stays
-        # visible while the battery is offline, and it must track a change made
-        # through the settings without waiting for the source to come back.
-        installed = s.capacity or None
-        if "/InstalledCapacity" in s.paths:
-            s.svc["/InstalledCapacity"] = installed
+            # Installed capacity is configuration, not a measurement: it stays
+            # visible while the battery is offline, and it must track a change
+            # made through the settings without waiting for the source to come
+            # back.
+            installed = s.capacity or None
+            if "/InstalledCapacity" in s.paths:
+                svc["/InstalledCapacity"] = installed
 
-        if not fresh:
-            # blank rather than freeze: a stale voltage on a start battery
-            # reads exactly like a healthy one
-            for p in ("/Dc/0/Voltage", "/Dc/0/Current", "/Dc/0/Power",
-                      "/Dc/0/Temperature", "/Soc", "/Soh", "/TimeToGo",
-                      "/Capacity", "/ConsumedAmphours"):
-                if p in s.paths:
-                    s.svc[p] = None
-            return
+            if not fresh:
+                # blank rather than freeze: a stale voltage on a start battery
+                # reads exactly like a healthy one
+                for p in ("/Dc/0/Voltage", "/Dc/0/Current", "/Dc/0/Power",
+                          "/Dc/0/Temperature", "/Soc", "/Soh", "/TimeToGo",
+                          "/Capacity", "/ConsumedAmphours"):
+                    if p in s.paths:
+                        svc[p] = None
+                return
 
-        s.svc["/Dc/0/Voltage"] = None if s.voltage is None else round(s.voltage, 2)
-        if s.kind != Source.KIND_DC:
-            return
+            svc["/Dc/0/Voltage"] = _q(s.voltage, c.voltage_step)
+            if s.kind != Source.KIND_DC:
+                return
 
-        s.svc["/Dc/0/Current"] = None if s.current is None else round(s.current, 1)
-        s.svc["/Dc/0/Power"] = (None if s.voltage is None or s.current is None
-                                else round(s.voltage * s.current, 1))
-        s.svc["/Dc/0/Temperature"] = (None if s.temperature is None
-                                      else round(s.temperature, 1))
-        s.svc["/Soc"] = s.soc
-        s.svc["/Soh"] = s.soh
-        s.svc["/TimeToGo"] = s.timetogo
+            svc["/Dc/0/Current"] = _q(s.current, c.current_step)
+            svc["/Dc/0/Power"] = (None if s.voltage is None or s.current is None
+                                  else _q(s.voltage * s.current, c.power_step))
+            svc["/Dc/0/Temperature"] = _q(s.temperature, c.temperature_step)
+            svc["/Soc"] = s.soc
+            svc["/Soh"] = s.soh
+            svc["/TimeToGo"] = s.timetogo
 
-        if installed and s.soc is not None:
-            remaining = installed * s.soc / 100.0
-            s.svc["/Capacity"] = round(remaining, 1)
-            # BMV convention: consumed amp hours are negative
-            s.svc["/ConsumedAmphours"] = -round(installed - remaining, 1)
-        else:
-            s.svc["/Capacity"] = None
-            s.svc["/ConsumedAmphours"] = None
+            if installed and s.soc is not None:
+                remaining = installed * s.soc / 100.0
+                svc["/Capacity"] = _q(remaining, 1)
+                # BMV convention: consumed amp hours are negative
+                svc["/ConsumedAmphours"] = -_q(installed - remaining, 1)
+            else:
+                svc["/Capacity"] = None
+                svc["/ConsumedAmphours"] = None
 
     # ------------------------------------------------------------- manager
     def _init_manager(self):
@@ -1180,26 +1218,32 @@ class BatteryDriver:
             self._catalog_json = blob
             self.settings.set("Catalog", blob)
 
-        svc = self.manager
-        if svc is None:
+        if self.manager is None:
             return
-        if svc["/Catalog"] != blob:
-            svc["/Catalog"] = blob
-        svc["/SourceCount"] = len(self.sources)
-        svc["/EnabledCount"] = sum(1 for s in self.sources.values() if s.enabled)
-        for s in self.sources.values():
-            base = "/Sources/%s" % s.key
-            if base + "/Enabled" not in self.manager_paths:
-                continue
-            svc[base + "/Enabled"] = 1 if s.enabled else 0
-            svc[base + "/Available"] = 1 if s.fresh else 0
-            svc[base + "/Published"] = 1 if s.svc is not None else 0
-            svc[base + "/Age"] = s.age()
-            svc[base + "/SourceAddress"] = s.src_addr
-            svc[base + "/Fields"] = ",".join(sorted(s.fields))
-            svc[base + "/DeviceInstance"] = s.instance or 0
-            svc[base + "/CustomName"] = s.name
-            svc[base + "/Capacity"] = s.capacity
+        now = time.time()
+        write_age = (now - self._age_written) >= self.cfg.age_refresh_s
+        if write_age:
+            self._age_written = now
+        with self.manager as svc:
+            if svc["/Catalog"] != blob:
+                svc["/Catalog"] = blob
+            svc["/SourceCount"] = len(self.sources)
+            svc["/EnabledCount"] = sum(1 for s in self.sources.values()
+                                       if s.enabled)
+            for s in self.sources.values():
+                base = "/Sources/%s" % s.key
+                if base + "/Enabled" not in self.manager_paths:
+                    continue
+                svc[base + "/Enabled"] = 1 if s.enabled else 0
+                svc[base + "/Available"] = 1 if s.fresh else 0
+                svc[base + "/Published"] = 1 if s.svc is not None else 0
+                if write_age:
+                    svc[base + "/Age"] = s.age()
+                svc[base + "/SourceAddress"] = s.src_addr
+                svc[base + "/Fields"] = ",".join(sorted(s.fields))
+                svc[base + "/DeviceInstance"] = s.instance or 0
+                svc[base + "/CustomName"] = s.name
+                svc[base + "/Capacity"] = s.capacity
 
     def _load_catalog(self):
         """Re-create last run's sources before a single frame arrives, so a

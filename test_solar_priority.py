@@ -73,14 +73,14 @@ check("sustain telemetry idle", batt["/RecBms/Sustain/Active"] == 0 and
 
 check("floor request accepted", batt.write("/RecBms/Sustain/Request", 1))
 rtick()
-check("floor: CVL = curve(present SOC)", batt["/RecBms/TargetChargeVoltage"] == curve(62),
-      "%s vs %s" % (batt["/RecBms/TargetChargeVoltage"], curve(62)))
+check("floor: CVL = curve(present SOC + one snap)", batt["/RecBms/TargetChargeVoltage"] == curve(63),
+      "%s vs %s" % (batt["/RecBms/TargetChargeVoltage"], curve(63)))
 check("floor telemetry", batt["/RecBms/Sustain/Active"] == 1 and
-      batt["/RecBms/Sustain/Mode"] == 1 and batt["/RecBms/Sustain/Soc"] == 62.0 and
+      batt["/RecBms/Sustain/Mode"] == 1 and batt["/RecBms/Sustain/Soc"] == 63.0 and
       batt["/RecBms/Sustain/Status"] == "floor")
-rtick(soc=62.6)
-check("floor ignores a wobble under one step", batt["/RecBms/TargetChargeVoltage"] == curve(62) and
-      batt["/RecBms/Sustain/Soc"] == 62.0)
+rtick(soc=63.9)
+check("floor ignores a wobble under one step past the snap",
+      batt["/RecBms/TargetChargeVoltage"] == curve(63) and batt["/RecBms/Sustain/Soc"] == 63.0)
 rtick(soc=65)
 check("floor follows the bank up a full step", batt["/RecBms/TargetChargeVoltage"] == curve(65))
 rtick(soc=60)
@@ -116,10 +116,10 @@ FakeBus.store["/Settings/RecBms/EqLastCompleted"] = T[0]
 rtick(soc=90, slider=70)
 check("ceiling request accepted", batt.write("/RecBms/Sustain/Request", 2))
 rtick()
-check("ceiling: CVL = curve(present SOC)", batt["/RecBms/TargetChargeVoltage"] == curve(90) and
+check("ceiling: CVL = curve(present SOC - one snap)", batt["/RecBms/TargetChargeVoltage"] == curve(89) and
       batt["/RecBms/Sustain/Mode"] == 2 and batt["/RecBms/Sustain/Status"] == "ceiling")
-rtick(soc=89.3)
-check("ceiling ignores a wobble under one step", batt["/RecBms/TargetChargeVoltage"] == curve(90))
+rtick(soc=88.3)
+check("ceiling ignores a wobble under one step past the snap", batt["/RecBms/TargetChargeVoltage"] == curve(89))
 rtick(soc=85)
 check("ceiling follows the bank down a full step", batt["/RecBms/TargetChargeVoltage"] == curve(85))
 rtick(soc=88)
@@ -134,7 +134,7 @@ rtick(soc=75)
 check("floor request while ceiling held", batt.write("/RecBms/Sustain/Request", 1))
 rtick()
 check("mode switch re-samples the SOC", batt["/RecBms/Sustain/Mode"] == 1 and
-      drv.sustain["soc"] == 75.0 and batt["/RecBms/Sustain/Soc"] == 70.0 and
+      drv.sustain["soc"] == 76.0 and batt["/RecBms/Sustain/Soc"] == 70.0 and
       batt["/RecBms/TargetChargeVoltage"] == curve(70),
       "floor 75 clipped to slider 70 -> %s" % batt["/RecBms/TargetChargeVoltage"])
 check("release accepted", batt.write("/RecBms/Sustain/Request", 0))
@@ -142,10 +142,47 @@ rtick()
 check("released: slider CVL, telemetry cleared", batt["/RecBms/TargetChargeVoltage"] == curve(70) and
       batt["/RecBms/Sustain/Active"] == 0 and batt["/RecBms/Sustain/Soc"] is None)
 
-# stale BMS: no present SOC to pin, so refuse
+# charge current limit while held: PV current + charge_limit_a, MPPT-safe
+rtick(soc=62, slider=80)
+check("ccl: full REC limit without a hold", batt["/Info/MaxChargeCurrent"] == 200.0)
+drv.pv_current = (3.0, T[0])
+check("ccl: floor request", batt.write("/RecBms/Sustain/Request", 1))
+rtick()
+check("ccl: PV 3 A + 5 A while held", batt["/Info/MaxChargeCurrent"] == 8.0 and
+      batt["/RecBms/Sustain/ChargeLimit"] == 8.0, str(batt["/Info/MaxChargeCurrent"]))
+drv.pv_current = (20.0, T[0])
+rtick()
+check("ccl: follows PV up", batt["/Info/MaxChargeCurrent"] == 25.0)
+drv.pv_current = (None, T[0])
+rtick()
+check("ccl: not applied when PV current is unknown", batt["/Info/MaxChargeCurrent"] == 200.0 and
+      batt["/RecBms/Sustain/ChargeLimit"] is None)
+drv.pv_current = (3.0, T[0] - 60)
+rtick()
+check("ccl: not applied on a stale PV reading", batt["/Info/MaxChargeCurrent"] == 200.0)
+drv.pv_current = (3.0, T[0])
+drv.boost["active"] = True
+rtick()
+check("ccl: lifted during a boost", batt["/Info/MaxChargeCurrent"] == 200.0)
+drv.boost["active"] = False
+batt.write("/RecBms/Sustain/Request", 0)
+rtick()
+check("ccl: full limit back once released", batt["/Info/MaxChargeCurrent"] == 200.0 and
+      batt["/RecBms/Sustain/ChargeLimit"] is None)
+
+# stale BMS: no present SOC to pin -> pending, sampled on the first live tick
 drv.bms["_lastUpdate"] = T[0] - 100
-check("refused while the BMS is stale", not batt.write("/RecBms/Sustain/Request", 1) and
-      batt["/RecBms/Sustain/Status"] == "refused: BMS not live")
+check("pending while the BMS is stale", batt.write("/RecBms/Sustain/Request", 1) and
+      batt["/RecBms/Sustain/Status"] == "pending: no SOC yet" and batt["/RecBms/Sustain/Active"] == 1)
+T[0] += 1; drv._tick()                                  # still stale: slider applies, hold waits
+check("pending: slider CVL meanwhile", batt["/RecBms/TargetChargeVoltage"] == curve(80) and
+      batt["/RecBms/Sustain/Soc"] is None,
+      "cvl %s vs %s, soc %s, status %s" % (batt["/RecBms/TargetChargeVoltage"], curve(80),
+                                          batt["/RecBms/Sustain/Soc"], batt["/RecBms/Sustain/Status"]))
+rtick(soc=64)                                           # BMS back: sampled and snapped
+check("pending hold starts on the first live tick", batt["/RecBms/Sustain/Status"] == "floor" and
+      batt["/RecBms/Sustain/Soc"] == 65.0 and batt["/RecBms/TargetChargeVoltage"] == curve(65))
+batt.write("/RecBms/Sustain/Request", 0); rtick()
 check("bad mode refused", not batt.write("/RecBms/Sustain/Request", 7))
 
 # pure ratchet corner: no SOC (fallback) keeps the last hold, still clipped
@@ -162,14 +199,15 @@ print("\n=== solar priority engine: one-way ===")
 SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priority")
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 5 and
-      scfg.engine["ONEWAY_EXIT_PCT"] == 1)
-check("engine version bumped", SP.ENGINE_VERSION == "4.3")
+      scfg.engine["ONEWAY_EXIT_PCT"] == 1 and scfg.engine["ONEWAY_FULL_PCT"] == 100)
+check("engine version bumped", SP.ENGINE_VERSION == "4.5")
 Val = SP.Val
 
 
 class Sim:
     """Drives Engine.tick with a plant that follows the commands: the
-    Quattro's ActiveInput reports 240 (none) once IgnoreAcIn is 1."""
+    Quattro's ActiveInput reports 240 (none) once IgnoreAcIn is 1, and
+    also whenever there is no shore power at all (shore=False)."""
 
     def __init__(self, **tun):
         self.t = dict(SP.ENGINE_DEFAULTS)
@@ -203,12 +241,14 @@ class Sim:
             inp.soc = Val(v["soc"], n)
             inp.batt = Val(v["batt"], n)
             inp.load_now = Val(v["load"], n)
-            inp.load_avg = Val(v["load"], n)
-            inp.feed = Val(240 if self.cmd == 1 else 0, n)
+            inp.load_avg = Val(v.get("load_avg", v["load"]), n)
+            inp.load_slow = Val(v.get("load_slow", v["load"]), n)
+            inp.feed = Val(240 if (self.cmd == 1 or not v.get("shore", True)) else 0, n)
             inp.ac_out = Val(v["load"], n)
             inp.voc6, inp.y6, inp.m6 = Val(v["voc"], n), Val(v["pv"], n), Val(v["m"], n)
             inp.voc7, inp.y7, inp.m7 = Val(0.0, n), Val(0.0, n), Val(0, n)
             inp.batt_v, inp.cvl = Val(v["batt_v"], n), Val(v["cvl"], n)
+            inp.dc_load = Val(v.get("dc_load", 0.0), n)
             inp.target_soc = Val(v["target"], n) if v["target"] is not None else None
             out = self.eng.tick(n, inp)
             if out.cmd is not None:
@@ -253,11 +293,14 @@ s.tick(95, batt=100.0, cvl=59.49)       # hold released: the real target is back
 check("charge: probe -> solar", s.state == "solar" and s.sustain == 0)
 s.tick(60, soc=68.0)
 check("charge: solar stays while the bank fills", s.state == "solar" and s.oneway == "charge")
-# night: PV gone, the loads draw from the bank -> deficit exit -> shore + sustain
+# night: PV gone, the loads draw from the bank -> ten-minute deficit exit -> shore + sustain
 s.tick(200, batt=-200.0, pv=0.0, m=0, voc=10.0)
+check("charge: -200 W is inside the one-way tolerance", s.state == "solar")
+s.tick(720, batt=-400.0)
 check("charge: deficit -> shore", s.state == "shore" and s.cmd == 0, s.state)
-check("charge: floor requested with the shore command",
-      s.sustain == 1 and s.sustains[-1][0] == s.cmds[-1][0])
+check("charge: floor requested one tick after the shore command (once the Quattro reports shore)",
+      s.sustain == 1 and s.sustains[-1][0] == s.cmds[-1][0] + 1000,
+      "sustain %s cmd %s" % (s.sustains[-1], s.cmds[-1]))
 check("charge: still engaged at 68 %", s.oneway == "charge")
 s.tick(1, soc=79.5, batt=0.0)
 check("charge: done within EXIT of the target", s.oneway is None and s.sustain == 0 and
@@ -311,6 +354,146 @@ s.tick(1, soc=70.9)
 check("discharge: done within EXIT of the target", s.oneway is None and s.sustain == 0)
 s.tick(20)
 check("discharge done: the normal deficit exit takes over", s.state == "shore" and s.cmd == 0)
+
+# ---- pre-probe checks (4.4) ----
+def prime(s, c6, c7, m6=None, m7=None, age=0):
+    """Plant captures (aged `age` ms) and fresh model estimates in the engine."""
+    ts = s.now - age
+    s.eng.st["cap6"] = {"w": c6, "ts": ts} if c6 is not None else None
+    s.eng.st["cap7"] = {"w": c7, "ts": ts} if c7 is not None else None
+    for k, m in (("mdl6", m6), ("mdl7", m7)):
+        s.eng.st[k] = {"voc": 70.0, "vocTs": s.now, "kff": 0.78,
+                       "est": ({"w": m, "ts": s.now, "lb": False} if m else None)}
+
+s = Sim()
+s.tick(5, pv=60.0, m=1, batt_v=56.4)            # throttled: no capture from the plant itself
+prime(s, 100, 80, m6=700, m7=700)
+s.tick(1)
+check("fresh capture caps the model", abs(s.out.est - 180) < 1, "est %.0f" % s.out.est)
+prime(s, 100, 80, m6=700, m7=700, age=16 * 60 * 1000)
+s.tick(1)
+# MPPT 6's model re-derives ~60 W from the live yield; MPPT 7 keeps the planted 700 W
+check("stale capture: the model applies again", 750 < s.out.est < 850, "est %.0f" % s.out.est)
+
+s = Sim()
+s.tick(1, pv=60.0, m=1, batt_v=56.4)
+prime(s, 300, 20)                                # brow 300/0.35=857, fly 20/0.65=31 -> 0.036
+s.tick(340)
+check("obstructed array: no probe", s.state == "shore" and "[SHADE]" in s.out.status_text and "bal 0.04" in s.out.status_text,
+      s.out.status_text)
+prime(s, 300, 400)                               # 857 vs 615 -> 0.72
+s.tick(35)
+check("balanced arrays: probe goes ahead", s.state == "probe", s.state)
+check("probe entry logs cap/mdl/bal", any("-> PROBE (est" in tr and "cap 300+400" in tr and "bal 0.72" in tr for tr in s.transitions),
+      str(s.transitions))
+
+s = Sim()
+s.tick(1, pv=60.0, m=1, batt_v=56.4, load=250.0, load_slow=330.0)
+prime(s, 200, 150)                               # est 350: clears 1.2*250=300, not 1.2*330=396
+s.tick(340)
+check("need judged against the slower average too", s.state == "shore" and "need 396W" in s.out.status_text,
+      s.out.status_text)
+s.tick(35, load_slow=250.0)
+check("...and clears once the slow average drops", s.state == "probe")
+
+# ---- one-way charge is patient with a deficit, and with a probe ----
+s = Sim()
+s.tick(1, soc=60, target=95, batt_v=56.4)
+s.tick(340)
+check("patient: probe", s.state == "probe")
+s.tick(50, batt=100.0, cvl=59.49, load=350.0)   # avg*1.2 = 420 > est: 4.2 would have quit
+check("patient: a creeping load does not end a one-way probe",
+      not any("big load" in tr for tr in s.transitions), str(s.transitions))
+s.tick(50, batt=-120.0)                          # verdict on the last 15 s: -120 W is inside 200 W
+check("patient: probe verdict uses the one-way tolerance", s.state == "solar", s.state)
+s.tick(300, batt=-150.0)
+check("patient: -150 W for 5 min stays on solar", s.state == "solar")
+s.tick(10, batt=-600.0)
+check("patient: a 10 s surge does not end it", s.state == "solar")
+s.tick(700, batt=-300.0)
+check("patient: -300 W ten-minute mean -> shore", any(tr.startswith("-> SHORE (deficit: batt avg -") for tr in s.transitions),
+      str(s.transitions))
+s = Sim()
+s.tick(1, soc=60, target=95, batt_v=56.4)
+s.tick(340)
+s.tick(95, batt=100.0, cvl=59.49)
+s.tick(5, load=1500.0, batt=-1500.0)
+check("patient: heater-class load still suspends", s.state == "suspend")
+
+# ---- solar filling the band is not "the charger charging" ----
+s = Sim()
+s.tick(1, soc=60, target=95, batt_v=56.4)
+s.tick(340, pv=345.0, m=2, batt=250.0, load=178.0, dc_load=85.0)   # bank +250 W, all of it solar
+check("solar charging the band does not block the probe", s.state == "probe", s.state)
+s = Sim()
+s.tick(1, soc=60, target=95, batt_v=56.4)
+s.tick(340, pv=0.0, m=1, batt=250.0, load=178.0)                   # bank +250 W from the Quattro
+check("the Quattro charging still does", s.state == "shore" and "[chg +250W]" in s.out.status_text, s.out.status_text)
+
+# ---- 4.5: 100 % means a full charge from every charger, not one-way ----
+s = Sim()
+s.tick(1, soc=60, target=100)
+check("full: 60 -> 100 does not engage one-way", s.oneway is None and s.out.oneway == "")
+check("full: no floor ever asked for", s.sustains == [])
+s.tick(335, batt_v=56.4)
+check("full: the normal engine probes as usual", s.state == "probe")
+s.tick(1, target=90)
+check("full: 90 engages", s.oneway == "charge")
+s.tick(1, target=100)
+check("full: back to 100 stands one-way down", s.oneway is None and
+      any("done (target 100% is a full charge: every charger at its maximum)" in l for l in s.logs),
+      str(s.logs[-1:]))
+s = Sim(ONEWAY_FULL_PCT=0)
+s.tick(1, soc=60, target=100)
+check("full: oneway_full_pct = 0 restores the 4.4 behaviour", s.oneway == "charge")
+
+# ---- 4.5: no floor while the Quattro is not actually on shore ----
+s = Sim()
+s.tick(1, soc=80, target=95, shore=False)
+check("no shore: charge engaged", s.oneway == "charge")
+check("no shore: floor never requested on shore state", s.sustain == 0 and 1 not in [x for _, x in s.sustains],
+      str(s.sustains))
+s.tick(200)
+check("no shore: engine sits in NO SHORE?, still no floor",
+      s.state == "shore" and "NO SHORE?" in s.out.status_text and s.sustain == 0, s.out.status_text)
+s.tick(1, shore=True)
+check("shore back: floor requested on the next tick", s.sustain == 1 and s.sustains[-1][0] == s.now)
+# the 2026-09-06 case: on solar, heater-class load, shore gone meanwhile
+s = Sim()
+s.tick(1, soc=80, target=95, batt_v=56.4)
+check("09-06: floor while on shore", s.sustain == 1)
+s.tick(335)
+s.tick(95, batt=100.0, cvl=59.49)
+check("09-06: on solar, floor released", s.state == "solar" and s.sustain == 0)
+s.tick(5, load=1500.0, load_avg=300.0, batt=-1500.0, shore=False)   # avg lags: base 300 W
+check("09-06: heater load -> suspend", s.state == "suspend" and s.cmd == 0)
+check("09-06: no AC came: NO floor in suspend", s.sustain == 0, str(s.sustains[-3:]))
+s.tick(200)
+check("09-06: still none 200 s in", s.sustain == 0 and s.state == "suspend")
+s.tick(1300, load=1500.0, batt=-1500.0)
+check("09-06: suspend times out to shore, still no floor",
+      s.state == "shore" and s.sustain == 0, "state %s sustain %s" % (s.state, s.sustain))
+s.tick(1, shore=True)
+check("09-06: shore returns: floor follows within a tick", s.sustain == 1)
+s.tick(5, shore=False)
+check("09-06: shore drops again: floor released", s.sustain == 0)
+# and the same suspend with shore present keeps the floor (4.3 behaviour)
+s = Sim()
+s.tick(1, soc=80, target=95, batt_v=56.4)
+s.tick(335)
+s.tick(95, batt=100.0, cvl=59.49)
+s.tick(5, load=1500.0, batt=-1500.0)
+check("shore present: suspend still gets the floor", s.state == "suspend" and s.sustain == 1)
+
+# ---- a re-appeared battery service gets the hold re-asserted at once ----
+s = Sim()
+s.tick(1, soc=60, target=80)
+n0 = len(s.sustains)
+s.tick(5)
+check("no re-assert inside the 30 s cycle", len(s.sustains) == n0)
+s.eng.st["sustainSent"] = None            # what _device_added does for the battery service
+s.tick(1)
+check("battery service re-appeared: floor re-asserted next tick", len(s.sustains) == n0 + 1 and s.sustain == 1)
 
 # ---- the SOC floor still wins ----
 s = Sim()
