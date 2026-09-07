@@ -186,6 +186,24 @@ Consequences:
 Deploy order: install this driver version **before** deploying the flow
 revision that reads `/RecBms/TargetChargeVoltage`.
 
+### Lead gating (v1.7.0)
+
+The lead exists for Solar Priority: it is what leaves the MPPTs headroom on
+shore. Without it, it only makes a full charge slower — the last 0.15 V had
+to come from the sun. So the lead is now applied only when both hold:
+
+- `/Settings/SolarPriority/Enabled` is 1 (`[cvl] lead_needs_solar_priority`,
+  default on; the setting absent reads as off), polled every 3 s;
+- the Max Charge slider is below `[cvl] lead_full_pct` (100 %).
+
+Otherwise `/Info/MaxChargeVoltage` is the **full target**, `/RecBms/SolarLead`
+is 0 and the systemcalc offset is written 0 once (it persists inside
+systemcalc, so it is cleared on the transition, not just left). The
+Quattro's +0.05–0.15 V bias is a hold-at-voltage effect; a bulk charge to the
+calibrated 100 % point does not overshoot it. A boost still rides on
+whatever lead is in force (`lead + boost`). Every change of the lead in
+force is logged once with the reason (Solar Priority on/off, slider).
+
 ## Lead verification (v1.4.0)
 
 Reading Victron's `dbus-systemcalc-py` (`delegates/dvcc.py`) showed the one

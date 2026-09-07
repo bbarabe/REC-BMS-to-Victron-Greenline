@@ -34,6 +34,13 @@ below the slider/EQ target and raises only the solar chargers back up to it
 via the systemcalc SolarVoltageOffset — the MPPTs, which regulate
 accurately, finish the top-off at the true target.
 
+v1.7.0 lead gating: the lead exists for Solar Priority (it is what leaves
+the MPPTs headroom on shore). With Solar Priority disabled, or the slider at
+lead_full_pct (100 %), the owner wants a FULL charge from whatever charger is
+on: the lead is 0, the Quattro is commanded the true target and the offset is
+cleared. The Quattro's +0.05..0.15V bias is a hold-at-voltage effect; a bulk
+charge to the calibrated 100 % point does not overshoot it.
+
 v1.4.0 lead verification: systemcalc applies the Debug voltage offsets only
 when /Settings/System/AccessLevel > 2 (Superuser) — and it evaluates that
 once per process (reify). The D-Bus write succeeds regardless, so v1.3 could
@@ -85,7 +92,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -178,6 +185,12 @@ class Config:
         # standing Quattro/solar split: command the vebus this far below the
         # target and raise only the MPPTs back to it (0 disables)
         self.solar_lead = max(0.0, min(0.30, float(v.get("solar_lead_v", 0.0))))
+        # v1.7.0: the lead only while Solar Priority is enabled (its
+        # /Settings/SolarPriority/Enabled), and never at/above this slider
+        # position -- a full charge is every charger commanded the target
+        self.lead_needs_sp = \
+            str(v.get("lead_needs_solar_priority", "true")).lower() != "false"
+        self.lead_full_pct = float(v.get("lead_full_pct", 100))
         # verify the offset against systemcalc /Control/EffectiveChargeVoltage:
         # a mismatch must persist this long before it counts (DVCC only
         # adjusts every 3 s, so a slider move is briefly inconsistent)
@@ -379,6 +392,21 @@ SUSTAIN_FLOOR = 1      # held SOC may only rise (solar charges, shore holds)
 SUSTAIN_CEILING = 2    # held SOC may only fall (loads drain, nothing charges)
 
 
+def standing_lead(lead_v, slider, full_pct, sp_enabled, needs_sp=True):
+    """The solar lead in force this tick (v1.7.0). The lead is a Solar
+    Priority tool: it keeps the Quattro under the target so the MPPTs have
+    headroom on shore. Without Solar Priority, or with the Max Charge slider
+    at full_pct, the owner wants the bank FULL from whatever is charging,
+    so the Quattro gets the true target and the offset is dropped."""
+    if lead_v <= 0:
+        return 0.0
+    if slider >= full_pct:
+        return 0.0
+    if needs_sp and not sp_enabled:
+        return 0.0
+    return float(lead_v)
+
+
 def sustain_ratchet(mode, held, soc, slider, lo, hi, step=1.0):
     """(held, effective) for this tick. Pure, so it can be tested off the boat.
 
@@ -475,12 +503,15 @@ class RecBmsDriver:
         self.pv_current = None              # (amps or None, ts) from systemcalc
         self._last_pub_cvl = None           # /Info/MaxChargeVoltage we published
         self._last_offset = 0.0             # offset we last wrote
+        self.sp_enabled = None              # /Settings/SolarPriority/Enabled, polled
+        self.lead_v = 0.0                   # standing lead in force this tick
+        self._lead_logged = None
         self.lead_fault = {"active": False, "since": 0.0, "msg": "",
                            "mismatch_since": 0.0}
         self._check_access_level()
         if cfg.pin_bms_instance:
             self._pin_bms_instance()
-        self._boost_write(cfg.solar_lead, quiet=True)
+        self._boost_write(0.0, quiet=True)   # first tick sets the real lead
         atexit.register(self._boost_shutdown)
         for _sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -880,7 +911,7 @@ class RecBmsDriver:
             log.warning("solar boost refused (%.2fV): %s", volts, why)
             self._pub["/RecBms/SolarBoost/Status"] = "refused: " + why
             return False
-        if not self._boost_write(self.cfg.solar_lead + volts):
+        if not self._boost_write(self.lead_v + volts):
             self._pub["/RecBms/SolarBoost/Status"] = "refused: systemcalc write failed"
             return False
         self.boost = {"active": True, "req_ts": time.time(), "volts": volts}
@@ -895,7 +926,7 @@ class RecBmsDriver:
     def _boost_clear(self, reason):
         was = self.boost["active"]
         self.boost = {"active": False, "req_ts": 0.0, "volts": 0.0}
-        self._boost_write(self.cfg.solar_lead)   # keep the standing lead
+        self._boost_write(self.lead_v)   # keep the standing lead
         s = self._pub
         s["/RecBms/SolarBoost/Request"] = 0.0
         s["/RecBms/SolarBoost/Applied"] = 0.0
@@ -1112,6 +1143,13 @@ class RecBmsDriver:
             v = None
         self.eff_cv = (v, time.time())
         self._pub["/RecBms/DvccEffectiveChargeVoltage"] = v
+        # v1.7.0: is Solar Priority on? Its setting; absent (driver not
+        # installed) reads as off, and then no lead is applied.
+        sp = self._settings_get("/Settings/SolarPriority/Enabled")
+        try:
+            self.sp_enabled = bool(int(sp)) if sp is not None else False
+        except (TypeError, ValueError):
+            self.sp_enabled = False
         # PV current for the sustain charge limit (same 3 s cadence as DVCC)
         try:
             raw = self.sbus.call_blocking(
@@ -1224,16 +1262,17 @@ class RecBmsDriver:
         if not verified and boost_v > 0:
             self._boost_clear("aborted: solar lead fault")
             boost_v = 0.0
-        if c.solar_lead > 0 or boost_v > 0:
+        lead_v = self.lead_v
+        if lead_v > 0 or boost_v > 0:
             # Keep writing the offset even while faulted: if the access
             # level is raised and systemcalc restarted, the next poll sees
             # the offset applied and the fault self-clears.
-            if self._boost_write(c.solar_lead + boost_v, quiet=True):
-                self._last_offset = c.solar_lead + boost_v
+            if self._boost_write(lead_v + boost_v, quiet=True):
+                self._last_offset = lead_v + boost_v
                 # While faulted publish the FULL target (lead 0): the MPPT
                 # ceiling is never silently lowered by a lead that is not
                 # actually in force.
-                lead = c.solar_lead if verified else 0.0
+                lead = lead_v if verified else 0.0
             else:
                 # Unwritable offset (Debug path — may vanish in a Venus
                 # update): publish the FULL target as the CVL so the MPPT
@@ -1248,6 +1287,11 @@ class RecBmsDriver:
                                 "publishing the full target CVL")
                     self._last_offset_warn = now
         else:
+            # No lead wanted this tick (v1.7.0: Solar Priority off, or the
+            # slider at full). The offset persists inside systemcalc, so
+            # drop it once when it was in force.
+            if self._last_offset > 0.005:
+                self._boost_write(0.0, quiet=True)
             self._last_offset = 0.0
         s["/RecBms/SolarBoost/EffectiveChargeVoltage"] = round(target + boost_v, 2)
         s["/RecBms/LeadFault"] = self.lead_fault["msg"] if self.lead_fault["active"] else ""
@@ -1533,6 +1577,15 @@ class RecBmsDriver:
         # only the solar chargers back up to it: the Quattro lands at or
         # under the calibrated equilibrium and solar finishes the top-off.
         target = round(final_cvl, 2)
+        self.lead_v = standing_lead(c.solar_lead, slider, c.lead_full_pct,
+                                    self.sp_enabled, c.lead_needs_sp)
+        if self._lead_logged != self.lead_v:
+            log.info("solar lead %.2fV -> %.2fV (Solar Priority %s, "
+                     "slider %.0f%%, full at %.0f%%)",
+                     self._lead_logged or 0.0, self.lead_v,
+                     "on" if self.sp_enabled else "off", slider,
+                     c.lead_full_pct)
+            self._lead_logged = self.lead_v
         lead = self._service_boost(now, target)
         s["/RecBms/TargetChargeVoltage"] = target
         s["/RecBms/TargetSoc"] = slider
