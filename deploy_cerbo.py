@@ -11,9 +11,10 @@ deploy_cerbo.py — ship a standalone driver to the Cerbo over ONE SSH session.
 Encodes the rules in CLAUDE.md so nobody re-derives them:
   * one SSH session per run, 30 s keepalive, NEVER retries a failed connect
     (repeated connects exhaust the Cerbo and it drops off the network)
-  * the on-boat config (calibration!) is diffed against the repo's HEAD copy
-    BEFORE anything is overwritten; a value difference aborts unless
-    --force-config, a comment-only difference is fine
+  * the on-boat config (calibration!) is diffed against the repo's committed
+    copies BEFORE anything is overwritten; a value set that matches no commit
+    (an on-boat edit) aborts unless --force-config, a comment-only difference
+    or a config that is simply behind the repo is fine
   * every overwritten file is backed up on the boat as <file>.bak-<tag>
   * only the requested service is restarted; verification re-reads the
     shipped VERSION after the restart instead of assuming the copy landed
@@ -187,6 +188,24 @@ def git_head(relpath):
     return r.stdout if r.returncode == 0 else None
 
 
+def git_history(relpath, n=30):
+    """The last n committed copies of a file, newest first (HEAD included).
+    The config guard asks whether the live file is one of them: a live
+    config that matches an OLDER commit is simply behind the repo, not an
+    on-boat edit -- which is exactly the state after a config change is
+    committed and before it is deployed (2026-09-09)."""
+    rp = relpath.replace(os.sep, "/")
+    r = subprocess.run(["git", "-C", REPO, "log", "-n", str(n), "--format=%H", "--", rp],
+                       capture_output=True, text=True, encoding="utf-8")
+    out = []
+    for h in r.stdout.split():
+        c = subprocess.run(["git", "-C", REPO, "show", "%s:%s" % (h, rp)],
+                           capture_output=True, text=True, encoding="utf-8")
+        if c.returncode == 0:
+            out.append(c.stdout)
+    return out
+
+
 def local_version(pkg):
     p = os.path.join(REPO, pkg["dir"], pkg["version_file"])
     m = re.search(r'^VERSION\s*=\s*"([^"]+)"', open(p, encoding="utf-8").read(), re.M)
@@ -313,7 +332,9 @@ def main():
                     live_vals = ini_values(live_txt.decode(errors="replace"))
                     head_vals = ini_values(head) if head is not None else None
                     new_vals = ini_values(local_txt.decode("utf-8"))
-                    if head_vals is not None and live_vals != head_vals:
+                    known = head_vals is None or live_vals == head_vals or any(
+                        live_vals == ini_values(t) for t in git_history(pkg["dir"] + "/" + f))
+                    if not known:
                         d = "\n".join(difflib.unified_diff(head_vals, live_vals, "repo HEAD", "live", lineterm=""))
                         print("!! live %s has on-boat VALUE edits not in the repo:\n%s" % (f, d))
                         if not args.force_config:
