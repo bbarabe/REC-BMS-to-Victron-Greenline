@@ -525,6 +525,23 @@ dock:
   shore relay within a tick, both ways; the status line reads `NO SHORE?`
   while it is withheld and `/SolarPriority/Sustain` shows 0.
 
+### Lower SOC gate for one-way charge (engine 4.6)
+
+From 2026-09-09: the bank sat at 30 % on shore in full sun because the probe
+gate wants `min_soc` (40 %), a threshold from before one-way mode that
+protects a bank being *inverted into*. Charging one-way on solar the bank is
+by definition being charged, the deficit exit is patient but bounded, and
+30 % of 1440 Ah is still 430 Ah. So while charging one-way the gate for
+leaving shore, and the floor for staying on solar, is `oneway_min_soc`
+(25 %) instead. The 30 % emergency lockout stands aside only while the
+bank's ten-minute mean is positive (the sun is carrying it) *and* the SOC is
+above `oneway_min_soc`; under that line it fires as before, sun or not. The
+normal engine and one-way discharge keep `min_soc`. On solar the floor is
+released and the MPPTs charge at the real target with the Quattro out of the
+circuit: every watt of sun goes in and there are no re-anchor ticks. The
+on-shore staircase (dbus-recbms 1.8.0) remains the behaviour for every hour
+the engine has to stay on shore.
+
 ### Pre-probe checks (engine 4.4)
 
 From the evening of 2026-09-01 in Home Assistant: five probes went out on

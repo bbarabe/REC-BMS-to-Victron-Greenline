@@ -36,6 +36,9 @@ What it does (see README.md "Solar Priority driver"):
     off; and the floor is only asked for while the Quattro is actually on
     shore (ActiveInput = the shore input) -- with no AC available the
     Quattro inverts regardless, and a floor would only throttle solar.
+    Since 4.6 the SOC gate for leaving shore while charging one-way is
+    ONEWAY_MIN_SOC (25 %) instead of MIN_SOC (40 %), and the emergency
+    lockout stands aside while the sun is carrying the bank above it.
 
 Differences from the flow (all deliberate):
   - inputs come from a velib DbusMonitor (signal-driven cache). Values stay
@@ -71,7 +74,7 @@ import dbus.mainloop.glib
 from gi.repository import GLib
 
 VERSION = "1.4.0"
-ENGINE_VERSION = "4.5"
+ENGINE_VERSION = "4.6"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-solarpriority")
@@ -145,6 +148,16 @@ ENGINE_DEFAULTS = {
     # (2026-09-06: at 100 % the floor held the Quattro at the present SOC
     # and only solar could move the bank -- it could never get full). 0 = off.
     "ONEWAY_FULL_PCT": 100,
+    # 4.6: the SOC floor for LEAVING shore and staying on solar while
+    # charging one-way. MIN_SOC (40) and SOC_EMERGENCY (30) protect a bank
+    # that is being inverted into; charging one-way on solar the bank is
+    # by definition being charged, the deficit exit is patient but bounded,
+    # and 30 % of 1440 Ah is 430 Ah of reserve -- yet at 30 % on 2026-09-09
+    # the engine sat on shore in full sun because of the 40 % gate. Below
+    # this the emergency lockout fires as before, sun or not; above it the
+    # lockout is skipped only while the bank's ten-minute mean is positive
+    # (the sun IS carrying it).
+    "ONEWAY_MIN_SOC": 25,
 }
 
 
@@ -607,6 +620,11 @@ class Engine:
             st["oneway"] = oneway
         owc = oneway == "charge"
         owd = oneway == "discharge"
+        # 4.6: the SOC gate for leaving / staying off shore
+        minSoc = t["ONEWAY_MIN_SOC"] if owc else t["MIN_SOC"]
+        battMeanAny = battMeanLong if battMeanLong is not None else (
+            battMean if battMean is not None else (batt.v if batt is not None else 0.0))
+        sunCarrying = owc and soc is not None and soc.v >= minSoc and battMeanAny > 0
 
         needW = 0.0
         if not enabled:
@@ -623,7 +641,7 @@ class Engine:
                 status[1] = "No data: " + ", ".join(missing)
             status[0] = "red"
 
-        elif soc.v < t["SOC_EMERGENCY"] and st["state"] != "shore":
+        elif soc.v < t["SOC_EMERGENCY"] and st["state"] != "shore" and not sunCarrying:
             lockout()
             toShore("EMERGENCY SOC %.1f%%" % soc.v)
             status[0] = "red"
@@ -663,7 +681,7 @@ class Engine:
                 # the CVL into the loads; while charging one-way that is a
                 # step backward, and while discharging the loads drain the
                 # bank anyway (solar state, no deficit exit).
-                surplus = (aboveCvl and soc.v >= t["MIN_SOC"] and not shoreMissing
+                surplus = (aboveCvl and soc.v >= minSoc and not shoreMissing
                            and not latched and batt.v <= t["SURPLUS_QUIET_W"]
                            and not owc and not owd)
                 if surplus:
@@ -676,7 +694,7 @@ class Engine:
                     # Discharging: leave shore as soon as the charger is quiet
                     # (the sustain ceiling makes it so). Solar need not cover
                     # the load -- the deficit IS the plan.
-                    ready = (not shoreMissing and soc.v >= t["MIN_SOC"]
+                    ready = (not shoreMissing and soc.v >= minSoc
                              and quattroW <= t["SURPLUS_QUIET_W"])
                 else:
                     # Charging one-way: aboveCvl is judged against the
@@ -685,7 +703,7 @@ class Engine:
                     # the real target once sustain is released, so it is no
                     # reason to wait.
                     ready = (not shoreMissing and (not aboveCvl or owc)
-                             and soc.v >= t["MIN_SOC"] and not shaded
+                             and soc.v >= minSoc and not shaded
                              and quattroW <= t["SURPLUS_QUIET_W"] and (est >= needW or explore))
                 if ready:
                     if not st["readySince"]:
@@ -696,7 +714,7 @@ class Engine:
                 harvestArmed = ((st["refillReady"] is True and not st["refillShoreFed"]) or
                                 (st["refillReady"] is None and evidence >= t["HARVEST_MIN_EVID"]))
                 harvest = (harvestArmed and leadOn and dayOk and not shoreMissing and not aboveCvl
-                           and soc.v >= t["MIN_SOC"] and batt.v <= t["SURPLUS_QUIET_W"]
+                           and soc.v >= minSoc and batt.v <= t["SURPLUS_QUIET_W"]
                            and battV is not None and cvl is not None
                            and battV.v >= cvl.v - t["HARVEST_ARM_V"]
                            and not owc and not owd)
@@ -710,7 +728,7 @@ class Engine:
                 # while discharging one-way: a boost charges from solar, and
                 # dbus-recbms would refuse it under a sustain ceiling anyway.
                 if (not boosting and dayOk and vocMax >= t["VOC_DAY_V"] and not vocRising
-                        and not aboveCvl and not shoreMissing and soc.v >= t["MIN_SOC"]
+                        and not aboveCvl and not shoreMissing and soc.v >= minSoc
                         and quattroW <= t["SURPLUS_QUIET_W"] and not owd
                         and (now - st["lastBoostTs"]) >=
                         (t["BOOST_RETRY_MS"] if capSum <= 0 else t["BOOST_INTERVAL_MS"])):
@@ -958,7 +976,7 @@ class Engine:
                     lockout()
                     toShore("FAULT: AC re-accepted externally")
                     status[0] = "red"
-                elif soc.v < t["MIN_SOC"]:
+                elif soc.v < minSoc:
                     escalateBackoff()
                     toShore("SOC %.1f%% (entry %.1f%%)" % (soc.v, st["socEntry"]))
                     status[0] = "blue"
@@ -979,7 +997,7 @@ class Engine:
                     toShore("big load: batt -%.0fW, load %.0fW" % (discharge, loadNow.v))
                     status[0] = "blue"
                 elif (st["loadExceedStart"] and now - st["loadExceedStart"] >= t["LOAD_EXCEED_MS"]
-                      and dayOk and soc.v >= t["MIN_SOC"]
+                      and dayOk and soc.v >= minSoc
                       and battV is not None and cvl is not None
                       and battV.v >= cvl.v - t["STALL_BURN_MIN_V"]):
                     # Ceiling stall (v4.1): burn the band, no backoff

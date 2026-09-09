@@ -348,8 +348,9 @@ print("\n=== solar priority engine: one-way ===")
 SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priority")
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 5 and
-      scfg.engine["ONEWAY_EXIT_PCT"] == 1 and scfg.engine["ONEWAY_FULL_PCT"] == 100)
-check("engine version bumped", SP.ENGINE_VERSION == "4.5")
+      scfg.engine["ONEWAY_EXIT_PCT"] == 1 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
+      scfg.engine["ONEWAY_MIN_SOC"] == 25)
+check("engine version bumped", SP.ENGINE_VERSION == "4.6")
 Val = SP.Val
 
 
@@ -643,6 +644,41 @@ check("no re-assert inside the 30 s cycle", len(s.sustains) == n0)
 s.eng.st["sustainSent"] = None            # what _device_added does for the battery service
 s.tick(1)
 check("battery service re-appeared: floor re-asserted next tick", len(s.sustains) == n0 + 1 and s.sustain == 1)
+
+# ---- 4.6: one-way charge leaves shore under min_soc, above oneway_min_soc ----
+s = Sim()
+s.tick(1, soc=30.0, target=60, batt_v=54.4, cvl=54.69, batt=300.0)
+check("4.6: 30 -> 60 engages one-way charge with the floor", s.oneway == "charge" and s.sustain == 1)
+s.tick(340)
+check("4.6: probe at 30 % (min_soc 40 no longer gates one-way charge)", s.state == "probe", s.state)
+s.tick(95, batt=100.0, cvl=56.42)
+check("4.6: on solar at 30 %, floor released, real target", s.state == "solar" and s.sustain == 0)
+s.tick(120, soc=29.0, batt=150.0)
+check("4.6: 29 % while the sun carries the bank: no emergency", s.state == "solar" and
+      s.eng.st["lockoutUntil"] == 0, s.state)
+s.tick(700, soc=28.5, batt=-100.0)               # mean turns negative under 30 %
+check("4.6: 28.5 % with the bank draining: emergency lockout", s.state == "shore" and
+      s.eng.st["lockoutUntil"] > s.now and any("EMERGENCY SOC" in tr for tr in s.transitions), str(s.transitions[-1:]))
+s = Sim()
+s.tick(1, soc=27.0, target=60, batt_v=54.2, cvl=54.5, batt=300.0)
+s.tick(340)
+check("4.6: 27 % still probes (above oneway_min_soc)", s.state == "probe", s.state)
+s.tick(95, batt=100.0, cvl=56.42)
+s.tick(1, soc=24.9, batt=150.0)
+check("4.6: under oneway_min_soc the emergency lockout fires even with the sun carrying the bank",
+      s.state == "shore" and s.eng.st["lockoutUntil"] > s.now and "EMERGENCY SOC 24.9%" in (s.out.transition or ""),
+      str(s.out.transition))
+s = Sim()
+s.tick(1, soc=24.0, target=60, batt_v=54.0, cvl=54.3, batt=300.0)
+s.tick(340)
+check("4.6: 24 % does not leave shore", s.state == "shore", s.state)
+s = Sim()
+s.tick(341, soc=30.0, batt_v=54.4, cvl=54.69)     # no target: the normal engine keeps min_soc 40
+check("4.6: without one-way, 30 % still stays on shore", s.state == "shore", s.state)
+s = Sim()
+s.tick(1, soc=35.0, target=100, batt_v=54.9, cvl=55.2)
+s.tick(340)
+check("4.6: a full charge (100 %) is not one-way and keeps min_soc", s.state == "shore", s.state)
 
 # ---- the SOC floor still wins ----
 s = Sim()
