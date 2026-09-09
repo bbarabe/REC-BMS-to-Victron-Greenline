@@ -6,10 +6,13 @@ test_solar_priority.py — one-way charge / discharge, off the boat.
 
 Two halves, both against the stand-ins in test_stubs.py:
 
-  dbus-recbms   the Sustain control: /RecBms/Sustain/Request pins the CVL at
-                the PRESENT SOC, ratchets one way only, stays inside the real
-                slider, expires by itself, refuses boosts under a ceiling,
-                makes an equalization wait, and refuses when the BMS is stale.
+  dbus-recbms   the Sustain control: /RecBms/Sustain/Request anchors the hold
+                to the bank's own voltage (never the curve), gives the MPPTs a
+                band above it, steps one way only (a full SOC step, or the
+                band absorbed on sun), servos on the coulomb count, stays
+                inside the real slider, expires by itself, refuses boosts
+                under a ceiling, makes an equalization wait, and holds a
+                stale-BMS request pending.
 
   engine 4.3    the Engine class driven tick by tick through a charge day
                 (shore/sustain -> probe -> solar -> deficit -> shore/sustain
@@ -33,31 +36,59 @@ print("\n=== dbus-recbms: sustain ===")
 R = load(os.path.join(REPO, "dbus-recbms", "dbus_recbms.py"), "dbus_recbms")
 rcfg = R.Config(os.path.join(REPO, "dbus-recbms", "config.ini"))
 check("config: [sustain] parsed", rcfg.sustain_enabled and rcfg.sustain_hold_s == 120)
+check("config: servo and taper tunables", rcfg.sustain_servo_v == 0.02 and rcfg.sustain_servo_s == 30
+      and rcfg.sustain_servo_db == 0.1 and rcfg.sustain_servo_up == 0.5 and rcfg.sustain_servo_down == 2.0
+      and rcfg.sustain_taper_a == 3 and rcfg.sustain_taper_s == 60 and rcfg.sustain_q_idle_a == 1
+      and rcfg.sustain_pv_min_a == 0.5 and rcfg.sustain_band_v == 0.30 and rcfg.sustain_anchor_r == 0.003)
 
 T = [1_800_000_000.0]
 R.time = types.SimpleNamespace(time=lambda: T[0])
 drv = R.RecBmsDriver(rcfg)
 batt = drv.batt
-SOC = [62.0]
+SOC, V, I = [62.0], [56.6], [0.0]
+# Solar Priority on, and a systemcalc that honours the offset: the lead is
+# in force, so the Quattro is commanded target - lead exactly as on the boat
+drv.sp_enabled = True
+drv._boost_write = lambda volts, quiet=False: True
+LEAD = rcfg.solar_lead
+BAND = rcfg.sustain_band_v
+
+
+def ir(amps):
+    """the anchor's correction for the drop across the pack"""
+    return -amps * rcfg.sustain_anchor_r
 
 
 def live():
     drv.bms.update({
         "_lastUpdate": T[0], "socHiRes": SOC[0], "soc": int(SOC[0]),
-        "voltage": 56.6, "current": 0.0, "temperature": 21.0,
+        "voltage": V[0], "current": I[0], "temperature": 21.0,
         "cvl": 62.7, "ccl": 200.0, "dcl": 400.0, "dvl": 48.0,
         "minCellV": 3.70, "maxCellV": 3.75, "minCellT": 20.0, "maxCellT": 22.0,
     })
 
 
-def rtick(n=1, soc=None, slider=None, dt=1.0):
+def rtick(n=1, soc=None, slider=None, dt=1.0, v=None, i=None, pv=None, keep=True):
+    """One or more driver ticks. keep=True re-asserts an active hold every
+    tick, the way Solar Priority does every 30 s, so a scenario longer than
+    hold_s does not silently expire it; the expiry tests pass keep=False."""
     if soc is not None:
         SOC[0] = soc
+    if v is not None:
+        V[0] = v
+    if i is not None:
+        I[0] = i
     if slider is not None:
         FakeBus.store["/Settings/RecBms/ChargeSlider"] = slider
     for _ in range(n):
         T[0] += dt
+        if pv is not None:
+            drv.pv_current = (pv, T[0])
         live()
+        if keep and drv.sustain["active"]:
+            batt.write("/RecBms/Sustain/Request", drv.sustain["mode"])
+        if drv._last_pub_cvl is not None:
+            drv.eff_cv = (drv._last_pub_cvl + drv._last_offset, T[0])
         drv._tick()
 
 
@@ -65,85 +96,185 @@ def curve(pct):
     return round(drv._slider_cvl(pct), 2)
 
 
-rtick(soc=62, slider=80)
-check("slider published as /RecBms/TargetSoc", batt["/RecBms/TargetSoc"] == 80)
-check("no hold: CVL from the slider", batt["/RecBms/TargetChargeVoltage"] == curve(80))
-check("sustain telemetry idle", batt["/RecBms/Sustain/Active"] == 0 and
-      batt["/RecBms/Sustain/Status"] == "idle")
+def r2(x):
+    return round(x, 2)
 
+
+mppt = lambda: batt["/RecBms/TargetChargeVoltage"]      # the MPPT ceiling
+quattro = lambda: batt["/Info/MaxChargeVoltage"]        # what the Quattro is commanded
+hold = lambda: batt["/RecBms/Sustain/HoldVoltage"]
+
+rtick(n=12, soc=62, slider=80, pv=0.0)
+check("slider published as /RecBms/TargetSoc", batt["/RecBms/TargetSoc"] == 80)
+check("no hold: CVL from the slider, Quattro a lead under", mppt() == curve(80) and
+      quattro() == r2(curve(80) - LEAD), "%s %s" % (mppt(), quattro()))
+check("sustain telemetry idle", batt["/RecBms/Sustain/Active"] == 0 and
+      batt["/RecBms/Sustain/Status"] == "idle" and hold() is None)
+
+# ---- floor: anchored to the pack voltage, one band of solar headroom ----
 check("floor request accepted", batt.write("/RecBms/Sustain/Request", 1))
 rtick()
-check("floor: CVL = curve(present SOC + one snap)", batt["/RecBms/TargetChargeVoltage"] == curve(63),
-      "%s vs %s" % (batt["/RecBms/TargetChargeVoltage"], curve(63)))
+check("floor: Quattro commanded the pack voltage itself", quattro() == 56.6, str(quattro()))
+check("floor: MPPTs one band above it", mppt() == r2(56.6 + BAND), str(mppt()))
 check("floor telemetry", batt["/RecBms/Sustain/Active"] == 1 and
-      batt["/RecBms/Sustain/Mode"] == 1 and batt["/RecBms/Sustain/Soc"] == 63.0 and
+      batt["/RecBms/Sustain/Mode"] == 1 and batt["/RecBms/Sustain/Soc"] == 62.0 and
+      hold() == 56.6 and batt["/RecBms/Sustain/Servo"] == 0.0 and
       batt["/RecBms/Sustain/Status"] == "floor")
-rtick(soc=63.9)
-check("floor ignores a wobble under one step past the snap",
-      batt["/RecBms/TargetChargeVoltage"] == curve(63) and batt["/RecBms/Sustain/Soc"] == 63.0)
-rtick(soc=65)
-check("floor follows the bank up a full step", batt["/RecBms/TargetChargeVoltage"] == curve(65))
-rtick(soc=60)
-check("floor never follows it down", batt["/RecBms/TargetChargeVoltage"] == curve(65))
-rtick(slider=64)
-check("floor stays under the real slider", batt["/RecBms/TargetChargeVoltage"] == curve(64))
+rtick(soc=62.9, v=56.7)
+check("floor keeps every bit the sun adds, re-anchors only on a full step",
+      hold() == 56.6 and batt["/RecBms/Sustain/Soc"] == 62.9)
+rtick(soc=63.0, v=56.72, i=10.0, pv=12.0)             # solar did it: re-anchor
+A1 = r2(56.72 + ir(10.0))
+check("floor follows the bank up a full step and re-anchors to the pack voltage less the IR drop",
+      batt["/RecBms/Sustain/Soc"] == 63.0 and hold() == A1 and quattro() == A1 and
+      mppt() == r2(A1 + BAND), "%s %s %s" % (batt["/RecBms/Sustain/Soc"], hold(), mppt()))
+rtick(soc=60, v=56.5, i=-2.0, pv=0.0)
+check("floor never follows it down", batt["/RecBms/Sustain/Soc"] == 63.0 and hold() == A1)
+rtick(soc=64.0, v=56.9, i=4.0, pv=0.0)                # the Quattro did it (no sun): not counted
+check("a rise the Quattro charged is neither held nor anchored",
+      batt["/RecBms/Sustain/Soc"] == 63.0 and hold() == A1, "%s %s" % (batt["/RecBms/Sustain/Soc"], hold()))
+rtick(slider=62)
+check("floor never holds more than the slider", batt["/RecBms/Sustain/Soc"] == 62.0)
+check("...and the band closes once the bank is at the slider (standing lead only)", mppt() == hold() and
+      quattro() == r2(hold() - LEAD), "%s %s" % (mppt(), quattro()))
 rtick(slider=80)
-check("...and pops back when the slider rises", batt["/RecBms/TargetChargeVoltage"] == curve(65))
+check("...and pops back when the slider rises", batt["/RecBms/Sustain/Soc"] == 63.0 and
+      mppt() == r2(hold() + BAND))
+
+# ---- the 2026-09-07 case: a floor far under the slider's minimum ----
+batt.write("/RecBms/Sustain/Request", 0); rtick()
+rtick(n=2, soc=23.3, slider=60, v=53.9, i=-30.0, pv=0.0)
+check("below the curve: floor request accepted", batt.write("/RecBms/Sustain/Request", 1))
+rtick()
+A0 = r2(53.9 + ir(-30.0))                               # under a 30 A load: 0.09 V under rest
+check("below the curve: anchored to the pack (IR-corrected), not clipped to the curve's 40 % edge",
+      hold() == A0 and quattro() == A0 and mppt() == r2(A0 + BAND) and
+      batt["/RecBms/Sustain/Soc"] == 23.3, "%s %s %s" % (hold(), quattro(), mppt()))
+check("below the curve: nothing near curve(40) = %.2f" % curve(40), abs(quattro() - curve(40)) > 0.3)
+# the bank settles under the anchor overnight (taken under load): the servo lifts the command
+rtick(n=1, soc=23.15, i=-1.0, pv=0.0, dt=31)
+check("servo: bank 0.15 % under the held SOC with no sun -> command up one step",
+      hold() == r2(A0 + 0.02) and batt["/RecBms/Sustain/Servo"] == 0.02, "%s" % hold())
+rtick(n=5, dt=31)
+check("servo: one step per period", batt["/RecBms/Sustain/Servo"] == 0.12, str(batt["/RecBms/Sustain/Servo"]))
+rtick(n=2, dt=10)
+check("servo: not inside a period", batt["/RecBms/Sustain/Servo"] == 0.12, str(batt["/RecBms/Sustain/Servo"]))
+rtick(n=1, soc=23.3, i=0.5, dt=31)
+check("servo: bank back at the held SOC -> holds there", batt["/RecBms/Sustain/Servo"] == 0.12)
+rtick(n=1, soc=23.45, i=3.0, pv=0.0, dt=31)
+check("servo: the Quattro charging it 0.15 % above -> command down one step",
+      batt["/RecBms/Sustain/Servo"] == 0.10, str(batt["/RecBms/Sustain/Servo"]))
+rtick(n=1, soc=23.45, i=3.0, pv=4.0, dt=31)
+check("servo: same rise on sun (PV covers the current) is left alone, and kept",
+      batt["/RecBms/Sustain/Servo"] == 0.10 and batt["/RecBms/Sustain/Soc"] == 23.4,
+      "%s %s" % (batt["/RecBms/Sustain/Servo"], batt["/RecBms/Sustain/Soc"]))
+rtick(n=1, soc=23.45, i=3.0, pv=None, dt=31)
+drv.pv_current = None
+rtick(n=1, dt=31)
+check("servo: unknown PV current never lowers", batt["/RecBms/Sustain/Servo"] == 0.10)
+rtick(n=80, soc=22.0, i=-5.0, pv=0.0, dt=31)
+check("servo: bounded upward at servo_max_up_v", batt["/RecBms/Sustain/Servo"] == 0.5 and hold() == r2(A0 + 0.5))
+check("servo: MPPT ceiling rides on it", mppt() == r2(hold() + BAND))
+rtick(n=200, soc=24.0, i=5.0, pv=0.0, dt=31)
+check("servo: bounded downward at the larger servo_max_down_v",
+      batt["/RecBms/Sustain/Servo"] == -2.0 and hold() == r2(A0 - 2.0), str(batt["/RecBms/Sustain/Servo"]))
+
+# ---- staircase: the band absorbed on sun steps the hold up ----
+batt.write("/RecBms/Sustain/Request", 0); rtick()
+rtick(n=2, soc=30.0, slider=60, v=54.40, i=0.0, pv=0.0)
+batt.write("/RecBms/Sustain/Request", 1)
+rtick()
+check("staircase: anchored 54.40, band to %.2f" % r2(54.40 + BAND), hold() == 54.40 and mppt() == r2(54.40 + BAND))
+top = mppt()
+rtick(n=30, v=top - 0.01, i=20.0, pv=25.0)             # at the ceiling, still absorbing
+check("staircase: absorbing at the ceiling is not yet a step", hold() == 54.40)
+rtick(n=60, v=top - 0.01, i=0.0, pv=4.0)               # tapered: 59 s elapsed
+check("staircase: tapered 59 s: not yet", hold() == 54.40)
+rtick(n=1, v=top - 0.01, i=0.0, pv=4.0)                # 60 s
+check("staircase: tapered 60 s on sun -> re-anchored at the ceiling",
+      hold() == r2(top - 0.01) and mppt() == r2(top - 0.01 + BAND) and quattro() == hold(),
+      "%s %s" % (hold(), mppt()))
+top2 = mppt()
+rtick(n=70, v=top2 - 0.01, i=2.0, pv=0.0)              # same picture at night: the Quattro's overshoot
+check("staircase: never steps at night", hold() == r2(top - 0.01))
+rtick(n=70, v=top2 - 0.01, i=2.0, pv=0.8)              # a dribble of PV, the Quattro doing the work
+check("staircase: never steps while the Quattro is charging", hold() == r2(top - 0.01))
+rtick(n=70, v=top2 - 0.10, i=2.0, pv=4.0)              # sun, but under the ceiling
+check("staircase: never steps under the ceiling", hold() == r2(top - 0.01))
+rtick(n=61, v=top2 - 0.01, i=0.0, pv=4.0)
+check("staircase: second step", hold() == r2(top2 - 0.01), str(hold()))
+rtick(n=1, soc=31.5, v=hold() + 0.12, i=10.0, pv=20.0)
+check("staircase: a full SOC step also re-anchors (IR-corrected)", hold() == r2(top2 - 0.01 + 0.12 + ir(10.0)) and
+      batt["/RecBms/Sustain/Soc"] == 31.5, str(hold()))
 
 # EQ due while held: it must wait, not run
 FakeBus.store["/Settings/RecBms/EqLastCompleted"] = 0
 rtick()
 check("equalization waits under a hold", not drv.eq["active"] and
-      batt["/RecBms/EqStatus"] == "" and batt["/RecBms/TargetChargeVoltage"] == curve(65))
+      batt["/RecBms/EqStatus"] == "" and mppt() == r2(hold() + BAND))
 
-# re-assert refreshes the expiry and keeps the ratchet
-rtick(n=1, dt=100)
+# re-assert refreshes the expiry and keeps the anchor
+h = hold()
+rtick(n=1, dt=100, keep=False)
 check("re-assert accepted", batt.write("/RecBms/Sustain/Request", 1))
-rtick(n=1, dt=100)
-check("re-asserted hold survives past the original expiry",
-      batt["/RecBms/Sustain/Active"] == 1 and batt["/RecBms/TargetChargeVoltage"] == curve(65))
-rtick(n=1, dt=125)
+rtick(n=1, dt=100, keep=False)
+check("re-asserted hold survives past the original expiry, anchor kept",
+      batt["/RecBms/Sustain/Active"] == 1 and hold() == h)
+rtick(n=1, dt=125, keep=False)
 check("hold expires on its own", batt["/RecBms/Sustain/Active"] == 0 and
       batt["/RecBms/Sustain/Status"].startswith("expired") and
-      batt["/RecBms/Sustain/Request"] == 0)
-check("slider back in force after expiry", batt["/RecBms/TargetChargeVoltage"] == curve(80) + rcfg.eq_boost
-      or batt["/RecBms/TargetChargeVoltage"] == curve(80), str(batt["/RecBms/TargetChargeVoltage"]))
+      batt["/RecBms/Sustain/Request"] == 0 and hold() is None)
+check("slider back in force after expiry", mppt() == curve(60) + rcfg.eq_boost
+      or mppt() == curve(60), str(mppt()))
 check("equalization starts once released", drv.eq["active"])
 drv.eq["active"] = False
 FakeBus.store["/Settings/RecBms/EqLastCompleted"] = T[0]
 
-# ceiling
-rtick(soc=90, slider=70)
+# ---- ceiling: anchored, nothing charges above it, Quattro a lead under ----
+rtick(n=2, soc=90, slider=70, v=60.3, i=0.0, pv=0.0)
 check("ceiling request accepted", batt.write("/RecBms/Sustain/Request", 2))
 rtick()
-check("ceiling: CVL = curve(present SOC - one snap)", batt["/RecBms/TargetChargeVoltage"] == curve(89) and
-      batt["/RecBms/Sustain/Mode"] == 2 and batt["/RecBms/Sustain/Status"] == "ceiling")
-rtick(soc=88.3)
-check("ceiling ignores a wobble under one step past the snap", batt["/RecBms/TargetChargeVoltage"] == curve(89))
-rtick(soc=85)
-check("ceiling follows the bank down a full step", batt["/RecBms/TargetChargeVoltage"] == curve(85))
-rtick(soc=88)
-check("ceiling never follows it up", batt["/RecBms/TargetChargeVoltage"] == curve(85))
-rtick(soc=69)
-check("ceiling never goes under the real slider", batt["/RecBms/TargetChargeVoltage"] == curve(70))
+check("ceiling: MPPTs at the pack voltage, Quattro a lead under",
+      mppt() == 60.3 and quattro() == r2(60.3 - LEAD) and hold() == 60.3 and
+      batt["/RecBms/Sustain/Mode"] == 2 and batt["/RecBms/Sustain/Status"] == "ceiling",
+      "%s %s" % (mppt(), quattro()))
+rtick(soc=89.3, v=60.2, i=-10.0)
+check("ceiling follows the drain, re-anchors only on a full step", hold() == 60.3 and batt["/RecBms/Sustain/Soc"] == 89.3)
+rtick(soc=89.0, v=60.15, i=-10.0)
+C1 = r2(60.15 + ir(-10.0))
+check("ceiling follows the bank down a full step and re-anchors lower (IR-corrected)",
+      hold() == C1 and mppt() == C1 and batt["/RecBms/Sustain/Soc"] == 89.0, str(hold()))
+rtick(soc=91, v=60.5, i=6.0, pv=8.0)
+check("ceiling never follows it up", hold() == C1 and batt["/RecBms/Sustain/Soc"] == 89.0)
+rtick(n=1, soc=89.0, v=60.2, i=3.0, pv=0.0, dt=31)
+check("ceiling: the Quattro holding it -> command down", batt["/RecBms/Sustain/Servo"] == -0.02 and
+      hold() == r2(C1 - 0.02), str(hold()))
+rtick(n=1, soc=88.5, v=60.1, i=-4.0, pv=0.0, dt=31)
+check("ceiling: a drain is the plan, no servo up", batt["/RecBms/Sustain/Servo"] == -0.02)
+rtick(soc=69, v=58.5, i=-4.0)
+check("ceiling never goes under the real slider", mppt() >= curve(70) and batt["/RecBms/Sustain/Soc"] == 70.0,
+      "%s vs %s" % (mppt(), curve(70)))
+rtick(soc=60, v=57.0, i=0.0)
+check("ceiling under the slider: MPPTs may charge back up to the slider's point",
+      mppt() == curve(70) and hold() == 57.0, "%s vs %s" % (mppt(), curve(70)))
 check("boost refused under a ceiling", not batt.write("/RecBms/SolarBoost/Request", 0.2) and
       batt["/RecBms/SolarBoost/Status"] == "refused: sustain ceiling active")
 
-# switching mode re-samples; release restores the slider
-rtick(soc=75)
+# switching mode re-anchors; release restores the slider
+rtick(soc=75, v=58.9, i=0.0)
 check("floor request while ceiling held", batt.write("/RecBms/Sustain/Request", 1))
 rtick()
-check("mode switch re-samples the SOC", batt["/RecBms/Sustain/Mode"] == 1 and
-      drv.sustain["soc"] == 76.0 and batt["/RecBms/Sustain/Soc"] == 70.0 and
-      batt["/RecBms/TargetChargeVoltage"] == curve(70),
-      "floor 75 clipped to slider 70 -> %s" % batt["/RecBms/TargetChargeVoltage"])
+check("mode switch re-anchors", batt["/RecBms/Sustain/Mode"] == 1 and
+      drv.sustain["soc"] == 75.0 and batt["/RecBms/Sustain/Soc"] == 70.0 and hold() == 58.9 and
+      mppt() == 58.9 and quattro() == r2(58.9 - LEAD),
+      "floor 75 over slider 70: no band, standing lead -> %s %s" % (mppt(), quattro()))
 check("release accepted", batt.write("/RecBms/Sustain/Request", 0))
 rtick()
-check("released: slider CVL, telemetry cleared", batt["/RecBms/TargetChargeVoltage"] == curve(70) and
-      batt["/RecBms/Sustain/Active"] == 0 and batt["/RecBms/Sustain/Soc"] is None)
+check("released: slider CVL, telemetry cleared", mppt() == curve(70) and
+      batt["/RecBms/Sustain/Active"] == 0 and batt["/RecBms/Sustain/Soc"] is None and hold() is None)
 
 # charge current limit while held: PV current + charge_limit_a, MPPT-safe
-rtick(soc=62, slider=80)
+rtick(n=2, soc=62, slider=80, v=56.6, i=0.0, pv=0.0)
 check("ccl: full REC limit without a hold", batt["/Info/MaxChargeCurrent"] == 200.0)
 drv.pv_current = (3.0, T[0])
 check("ccl: floor request", batt.write("/RecBms/Sustain/Request", 1))
@@ -170,29 +301,47 @@ rtick()
 check("ccl: full limit back once released", batt["/Info/MaxChargeCurrent"] == 200.0 and
       batt["/RecBms/Sustain/ChargeLimit"] is None)
 
-# stale BMS: no present SOC to pin -> pending, sampled on the first live tick
+# stale BMS: no present SOC to pin -> pending, anchored on the first live tick
 drv.bms["_lastUpdate"] = T[0] - 100
 check("pending while the BMS is stale", batt.write("/RecBms/Sustain/Request", 1) and
       batt["/RecBms/Sustain/Status"] == "pending: no SOC yet" and batt["/RecBms/Sustain/Active"] == 1)
 T[0] += 1; drv._tick()                                  # still stale: slider applies, hold waits
-check("pending: slider CVL meanwhile", batt["/RecBms/TargetChargeVoltage"] == curve(80) and
-      batt["/RecBms/Sustain/Soc"] is None,
-      "cvl %s vs %s, soc %s, status %s" % (batt["/RecBms/TargetChargeVoltage"], curve(80),
+check("pending: slider CVL meanwhile", mppt() == curve(80) and
+      batt["/RecBms/Sustain/Soc"] is None and hold() is None,
+      "cvl %s vs %s, soc %s, status %s" % (mppt(), curve(80),
                                           batt["/RecBms/Sustain/Soc"], batt["/RecBms/Sustain/Status"]))
-rtick(soc=64)                                           # BMS back: sampled and snapped
+rtick(soc=64, v=56.8)                                   # BMS back: anchored
 check("pending hold starts on the first live tick", batt["/RecBms/Sustain/Status"] == "floor" and
-      batt["/RecBms/Sustain/Soc"] == 65.0 and batt["/RecBms/TargetChargeVoltage"] == curve(65))
+      batt["/RecBms/Sustain/Soc"] == 64.0 and hold() == 56.8 and mppt() == r2(56.8 + BAND))
 batt.write("/RecBms/Sustain/Request", 0); rtick()
 check("bad mode refused", not batt.write("/RecBms/Sustain/Request", 7))
 
-# pure ratchet corner: no SOC (fallback) keeps the last hold, still clipped
-check("ratchet: floor without SOC keeps and clips",
-      R.sustain_ratchet(1, 65, None, 60, 40, 100) == (65, 60) and
-      R.sustain_ratchet(2, 65, None, 70, 40, 100) == (65, 70) and
-      R.sustain_ratchet(1, 30, 35, 80, 40, 100) == (35, 40) and
-      R.sustain_ratchet(1, 60, 60.9, 80, 40, 100) == (60, 60) and
-      R.sustain_ratchet(1, 60, 61.0, 80, 40, 100) == (61, 61) and
-      R.sustain_ratchet(2, 60, 59.2, 40, 40, 100) == (60, 60))
+# lead not in force (Solar Priority off): a floor has no band to give
+drv.sp_enabled = False
+rtick(n=2, soc=62, slider=80, v=56.6, i=0.0, pv=0.0)
+batt.write("/RecBms/Sustain/Request", 1); rtick()
+check("no lead: floor holds the Quattro AND the MPPTs at the pack voltage",
+      mppt() == 56.6 and quattro() == 56.6, "%s %s" % (mppt(), quattro()))
+batt.write("/RecBms/Sustain/Request", 0); rtick()
+drv.sp_enabled = True
+
+# pure pieces
+check("hold: floor up on sun only, never down; ceiling down always, never up; None keeps",
+      R.sustain_hold(1, 60, 60.9, False) == 60.9 and R.sustain_hold(1, 60, 60.9, True) == 60 and
+      R.sustain_hold(1, 60, 50, False) == 60 and R.sustain_hold(2, 60, 59.2, False) == 59.2 and
+      R.sustain_hold(2, 60, 59.2, True) == 59.2 and R.sustain_hold(2, 60, 70, False) == 60 and
+      R.sustain_hold(1, 60, None, False) == 60)
+check("servo: floor up on a sag, down only when the Quattro charges above, else hold",
+      R.sustain_servo(1, -0.2, False, 0.1) == 1 and R.sustain_servo(1, -0.2, True, 0.1) == 1 and
+      R.sustain_servo(1, 0.2, True, 0.1) == -1 and R.sustain_servo(1, 0.2, False, 0.1) == 0 and
+      R.sustain_servo(1, 0.05, True, 0.1) == 0 and R.sustain_servo(1, -0.05, False, 0.1) == 0)
+check("servo: ceiling down whenever the Quattro charges, never up",
+      R.sustain_servo(2, 0.0, True, 0.1) == -1 and R.sustain_servo(2, -3.0, True, 0.1) == -1 and
+      R.sustain_servo(2, -3.0, False, 0.1) == 0 and R.sustain_servo(2, 3.0, False, 0.1) == 0)
+check("shore_charging: battery current over PV current by more than idle",
+      R.shore_charging(3.0, 0.0, 1.0) and not R.shore_charging(3.0, 4.0, 1.0) and
+      not R.shore_charging(1.0, 0.0, 1.0) and not R.shore_charging(3.0, None, 1.0) and
+      not R.shore_charging(None, 0.0, 1.0))
 
 # ================================================================ engine 4.3
 print("\n=== solar priority engine: one-way ===")

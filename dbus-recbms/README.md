@@ -268,53 +268,87 @@ Things dvcc.py does that are worth knowing:
   to 0 as well — solar is off during a CAN outage on shore; when inverting
   the MPPTs still get 0 + inverter draw, so they keep carrying loads.
 
-## Sustain (v1.5.0)
+## Sustain (v1.5.0, voltage-anchored since v1.8.0)
 
-A request-and-forget control that makes the driver **read the Max Charge
-slider as the present SOC**: the CVL curve is evaluated at the SOC the bank is
-at, so the chargers hold it where it is instead of moving it. It exists for
-Solar Priority's one-way charge/discharge (below) — shore should only ever
-*sustain* the bank while solar, or the loads, do the moving — but any client
-may use it.
+A request-and-forget control that makes the driver **hold the bank where it
+is** instead of moving it. It exists for Solar Priority's one-way
+charge/discharge (below) — shore should only ever *sustain* the bank while
+solar, or the loads, do the moving — but any client may use it.
 
 | path | |
 |---|---|
 | `/RecBms/Sustain/Request` | **writeable** — `1` floor, `2` ceiling, `0` release. Reads back `-1` while active, so a repeated write (re-assert) and a release are both seen (a D-Bus write of the value a path already holds never reaches the driver) |
 | `/RecBms/Sustain/Active` | 0/1 |
 | `/RecBms/Sustain/Mode` | the mode in force |
-| `/RecBms/Sustain/Soc` | the SOC the CVL is evaluated at |
+| `/RecBms/Sustain/Soc` | the SOC being held (bounded by the slider) |
+| `/RecBms/Sustain/HoldVoltage` | the voltage the hold sits at: the Quattro's command under a floor, the MPPT ceiling under a ceiling |
+| `/RecBms/Sustain/Servo` | the SOC servo's correction, included in `HoldVoltage` |
 | `/RecBms/Sustain/SecondsLeft` | countdown to automatic expiry |
 | `/RecBms/Sustain/Status` | `idle` / `floor` / `ceiling` / why it ended or was refused |
 | `/RecBms/TargetSoc` | the slider itself, as the driver reads it each tick |
 
-The held SOC is a **one-way ratchet with hysteresis**. A *floor* follows the
-bank upward only, and only in whole steps (`step_pct`, 1 %): solar may raise
-it and the held level steps up with it, the charger never lets it fall. A
-*ceiling* follows it downward only, in the same steps: the loads may lower it,
-nothing raises it. The step matters: the Quattro's re-absorb bursts nudge the
-hi-res SOC by hundredths of a percent, and without it every nudge would lift
-the CVL a few millivolts for the next burst to start from.
+**A hold is anchored to the bank's measured voltage**, never to the CVL
+curve. The curve is calibrated on settled holds between 58.6 and 62.3 %
+and is only a guess elsewhere: on 2026-09-07 a floor was requested at 23 %
+after a motoring stint, v1.5 clipped it to the slider's 40 % minimum and
+the curve's 54.42 V there — which this pack reaches at 30 % by coulomb
+count — and every charger then sat at that ceiling through two sunny days
+while the ratchet waited for a 41 % that could never come. Now:
 
-The hold also **starts one step in its own direction** (`snap_pct`, 1 %): a
-floor requested with the bank at 59.8 % holds 60.8 %. This compensates the
-solar lead — the Quattro is commanded `solar_lead_v` (0.15 V, about 1.5 % on
-the curve) under the point, and a floor at the exact SOC was measured
-settling 1.4 % low overnight (2026-09-02). Snapped one step up, its command
-lands 0.05 V under the true point, so with its usual overshoot it holds
-within roughly −0.2 % to +1 % of where the bank was; and the ratchet's first
-move then needs the bank two full steps above its start, beyond anything the
-charger's overshoot can do. Neither crosses the real slider — a floor is capped at the slider,
-a ceiling floored at it — and a boost is refused while a ceiling is held,
-since a boost charges from solar. An equalization that falls due during a
-hold waits (its timestamp is untouched, so it stays due) rather than charging
-from shore.
+- **Floor.** The Quattro is commanded the pack voltage as it was when the
+  hold was taken (less the drop across the pack's resistance,
+  `anchor_ir_mohm`, so a bank being charged at that moment does not anchor
+  high nor one under load low); the MPPTs get `band_v` (0.30 V) of solar
+  headroom above it — the standing lead is widened to that while the floor
+  holds, so the sun is taken at full MPPT current rather than throttled
+  inside a band the bank fills in an hour. The held SOC follows the bank
+  **up only**, continuously — every hundredth of a percent the sun adds is
+  kept, but never a rise the Quattro made — and the hold voltage
+  re-anchors to the present (resistance-corrected) pack voltage when the
+  held SOC has gained a full `step_pct` (1 %) since the last anchor, or
+  when the **band is absorbed** — the pack sits at the MPPT ceiling with the
+  charge current tapered to `taper_a` (3 A) or less, on sun (`pv_min_a`)
+  and with the Quattro idle, for `taper_s` (60 s). The second trigger is
+  the safety net where the curve is steep: a band there may be less than a
+  full SOC step, and a hold waiting for the step alone would stall the way
+  v1.5 did. Never at night: the sun condition sees to that.
+- **Ceiling.** The mirror image: the MPPTs are held at the pack voltage as
+  it was (nothing charges above it), the Quattro a lead under. The held
+  SOC follows the bank **down only** and the voltage re-anchors on each
+  full step down.
+- **SOC servo.** Between steps the coulomb count is held exactly. Every
+  `servo_period_s` (30 s) the hold voltage moves one `servo_step_v`
+  (0.02 V) when the bank is more than `servo_deadband_pct` (0.1 %) from the
+  held SOC in the direction the hold forbids: under a floor **up** while
+  the bank sits below the held SOC (a sag the Quattro is not covering) and
+  **down** while the Quattro is charging it above; under a ceiling down
+  whenever the Quattro is charging. Solar raising the bank is never fought.
+  "The Quattro is charging" is *battery current minus PV current* above
+  `quattro_idle_a` — with no DC meter, systemcalc's DC-system estimate makes
+  that exactly the Quattro's contribution. The correction starts from zero
+  at every anchor and is bounded — `servo_max_up_v` (0.5 V) upward, so a
+  load the Quattro's 5 A cap cannot cover does not wind it up all night,
+  and `servo_max_down_v` (2.0 V) downward, since an anchor taken mid-bulk
+  can sit a volt above the bank's rest and the Quattro feeds the bank at
+  its cap until the command is under it. So a high or low anchor is taken
+  out within minutes, and the Quattro's own +0.05..0.15 V hold bias — the
+  reason v1.5 needed `snap_pct`, which is gone — no longer matters.
+
+The effect, watched on the SOC, is a **pure staircase**: flat to a tenth of
+a percent while there is no sun, rising while there is, never a step back.
+A floor never holds more than the owner set (the servo judges the bank
+against the slider when that is lower, and the band closes once the bank
+reaches it) and a ceiling never less; a boost is refused while a ceiling is
+held, since a boost charges from solar. An equalization that falls due
+during a hold waits (its timestamp is untouched, so it stays due) rather
+than charging from shore.
 
 **It is never sticky.** Like the boost it expires by itself after `[sustain]
 hold_s` (120 s) unless re-asserted (re-asserting the same mode refreshes the
-expiry and keeps the ratchet; a different mode re-samples), it is never
+expiry and keeps the anchor; a different mode re-anchors), it is never
 persisted, and it dies with the process — a restart always comes back on the
-real slider. A request is refused while the BMS is not live: there is no
-present SOC to pin.
+real slider. A request while the BMS is not live is taken as *pending* and
+anchored on the first live tick.
 
 **Charge current limit** (`charge_limit_a`, 5 A): while a hold is in force
 the published CCL becomes *present PV current + 5 A*. DVCC gives the MPPTs the
@@ -328,13 +362,9 @@ supposed to be sustained. No CVL stops that, and `/Dc/0/MaxChargeCurrent` on
 the vebus service accepts a write and ignores it on this firmware. The cap is
 lifted during a solar boost (the measurement needs the MPPTs truly
 unthrottled) and not applied when PV current cannot be read;
-`/RecBms/Sustain/ChargeLimit` shows the limit in force.
-
-The pin is only as good as the CVL curve. It is calibrated on settled holds,
-so at rest the chargers neither fill nor drain; a freshly solar-charged bank
-sits above its curve point for a while (the charger simply idles until it
-relaxes) and below ~50 % the curve is known to settle a little high. Both are
-within the deadband one-way mode uses.
+`/RecBms/Sustain/ChargeLimit` shows the limit in force. It is also what
+bounds the servo's worst case: however wrong an anchor, the Quattro can put
+no more than 5 A into the bank while the servo walks the command back down.
 
 ## Solar Priority driver (`solar_priority.py`, dbus-solarpriority)
 
@@ -435,9 +465,12 @@ normal shore → probe → solar cycle does the charging — whenever the sun
 carries the loads, shore is dropped and the surplus fills the bank up to the
 real target. Whenever shore is connected (shore, suspend) the engine asks
 dbus-recbms to **sustain a floor**: the Quattro holds the bank where solar
-left it and feeds the loads, and never charges it. The held level rises with
-the bank and the next probe releases it, so the morning's solar charges
-freely. Burn-downs (surplus and harvest) are off — they spend the band into
+left it and feeds the loads, and never charges it. Since dbus-recbms 1.8.0
+the floor is anchored to the bank's own voltage and servoed on its SOC (see
+Sustain above), so the hold is exact — no overnight sag — and the MPPTs
+keep one lead of headroom above it, so the sun is taken on shore too, band
+by band. The held level rises with the bank and the next probe releases it,
+so the morning's solar charges freely. Burn-downs (surplus and harvest) are off — they spend the band into
 the loads, a step backward — and the probe is not held back by a bank that
 sits above the sustain CVL (it runs against the real target).
 

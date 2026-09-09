@@ -24,8 +24,9 @@ What it does (see README.md "Solar Priority driver"):
     more than ONEWAY_ENTER_PCT away from the SOC, the bank is only ever
     moved in that direction. Charging: solar does all the charging (the
     normal shore -> probe -> solar cycle), and whenever shore is connected
-    dbus-recbms is asked to SUSTAIN the bank (read the slider as the present
-    SOC, floor mode) so the Quattro holds instead of charging. Discharging:
+    dbus-recbms is asked to SUSTAIN the bank (a floor anchored to the bank's
+    own voltage and SOC, dbus-recbms >= 1.8.0) so the Quattro holds it
+    exactly where solar left it instead of charging. Discharging:
     the bank is sustained as a ceiling the whole time (nothing may charge
     it), shore is left as soon as the gates allow, and the loads drain the
     bank day and night while solar covers what it can. Ends within

@@ -6,7 +6,7 @@ test_recbms.py — off-boat checks for dbus-recbms pure logic.
 
 Loads dbus_recbms.py under the test_stubs stand-ins and exercises the
 functions that need no bus: the solar lead gate (v1.7.0) and the sustain
-ratchet. Exit status is 0 only if everything passes.
+step and servo (v1.8.0). Exit status is 0 only if everything passes.
 """
 from test_stubs import *   # noqa: F401,F403
 
@@ -29,11 +29,17 @@ check("slider 99.9 just under full: lead", L(0.15, 99.9, 100, True) == 0.15)
 check("lead 0 in config: never", L(0.0, 80, 100, True) == 0.0)
 check("full_pct 95, slider 95: no lead", L(0.15, 95, 95, True) == 0.0)
 
-print("\n=== dbus-recbms: sustain ratchet (regression) ===")
-F = R.SUSTAIN_FLOOR
-r = R.sustain_ratchet(F, 90.0, 92.0, 80.0, 40, 100)
-eff = r[1]   # (held unclipped, effective)
-check("floor never above slider", eff <= 80.0, str(r))
+print("\n=== dbus-recbms: sustain step / servo (regression) ===")
+F, C = R.SUSTAIN_FLOOR, R.SUSTAIN_CEILING
+check("floor follows the sun up, never the Quattro, never down",
+      R.sustain_hold(F, 90.0, 92.0, False) == 92.0 and R.sustain_hold(F, 90.0, 92.0, True) == 90.0
+      and R.sustain_hold(F, 90.0, 80.0, False) == 90.0)
+check("ceiling follows the drain down, never up", R.sustain_hold(C, 90.0, 88.0, False) == 88.0 and
+      R.sustain_hold(C, 90.0, 88.0, True) == 88.0 and R.sustain_hold(C, 90.0, 95.0, False) == 90.0)
+check("servo never fights solar", R.sustain_servo(F, 0.5, False, 0.1) == 0)
+check("servo lifts a sagging floor", R.sustain_servo(F, -0.5, False, 0.1) == 1)
+check("servo lowers a Quattro-fed floor", R.sustain_servo(F, 0.5, True, 0.1) == -1)
+check("servo lowers any Quattro-fed ceiling", R.sustain_servo(C, -0.5, True, 0.1) == -1)
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:
