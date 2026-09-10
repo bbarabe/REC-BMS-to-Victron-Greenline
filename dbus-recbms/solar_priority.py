@@ -74,7 +74,7 @@ import dbus.mainloop.glib
 from gi.repository import GLib
 
 VERSION = "1.4.0"
-ENGINE_VERSION = "4.6"
+ENGINE_VERSION = "4.7"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-solarpriority")
@@ -158,6 +158,11 @@ ENGINE_DEFAULTS = {
     # lockout is skipped only while the bank's ten-minute mean is positive
     # (the sun IS carrying it).
     "ONEWAY_MIN_SOC": 25,
+    # 4.7: a measurement boost needs this much PV actually flowing. On the
+    # evening of 2026-09-09 eight boosts fired at fifteen-minute intervals
+    # on a marina-light open-circuit voltage with zero yield; each lifts
+    # dbus-recbms' sustain charge-current cap for two minutes for nothing.
+    "BOOST_MIN_PV_W": 20,
 }
 
 
@@ -728,6 +733,7 @@ class Engine:
                 # while discharging one-way: a boost charges from solar, and
                 # dbus-recbms would refuse it under a sustain ceiling anyway.
                 if (not boosting and dayOk and vocMax >= t["VOC_DAY_V"] and not vocRising
+                        and pvNow >= t["BOOST_MIN_PV_W"]
                         and not aboveCvl and not shoreMissing and soc.v >= minSoc
                         and quattroW <= t["SURPLUS_QUIET_W"] and not owd
                         and (now - st["lastBoostTs"]) >=

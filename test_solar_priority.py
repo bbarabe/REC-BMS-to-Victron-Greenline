@@ -120,9 +120,12 @@ check("floor telemetry", batt["/RecBms/Sustain/Active"] == 1 and
       batt["/RecBms/Sustain/Mode"] == 1 and batt["/RecBms/Sustain/Soc"] == 62.0 and
       hold() == 56.6 and batt["/RecBms/Sustain/Servo"] == 0.0 and
       batt["/RecBms/Sustain/Status"] == "floor")
-rtick(soc=62.9, v=56.7)
+rtick(soc=62.9, v=56.7, pv=5.0)
 check("floor keeps every bit the sun adds, re-anchors only on a full step",
       hold() == 56.6 and batt["/RecBms/Sustain/Soc"] == 62.9)
+rtick(soc=62.95, v=56.7, i=0.5, pv=0.0)
+check("...but not a rise made without the sun (Quattro trickle at night)",
+      batt["/RecBms/Sustain/Soc"] == 62.9, str(batt["/RecBms/Sustain/Soc"]))
 rtick(soc=63.0, v=56.72, i=10.0, pv=12.0)             # solar did it: re-anchor
 A1 = r2(56.72 + ir(10.0))
 check("floor follows the bank up a full step and re-anchors to the pack voltage less the IR drop",
@@ -152,13 +155,16 @@ check("below the curve: anchored to the pack (IR-corrected), not clipped to the 
       batt["/RecBms/Sustain/Soc"] == 23.3, "%s %s %s" % (hold(), quattro(), mppt()))
 check("below the curve: nothing near curve(40) = %.2f" % curve(40), abs(quattro() - curve(40)) > 0.3)
 # the bank settles under the anchor overnight (taken under load): the servo lifts the command
-rtick(n=1, soc=23.15, i=-1.0, pv=0.0, dt=31)
-check("servo: bank 0.15 % under the held SOC with no sun -> command up one step",
+rtick(n=1, soc=23.15, i=-2.0, pv=0.0, dt=31)
+check("servo: bank 0.15 % under the held SOC and draining -> command up one step",
       hold() == r2(A0 + 0.02) and batt["/RecBms/Sustain/Servo"] == 0.02, "%s" % hold())
 rtick(n=5, dt=31)
 check("servo: one step per period", batt["/RecBms/Sustain/Servo"] == 0.12, str(batt["/RecBms/Sustain/Servo"]))
 rtick(n=2, dt=10)
 check("servo: not inside a period", batt["/RecBms/Sustain/Servo"] == 0.12, str(batt["/RecBms/Sustain/Servo"]))
+rtick(n=3, soc=23.15, i=0.0, dt=31)
+check("servo: still under the held SOC but no longer draining (Quattro covering) -> holds",
+      batt["/RecBms/Sustain/Servo"] == 0.12, str(batt["/RecBms/Sustain/Servo"]))
 rtick(n=1, soc=23.3, i=0.5, dt=31)
 check("servo: bank back at the held SOC -> holds there", batt["/RecBms/Sustain/Servo"] == 0.12)
 rtick(n=1, soc=23.45, i=3.0, pv=0.0, dt=31)
@@ -326,15 +332,17 @@ batt.write("/RecBms/Sustain/Request", 0); rtick()
 drv.sp_enabled = True
 
 # pure pieces
-check("hold: floor up on sun only, never down; ceiling down always, never up; None keeps",
-      R.sustain_hold(1, 60, 60.9, False) == 60.9 and R.sustain_hold(1, 60, 60.9, True) == 60 and
-      R.sustain_hold(1, 60, 50, False) == 60 and R.sustain_hold(2, 60, 59.2, False) == 59.2 and
-      R.sustain_hold(2, 60, 59.2, True) == 59.2 and R.sustain_hold(2, 60, 70, False) == 60 and
-      R.sustain_hold(1, 60, None, False) == 60)
-check("servo: floor up on a sag, down only when the Quattro charges above, else hold",
-      R.sustain_servo(1, -0.2, False, 0.1) == 1 and R.sustain_servo(1, -0.2, True, 0.1) == 1 and
+check("hold: floor up on sun only, never at night or from the Quattro, never down; ceiling down always; None keeps",
+      R.sustain_hold(1, 60, 60.9, False, True) == 60.9 and R.sustain_hold(1, 60, 60.9, True, True) == 60 and
+      R.sustain_hold(1, 60, 60.9, False, False) == 60 and
+      R.sustain_hold(1, 60, 50, False, True) == 60 and R.sustain_hold(2, 60, 59.2, False, False) == 59.2 and
+      R.sustain_hold(2, 60, 59.2, True, True) == 59.2 and R.sustain_hold(2, 60, 70, False, True) == 60 and
+      R.sustain_hold(1, 60, None, False, True) == 60)
+check("servo: floor up only while draining under the line, down only when the Quattro charges above, else hold",
+      R.sustain_servo(1, -0.2, False, 0.1, True) == 1 and R.sustain_servo(1, -0.2, False, 0.1, False) == 0 and
+      R.sustain_servo(1, -0.2, True, 0.1, True) == 1 and
       R.sustain_servo(1, 0.2, True, 0.1) == -1 and R.sustain_servo(1, 0.2, False, 0.1) == 0 and
-      R.sustain_servo(1, 0.05, True, 0.1) == 0 and R.sustain_servo(1, -0.05, False, 0.1) == 0)
+      R.sustain_servo(1, 0.05, True, 0.1) == 0 and R.sustain_servo(1, -0.05, False, 0.1, True) == 0)
 check("servo: ceiling down whenever the Quattro charges, never up",
       R.sustain_servo(2, 0.0, True, 0.1) == -1 and R.sustain_servo(2, -3.0, True, 0.1) == -1 and
       R.sustain_servo(2, -3.0, False, 0.1) == 0 and R.sustain_servo(2, 3.0, False, 0.1) == 0)
@@ -350,7 +358,7 @@ scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 5 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 1 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25)
-check("engine version bumped", SP.ENGINE_VERSION == "4.6")
+check("engine version bumped", SP.ENGINE_VERSION == "4.7")
 Val = SP.Val
 
 
@@ -679,6 +687,13 @@ s = Sim()
 s.tick(1, soc=35.0, target=100, batt_v=54.9, cvl=55.2)
 s.tick(340)
 check("4.6: a full charge (100 %) is not one-way and keeps min_soc", s.state == "shore", s.state)
+
+# ---- 4.7: no measurement boost without real PV ----
+s = Sim()
+s.tick(400, soc=60, target=80, pv=0.0, m=1, voc=62.0, batt_v=56.4)   # dusk: Voc up, yield nil
+check("4.7: no boost on an open-circuit voltage with no yield", s.boosts == [], str(s.boosts))
+s.tick(400, pv=60.0)
+check("4.7: boost once PV is flowing", s.boosts and s.boosts[-1] == s.t["BOOST_V"], str(s.boosts))
 
 # ---- the SOC floor still wins ----
 s = Sim()

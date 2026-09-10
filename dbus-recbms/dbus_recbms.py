@@ -113,7 +113,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -440,39 +440,47 @@ def standing_lead(lead_v, slider, full_pct, sp_enabled, needs_sp=True):
     return float(lead_v)
 
 
-def sustain_hold(mode, held, soc, charging):
+def sustain_hold(mode, held, soc, charging, sun):
     """The held SOC after this tick: a one-way ratchet with no hysteresis.
 
     A floor follows the bank upward -- every hundredth of a percent the
-    sun adds is kept -- but not while the shore charger is the one adding
-    (the Quattro's re-absorb bursts would otherwise ratchet the floor up
-    on shore power, and the servo lowers its command instead). A ceiling
-    follows the bank downward, always: a drain is the plan. No SOC (BMS
-    not live) keeps the hold. Pure, so it can be tested off the boat.
+    sun adds is kept -- but only on sun (PV current flowing) and not while
+    the shore charger is the one adding. Without the sun condition the
+    Quattro's trickle under the idle threshold ratcheted the floor up 0.2 %
+    over the night of 2026-09-09; with it, a rise at night is the Quattro's
+    and the servo answers it instead. A ceiling follows the bank downward,
+    always: a drain is the plan. No SOC (BMS not live) keeps the hold.
+    Pure, so it can be tested off the boat.
     """
     if soc is None:
         return held
-    if mode == SUSTAIN_FLOOR and soc > held and not charging:
+    if mode == SUSTAIN_FLOOR and soc > held and sun and not charging:
         return soc
     if mode == SUSTAIN_CEILING and soc < held:
         return soc
     return held
 
 
-def sustain_servo(mode, err, charging, deadband):
+def sustain_servo(mode, err, charging, deadband, draining=True):
     """Which way to move the hold voltage this servo period: +1 up, -1
     down, 0 leave it. err is SOC minus the (slider-bounded) held SOC in
     percent; charging says whether the shore charger is pushing current
-    into the bank (see shore_charging).
+    into the bank (see shore_charging); draining says whether current is
+    still leaving the bank.
 
-    Floor: the bank more than a deadband UNDER the held SOC is a sag the
-    Quattro is not covering -> up. The Quattro charging it more than a
-    deadband ABOVE -> down. Solar raising it, or a wobble inside the band,
-    is left alone. Ceiling: nothing may charge, so the Quattro charging is
-    always -> down, and a drain is the plan.
+    Floor: the bank more than a deadband UNDER the held SOC AND still
+    draining is a sag the Quattro is not covering -> up. Once the bank
+    sits still, the Quattro is covering the loads and the command is
+    where it needs to be: hold, even a hair under the held SOC. (Pushing
+    on until the bank was back above the line wound the command up 0.5 V
+    ahead of the Quattro's slow response on 2026-09-09 and overshot by
+    0.25 %.) The Quattro charging it more than a deadband ABOVE -> down.
+    Solar raising it, or a wobble inside the band, is left alone. Ceiling:
+    nothing may charge, so the Quattro charging is always -> down, and a
+    drain is the plan.
     """
     if mode == SUSTAIN_FLOOR:
-        if err < -deadband:
+        if err < -deadband and draining:
             return 1
         if err > deadband and charging:
             return -1
@@ -1200,7 +1208,8 @@ class RecBmsDriver:
         charging = shore_charging(amps, pv_a, c.sustain_q_idle_a)
         held_eff = su["soc"]
         if soc is not None:
-            su["soc"] = sustain_hold(su["mode"], su["soc"], soc, charging)
+            sun = pv_a is not None and pv_a >= c.sustain_pv_min_a
+            su["soc"] = sustain_hold(su["mode"], su["soc"], soc, charging, sun)
             # The held SOC has moved a full step the hold's way since the
             # hold voltage was last anchored: the voltage follows it (a
             # floor only ever rises this way on sun, see sustain_hold).
@@ -1213,7 +1222,8 @@ class RecBmsDriver:
             held_eff = min(su["soc"], slider) if floor else max(su["soc"], slider)
             if now - su["servo_ts"] >= c.sustain_servo_s:
                 su["servo_ts"] = now
-                d = sustain_servo(su["mode"], soc - held_eff, charging, c.sustain_servo_db)
+                draining = amps is not None and amps < -c.sustain_q_idle_a
+                d = sustain_servo(su["mode"], soc - held_eff, charging, c.sustain_servo_db, draining)
                 if d:
                     su["servo_v"] = max(-c.sustain_servo_down, min(
                         c.sustain_servo_up, su["servo_v"] + d * c.sustain_servo_v))
@@ -1258,7 +1268,7 @@ class RecBmsDriver:
         if abs(su["servo_v"] - su["logged_servo"]) >= 0.05 - 1e-9:
             log.info("sustain %s servo %+.2fV: bank %.2f%% vs held %.1f%% (%s)",
                      name, su["servo_v"], soc if soc is not None else -1, held_eff,
-                     "Quattro charging" if charging else "sagging")
+                     "Quattro charging" if charging else "draining")
             su["logged_servo"] = su["servo_v"]
         s = self._pub
         s["/RecBms/Sustain/Soc"] = round(held_eff, 1)

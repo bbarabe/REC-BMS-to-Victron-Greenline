@@ -303,7 +303,9 @@ while the ratchet waited for a 41 % that could never come. Now:
   holds, so the sun is taken at full MPPT current rather than throttled
   inside a band the bank fills in an hour. The held SOC follows the bank
   **up only**, continuously — every hundredth of a percent the sun adds is
-  kept, but never a rise the Quattro made — and the hold voltage
+  kept, but only while PV current is flowing and never a rise the Quattro
+  made (its overnight trickle crept the floor up 0.2 % on 2026-09-09 before
+  the sun condition was added in 1.8.1) — and the hold voltage
   re-anchors to the present (resistance-corrected) pack voltage when the
   held SOC has gained a full `step_pct` (1 %) since the last anchor, or
   when the **band is absorbed** — the pack sits at the MPPT ceiling with the
@@ -320,7 +322,11 @@ while the ratchet waited for a 41 % that could never come. Now:
   `servo_period_s` (30 s) the hold voltage moves one `servo_step_v`
   (0.02 V) when the bank is more than `servo_deadband_pct` (0.1 %) from the
   held SOC in the direction the hold forbids: under a floor **up** while
-  the bank sits below the held SOC (a sag the Quattro is not covering) and
+  the bank sits below the held SOC *and is still draining* (a sag the
+  Quattro is not covering; once the bank sits still the Quattro is covering
+  the loads and the command is where it needs to be — 1.8.0 kept pushing
+  until the bank was back above the line, wound up 0.5 V ahead of the
+  Quattro's slow response and overshot by 0.25 % on the first night) and
   **down** while the Quattro is charging it above; under a ceiling down
   whenever the Quattro is charging. Solar raising the bank is never fought.
   "The Quattro is charging" is *battery current minus PV current* above
@@ -541,6 +547,14 @@ released and the MPPTs charge at the real target with the Quattro out of the
 circuit: every watt of sun goes in and there are no re-anchor ticks. The
 on-shore staircase (dbus-recbms 1.8.0) remains the behaviour for every hour
 the engine has to stay on shore.
+
+### Boosts need sun (engine 4.7)
+
+A measurement boost is requested only while at least `boost_min_pv_w`
+(20 W) of PV is flowing. On the evening of 2026-09-09 eight boosts went out
+at fifteen-minute intervals on a marina-light open-circuit voltage with
+zero yield; each lifted dbus-recbms' sustain charge-current cap for two
+minutes and measured nothing. The probe's own ramp assist is unchanged.
 
 ### Pre-probe checks (engine 4.4)
 
