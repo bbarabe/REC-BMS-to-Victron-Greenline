@@ -39,6 +39,8 @@ What it does (see README.md "Solar Priority driver"):
     Since 4.6 the SOC gate for leaving shore while charging one-way is
     ONEWAY_MIN_SOC (25 %) instead of MIN_SOC (40 %), and the emergency
     lockout stands aside while the sun is carrying the bank above it.
+    Since 4.8 a one-way solar stint ends on a three-minute mean below
+    -50 W: a bank that is being charged is never left to drain.
 
 Differences from the flow (all deliberate):
   - inputs come from a velib DbusMonitor (signal-driven cache). Values stay
@@ -74,7 +76,7 @@ import dbus.mainloop.glib
 from gi.repository import GLib
 
 VERSION = "1.4.0"
-ENGINE_VERSION = "4.7"
+ENGINE_VERSION = "4.8"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-solarpriority")
@@ -137,12 +139,14 @@ ENGINE_DEFAULTS = {
     # load rising past the 60 s average.
     "CAP_TRUMPS_MDL_MS": 900000, "SHADE_BALANCE_MIN": 0.4, "LOAD_SLOW_MS": 300000,
     # one-way charge: how much deficit solar may run before shore is
-    # reconnected. Measured 2026-09-02: the 4.2 rule (-50 W over 90 s) left
-    # solar over a one-minute -51 W dip, and every reconnect made the
-    # Quattro re-absorb at 0.6-2 kW for ten-plus minutes (>100 Wh of shore
-    # into the bank) -- far more than the dip. On a bank this size a small
-    # deficit is nothing; a reconnect is not.
-    "ONEWAY_DEFICIT_W": 200, "ONEWAY_DEFICIT_MS": 600000,
+    # reconnected. 4.3 allowed -200 W for ten minutes because every
+    # reconnect then cost a 0.6-2 kW Quattro re-absorb (2026-09-02); the
+    # sustain charge-current cap (dbus-recbms 1.5+) has removed that cost,
+    # and on 2026-09-10 the tolerance let the bank drain for two hours of
+    # thin sun while it was supposed to be CHARGING. 4.8: a three-minute
+    # mean below -50 W reconnects; on shore the floor holds the bank flat
+    # and every watt of sun still goes in through the solar band.
+    "ONEWAY_DEFICIT_W": 50, "ONEWAY_DEFICIT_MS": 180000,
     # 4.5: a target at or above this is a request for a FULL charge from
     # every charger at its maximum, so one-way charge never engages there
     # (2026-09-06: at 100 % the floor held the Quattro at the present SOC

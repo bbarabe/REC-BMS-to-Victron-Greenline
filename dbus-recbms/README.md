@@ -490,15 +490,17 @@ deficit, surge, SOC-drift and ceiling-stall exits are off — the bank draining
 (suspend, on shore under the ceiling, resume without the re-ramp boost), and
 the AC-control faults. No measurement boosts are requested.
 
-While charging one-way the solar stint is also judged more patiently than
-the 4.2 engine does: shore comes back only when the bank's **ten-minute
-mean** is below **−200 W** (`oneway_deficit_w`, `oneway_deficit_ms`), a probe
+While charging one-way the solar stint ends when the bank's **three-minute
+mean** is below **−50 W** (`oneway_deficit_w`, `oneway_deficit_ms`); a probe
 is ended only by a real surge (load above 1.5× the estimate), and the 3 s
-surge exit is off. Measured 2026-09-02: the 4.2 rule left solar over a
-one-minute −51 W dip, and every reconnect made the Quattro re-absorb at
-0.6–2 kW for ten-plus minutes, well over 100 Wh of shore into the bank. On a
-1440 Ah bank a small deficit costs nothing; a reconnect does. The 2 % SOC
-drift exit and the heater-class suspend still apply.
+surge exit is off. Engine 4.3 allowed −200 W for ten minutes because every
+reconnect then made the Quattro re-absorb at 0.6–2 kW for ten-plus minutes;
+the sustain charge-current cap has removed that cost, and on 2026-09-10 the
+patience let the bank drain for two hours of thin sun while it was meant to
+be charging (engine 4.8). A bank being charged is never left to drain: on
+shore the floor holds it flat and every watt of sun still goes in through
+the solar band, so a reconnect costs nothing. The 2 % SOC drift exit and the
+heater-class suspend still apply.
 
 Both stand down within `oneway_exit_pct` = 1 % of the target and the normal
 engine finishes the last bit (the charger tops up to the slider, or a
@@ -547,6 +549,18 @@ released and the MPPTs charge at the real target with the Quattro out of the
 circuit: every watt of sun goes in and there are no re-anchor ticks. The
 on-shore staircase (dbus-recbms 1.8.0) remains the behaviour for every hour
 the engine has to stay on shore.
+
+### A charging bank is never left to drain (engine 4.8)
+
+2026-09-10, on solar since 10:13 with loads of 360–410 W against 400–750 W
+of sun: the bank's 15-minute mean sat between −50 and −170 W for most of the
+afternoon and the SOC gave back everything it had gained, while the ten-minute
+−200 W tolerance from 4.3 saw nothing wrong. The tolerance was there for the
+re-absorb every reconnect used to cost; with the charge-current cap in
+force a reconnect is free, and on shore the floor holds the bank flat while
+the sun still goes in through the band. `oneway_deficit_w` is now 50 W over
+`oneway_deficit_ms` of three minutes. The probe's verdict uses the same
+figure, so a stint that would drain is not started either.
 
 ### Boosts need sun (engine 4.7)
 

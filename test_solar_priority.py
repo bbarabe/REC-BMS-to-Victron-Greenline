@@ -364,8 +364,9 @@ SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priorit
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 5 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 1 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
-      scfg.engine["ONEWAY_MIN_SOC"] == 25)
-check("engine version bumped", SP.ENGINE_VERSION == "4.7")
+      scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
+      scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
+check("engine version bumped", SP.ENGINE_VERSION == "4.8")
 Val = SP.Val
 
 
@@ -458,11 +459,11 @@ s.tick(95, batt=100.0, cvl=59.49)       # hold released: the real target is back
 check("charge: probe -> solar", s.state == "solar" and s.sustain == 0)
 s.tick(60, soc=68.0)
 check("charge: solar stays while the bank fills", s.state == "solar" and s.oneway == "charge")
-# night: PV gone, the loads draw from the bank -> ten-minute deficit exit -> shore + sustain
-s.tick(200, batt=-200.0, pv=0.0, m=0, voc=10.0)
-check("charge: -200 W is inside the one-way tolerance", s.state == "solar")
-s.tick(720, batt=-400.0)
-check("charge: deficit -> shore", s.state == "shore" and s.cmd == 0, s.state)
+# night: PV gone, the loads draw from the bank -> three-minute deficit exit -> shore + sustain
+s.tick(200, batt=-40.0, pv=0.0, m=0, voc=10.0)
+check("charge: -40 W is inside the one-way tolerance", s.state == "solar")
+s.tick(240, batt=-100.0)
+check("charge: -100 W three-minute mean -> shore", s.state == "shore" and s.cmd == 0, s.state)
 check("charge: floor requested one tick after the shore command (once the Quattro reports shore)",
       s.sustain == 1 and s.sustains[-1][0] == s.cmds[-1][0] + 1000,
       "sustain %s cmd %s" % (s.sustains[-1], s.cmds[-1]))
@@ -569,15 +570,21 @@ check("patient: probe", s.state == "probe")
 s.tick(50, batt=100.0, cvl=59.49, load=350.0)   # avg*1.2 = 420 > est: 4.2 would have quit
 check("patient: a creeping load does not end a one-way probe",
       not any("big load" in tr for tr in s.transitions), str(s.transitions))
-s.tick(50, batt=-120.0)                          # verdict on the last 15 s: -120 W is inside 200 W
+s.tick(50, batt=-40.0)                           # verdict on the last 15 s: -40 W is inside 50 W
 check("patient: probe verdict uses the one-way tolerance", s.state == "solar", s.state)
-s.tick(300, batt=-150.0)
-check("patient: -150 W for 5 min stays on solar", s.state == "solar")
+s.tick(300, batt=-40.0)
+check("patient: -40 W for 5 min stays on solar", s.state == "solar")
 s.tick(10, batt=-600.0)
 check("patient: a 10 s surge does not end it", s.state == "solar")
-s.tick(700, batt=-300.0)
-check("patient: -300 W ten-minute mean -> shore", any(tr.startswith("-> SHORE (deficit: batt avg -") for tr in s.transitions),
+s.tick(300, batt=-100.0)
+check("4.8: -100 W three-minute mean -> shore", any(tr.startswith("-> SHORE (deficit: batt avg -") for tr in s.transitions),
       str(s.transitions))
+s = Sim()
+s.tick(1, soc=60, target=95, batt_v=56.4)
+s.tick(340)
+s.tick(100, batt=-120.0, cvl=59.49)              # the whole ramp drains: not a stint to start
+check("4.8: probe verdict refuses a draining stint", s.state == "shore" and
+      any("probe failed" in tr for tr in s.transitions), str(s.transitions[-1:]))
 s = Sim()
 s.tick(1, soc=60, target=95, batt_v=56.4)
 s.tick(340)
