@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Cameras</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 16px/1.3 -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  #stage { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+  .cam { position: absolute; top: 0; height: 100%; background: #000; overflow: hidden; border: 2px solid transparent; box-sizing: border-box; }
+  .cam.sel { border-color: #3584e4; }
+  .cam canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: block; }
+  .cam .hud { position: absolute; left: 6px; top: 6px; padding: 2px 6px; background: rgba(0,0,0,0.55); font-size: 12px; font-family: monospace; white-space: pre; pointer-events: none; }
+  body.nohud .cam .hud { display: none; }
+  /* floating controls, bottom centre, over the empty middle */
+  #ctl { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; }
+  #ctl button, #panel button { font: inherit; padding: 10px 16px; min-width: 48px; min-height: 48px; background: rgba(40,40,40,0.75); color: #eee; border: 1px solid rgba(255,255,255,0.25); border-radius: 8px; }
+  #panel button.on { background: rgba(26,95,180,0.9); border-color: #3584e4; }
+  #panel { position: absolute; left: 50%; bottom: 76px; transform: translateX(-50%); display: none; flex-direction: column; gap: 10px; align-items: center; padding: 12px; background: rgba(20,20,20,0.85); border-radius: 10px; }
+  #panel.show { display: flex; }
+  #panel .row { display: flex; gap: 8px; align-items: center; }
+  #selname { min-width: 90px; font-family: monospace; }
+  #saved { font-size: 13px; color: #8c8; min-width: 50px; }
+  #sys { font-family: monospace; font-size: 12px; color: #aaa; }
+  #lens { display: grid; grid-template-columns: 52px 320px 64px; gap: 4px 10px; align-items: center; font-family: monospace; font-size: 14px; }
+  #lens input[type=range] { width: 320px; height: 44px; margin: 0; }
+  #lens .val { text-align: right; }
+  #log { position: absolute; left: 0; right: 0; bottom: 0; max-height: 30%; overflow: auto; background: rgba(0,0,0,0.75); font: 12px/1.3 monospace; padding: 4px 8px; white-space: pre-wrap; display: none; }
+  #log.show { display: block; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="panel">
+  <div class="row"><span id="selname">-</span>
+    <button data-rot="0" class="rot">0&deg;</button>
+    <button data-rot="90" class="rot">90&deg;&#8635;</button>
+    <button data-rot="180" class="rot">180&deg;</button>
+    <button data-rot="270" class="rot">90&deg;&#8634;</button>
+    <button id="mirror">Mirror</button>
+    <button id="flip">Flip</button>
+    <span id="saved"></span>
+  </div>
+  <div id="lens">
+    <span>k1</span><input type="range" data-lens="k1" min="-1" max="1.5" step="0.005"><span class="val" id="k1v"></span>
+    <span>k2</span><input type="range" data-lens="k2" min="-1" max="1.5" step="0.005"><span class="val" id="k2v"></span>
+    <span>zoom</span><input type="range" data-lens="zoom" min="0.4" max="1.6" step="0.005"><span class="val" id="zoomv"></span>
+    <span>cx</span><input type="range" data-lens="cx" min="-0.3" max="0.3" step="0.002"><span class="val" id="cxv"></span>
+    <span>cy</span><input type="range" data-lens="cy" min="-0.3" max="0.3" step="0.002"><span class="val" id="cyv"></span>
+  </div>
+  <div class="row"><button id="lensreset">Reset lens</button><button id="streambtn">Stream</button><button id="hudbtn">HUD</button><button id="logbtn">Log</button><button id="drawbtn">Draw</button><span id="sys"></span></div>
+</div>
+<div id="ctl">
+  <button id="back">&larr; App</button>
+  <button id="gear">&#9881;</button>
+</div>
+<div id="log"></div>
+<script src="yuv-canvas.js"></script>
+<script>
+"use strict"
+// Views stand on their edges: the first camera flush left, the second flush right,
+// any others centred, so the middle of the screen stays free for a boat outline.
+// Tap a view to select it; the gear opens the orientation panel, whose buttons act
+// on the selected view and are saved to the relay (config.json on the GX).
+//
+// Each camera lives in its own worker: websocket, H.264 decode and, when the
+// browser has OffscreenCanvas (Chromium 69 does), the WebGL draw as well. The
+// main thread then only ever sees a few numbers per frame.
+// Plain ES2015: the Simrad's webview is Chromium 69.
+var PAGE = 7
+var host = window.location.host
+var base = window.location.pathname.replace(/[^/]*$/, "")
+var logEl = document.getElementById("log")
+function log(s) {
+  var t = new Date().toTimeString().slice(0, 8)
+  logEl.textContent += t + " " + s + "\n"
+  logEl.scrollTop = logEl.scrollHeight
+  if (window.console) console.log(s)
+}
+window.onerror = function (m, src, line) { log("ERROR " + m + " @" + line) }
+document.getElementById("logbtn").onclick = function () { logEl.className = logEl.className ? "" : "show" }
+document.getElementById("hudbtn").onclick = function () { document.body.className = document.body.className ? "" : "nohud" }
+document.getElementById("gear").onclick = function () { var p = document.getElementById("panel"); p.className = p.className ? "" : "show" }
+document.getElementById("back").onclick = function () { window.location.href = "http://" + window.location.hostname + "/app/" }
+
+var canOffscreen = typeof HTMLCanvasElement !== "undefined" && !!HTMLCanvasElement.prototype.transferControlToOffscreen
+// Default is main-thread drawing: the Simrad's Chromium 69 accepts an OffscreenCanvas,
+// draws into it, and never shows a pixel (2026-09-09). The worker still owns the websocket.
+var drawPref = "main"
+try { drawPref = window.localStorage.getItem("camDraw") || "main" } catch (e) { /* ignore */ }
+if (/[?&]draw=main/.test(window.location.search)) drawPref = "main"
+if (/[?&]draw=worker/.test(window.location.search)) drawPref = "worker"
+var drawInWorker = canOffscreen && drawPref !== "main"
+document.getElementById("drawbtn").textContent = "Draw: " + (drawInWorker ? "worker" : "main")
+document.getElementById("drawbtn").onclick = function () {
+  try { window.localStorage.setItem("camDraw", drawInWorker ? "main" : "worker") } catch (e) { /* ignore */ }
+  window.location.reload()
+}
+
+// Which camera stream to ask for, per device: "auto" starts on the substream and
+// moves to the main stream (1080p) once the decoder has proved fast enough, "sub"
+// and "main" force it. The Simrad decodes the substream in ~25 ms and never
+// qualifies; a PC or tablet does. Main streams are opened by the relay on demand.
+// With the Simrad on, the GX has Ethernet and both 1080p streams flow at full
+// rate (measured 2026-09-10). With the Simrad off it falls back to Wi-Fi, which
+// carries ~3 Mbit/s in total; auto then promotes, starves, and demotes itself.
+var streamPref = "auto"
+try { streamPref = window.localStorage.getItem("camStream") || "auto" } catch (e) { /* ignore */ }
+var mm = /[?&]stream=(auto|sub|main)/.exec(window.location.search)
+if (mm) streamPref = mm[1]
+var MAIN_DECODE_MS = 6 // substream P-frame decode time below which 1080p at 30 fps fits in one core
+document.getElementById("streambtn").textContent = "Stream: " + streamPref
+document.getElementById("streambtn").onclick = function () {
+  var next = streamPref === "auto" ? "main" : streamPref === "main" ? "sub" : "auto"
+  try { window.localStorage.setItem("camStream", next) } catch (e) { /* ignore */ }
+  window.location.reload()
+}
+
+var views = []
+var selected = null
+
+// --- relay clock offset, so each frame's relay-to-screen latency can be measured.
+var clockOffset = null
+var clockRtt = Infinity
+function relayNow() { return (Date.now() + clockOffset) % 4294967296 }
+function sinceRelay(relayMs) {
+  if (clockOffset === null) return -1
+  var d = relayNow() - relayMs
+  if (d < -2147483648) d += 4294967296
+  return d
+}
+function syncClock(n) {
+  var t0 = Date.now()
+  var xhr = new XMLHttpRequest()
+  xhr.open("GET", base + "time?" + t0)
+  xhr.onload = function () {
+    var t1 = Date.now()
+    try {
+      var relay = JSON.parse(xhr.responseText).ms
+      var rtt = t1 - t0
+      if (rtt < clockRtt) { clockRtt = rtt; clockOffset = relay - (t0 + rtt / 2) }
+    } catch (e) { /* ignore */ }
+    if (n > 1) setTimeout(function () { syncClock(n - 1) }, 200)
+    else {
+      log("clock offset to relay " + (clockOffset === null ? "unknown" : Math.round(clockOffset) + " ms (rtt " + clockRtt + " ms)"))
+      views.forEach(function (v) { v.worker.postMessage({ type: "clock", offset: clockOffset }) })
+    }
+  }
+  xhr.send()
+}
+syncClock(6)
+setInterval(function () { syncClock(3) }, 60000)
+
+function ewma(old, v, a) { return old ? old * (1 - a) + v * a : v }
+
+function View(cam, index) {
+  var self = this
+  this.id = cam.id
+  this.cam = cam
+  this.index = index
+  this.rotate = cam.rotate || 0
+  this.mirror = !!cam.mirror
+  this.flip = !!cam.flip
+  this.lens = { k1: 0, k2: 0, zoom: 1, cx: 0, cy: 0 }
+  if (cam.lens) for (var lk in this.lens) if (typeof cam.lens[lk] === "number") this.lens[lk] = cam.lens[lk]
+  this.el = document.createElement("div")
+  this.el.className = "cam"
+  this.canvas = document.createElement("canvas")
+  this.hud = document.createElement("div")
+  this.hud.className = "hud"
+  this.el.appendChild(this.canvas)
+  this.el.appendChild(this.hud)
+  this.el.onclick = function () { select(self) }
+  document.getElementById("stage").appendChild(this.el)
+  this.stats = { recv: 0, bytes: 0, drawn: 0, skipped: 0, errors: 0, decodeMs: 0, keyDecodeMs: 0, drawMs: 0, hopMs: 0, netMs: 0, latencyMs: 0, lastFps: 0, fpsCount: 0, fpsT0: performance.now(), hops: [] }
+  this.frameWidth = 800
+  this.frameHeight = 448
+  this.stream = streamPref === "main" && cam.main ? "main" : "sub"
+  this.autoDone = streamPref !== "auto" || !cam.main
+  this.mainFailed = false
+  this.workerDraws = false
+  this.worker = new Worker(base + "decoder-worker.js")
+  this.worker.onmessage = function (e) { self.onWorker(e.data) }
+  this.worker.onerror = function (e) { log(cam.id + ": worker error " + e.message) }
+  var init = { type: "init", id: cam.id, base: "http://" + host + base, wsUrl: this.wsUrl(),
+    rotate: this.rotate, mirror: this.mirror, flip: this.flip, lens: this.lens }
+  if (drawInWorker) {
+    try {
+      var off = this.canvas.transferControlToOffscreen()
+      init.canvas = off
+      this.workerDraws = true
+      this.worker.postMessage(init, [off])
+    } catch (err) {
+      log(cam.id + ": OffscreenCanvas failed (" + err + "), drawing on the main thread")
+      this.workerDraws = false
+      delete init.canvas
+      this.worker.postMessage(init)
+    }
+  } else {
+    this.worker.postMessage(init)
+  }
+  if (!this.workerDraws) {
+    this.gl = new YuvCanvas(this.canvas)
+    this.gl.setTransform(this.rotate, this.mirror, this.flip)
+    this.gl.setLens(this.lens)
+  }
+  this.hud.textContent = (cam.label || cam.id) + ": loading decoder"
+}
+View.prototype.wsUrl = function () { return "ws://" + host + base + "ws/" + this.id + "?stream=" + this.stream }
+View.prototype.setStream = function (stream, why) {
+  if (stream === this.stream) return
+  this.stream = stream
+  var s = this.stats
+  s.decodeMs = 0; s.keyDecodeMs = 0; s.skipped = 0
+  log(this.id + ": switching to the " + stream + " stream (" + why + ")")
+  this.worker.postMessage({ type: "stream", wsUrl: this.wsUrl() })
+}
+// Auto mode: judge the decoder on the substream, promote once; demote for good if
+// the main stream makes the worker skip frames.
+View.prototype.judge = function () {
+  var s = this.stats
+  if (this.stream === "main") {
+    if (!this.mainFailed && s.skipped > 20 && !(streamPref === "main")) {
+      this.mainFailed = true
+      this.setStream("sub", "decoder cannot keep up: " + s.skipped + " frames skipped")
+    }
+    return
+  }
+  if (this.autoDone || this.mainFailed || s.drawn < 40 || s.decodeMs === 0) return
+  this.autoDone = true
+  if (s.decodeMs < MAIN_DECODE_MS) this.setStream("main", "substream decodes in " + s.decodeMs.toFixed(1) + " ms")
+  else log(this.id + ": staying on the substream (decode " + s.decodeMs.toFixed(1) + " ms/frame, main needs < " + MAIN_DECODE_MS + ")")
+}
+// Size the tile to the rotated frame's aspect at full stage height and park it on its edge.
+View.prototype.place = function () {
+  var stage = document.getElementById("stage")
+  var sh = stage.clientHeight, sw = stage.clientWidth
+  var upright = this.rotate % 180 === 0
+  var fw = upright ? this.frameWidth : this.frameHeight
+  var fh = upright ? this.frameHeight : this.frameWidth
+  var w = Math.min(sw / 2, Math.round((sh * fw) / fh))
+  this.el.style.width = w + "px"
+  if (this.index === 0) { this.el.style.left = "0"; this.el.style.right = "auto" }
+  else if (this.index === 1) { this.el.style.left = "auto"; this.el.style.right = "0" }
+  else { this.el.style.left = Math.round((sw - w) / 2) + "px"; this.el.style.right = "auto"; this.el.style.height = "50%"; this.el.style.top = "0" }
+  if (this.workerDraws) {
+    this.worker.postMessage({ type: "resize", width: this.canvas.clientWidth || w, height: this.canvas.clientHeight || sh })
+  }
+}
+View.prototype.onWorker = function (m) {
+  var s = this.stats
+  if (m.type === "ready") {
+    log(this.id + ": decoder ready" + (m.draws ? ", drawing in the worker" : ", drawing on the main thread"))
+    if (this.workerDraws && !m.draws) {
+      // the worker could not draw on the transferred canvas: swap in a fresh one and draw here
+      this.workerDraws = false
+      var fresh = document.createElement("canvas")
+      this.el.replaceChild(fresh, this.canvas)
+      this.canvas = fresh
+      this.gl = new YuvCanvas(this.canvas)
+      this.gl.setTransform(this.rotate, this.mirror, this.flip)
+      this.gl.setLens(this.lens)
+    }
+    if (clockOffset !== null) this.worker.postMessage({ type: "clock", offset: clockOffset })
+  } else if (m.type === "ws") {
+    log(this.id + ": websocket " + m.state)
+  } else if (m.type === "drawn") {
+    this.account(m, m.drawMs, 0, m.totalMs)
+  } else if (m.type === "frame") {
+    var hop = Date.now() - m.tDone
+    var t0 = performance.now()
+    try {
+      if (m.width !== this.frameWidth || m.height !== this.frameHeight) { this.frameWidth = m.width; this.frameHeight = m.height; this.place() }
+      this.gl.draw(m.width, m.height, new Uint8Array(m.buffer))
+    } catch (err) {
+      log(this.id + ": draw failed " + err)
+      return
+    }
+    this.account(m, performance.now() - t0, hop, sinceRelay(m.relayMs))
+  } else if (m.type === "nopic") {
+    s.recv++
+    s.bytes += m.bytes || 0
+  } else if (m.type === "skipped") {
+    s.recv++
+    s.skipped = m.skipped
+  } else if (m.type === "error") {
+    s.errors++
+    log(this.id + ": " + m.message)
+  }
+}
+View.prototype.account = function (m, drawMs, hopMs, totalMs) {
+  var s = this.stats
+  s.hops.push(hopMs)
+  s.recv++
+  s.bytes += m.bytes || 0
+  s.drawn++
+  s.fpsCount++
+  if (m.key) s.keyDecodeMs = ewma(s.keyDecodeMs, m.decodeMs, 0.3)
+  else s.decodeMs = ewma(s.decodeMs, m.decodeMs, 0.1)
+  s.drawMs = ewma(s.drawMs, drawMs, 0.1)
+  s.hopMs = ewma(s.hopMs, hopMs, 0.2)
+  if (m.netMs >= 0 && m.netMs < 10000) s.netMs = ewma(s.netMs, m.netMs, 0.2)
+  if (totalMs >= 0 && totalMs < 10000) s.latencyMs = ewma(s.latencyMs, totalMs, 0.2)
+  if (this.workerDraws && (m.width !== this.frameWidth || m.height !== this.frameHeight)) { this.frameWidth = m.width; this.frameHeight = m.height; this.place() }
+  var now = performance.now()
+  this.judge()
+  if (now - s.fpsT0 >= 1000) {
+    s.lastFps = Math.round((s.fpsCount * 1000) / (now - s.fpsT0))
+    s.fpsCount = 0
+    s.fpsT0 = now
+    this.hud.textContent = (this.cam.label || this.id) + " " + this.stream + " " + this.frameWidth + "x" + this.frameHeight + " " + s.lastFps + " fps  lat " + Math.round(s.latencyMs) + " ms (net " + Math.round(s.netMs) +
+      " + dec " + Math.round(s.decodeMs) + "/" + Math.round(s.keyDecodeMs) + (this.workerDraws ? "" : " + hop " + Math.round(s.hopMs)) + " + draw " + s.drawMs.toFixed(1) + ")" +
+      (s.skipped ? "  skip " + s.skipped : "") + (s.errors ? "  err " + s.errors : "")
+  }
+}
+View.prototype.apply = function () {
+  if (this.workerDraws) this.worker.postMessage({ type: "transform", rotate: this.rotate, mirror: this.mirror, flip: this.flip, lens: this.lens })
+  else { this.gl.setTransform(this.rotate, this.mirror, this.flip); this.gl.setLens(this.lens) }
+  this.place()
+}
+// sliders fire continuously; save the orientation + lens at most once per 400 ms of quiet
+View.prototype.saveSoon = function () {
+  var self = this
+  if (this.saveTimer) clearTimeout(this.saveTimer)
+  this.saveTimer = setTimeout(function () { self.saveTimer = null; self.save() }, 400)
+}
+View.prototype.save = function () {
+  var self = this
+  var xhr = new XMLHttpRequest()
+  xhr.open("POST", base + "cameras/" + this.id)
+  xhr.setRequestHeader("Content-Type", "application/json")
+  xhr.onload = function () {
+    var ok = xhr.status === 200
+    document.getElementById("saved").textContent = ok ? "saved" : "save failed " + xhr.status
+    setTimeout(function () { document.getElementById("saved").textContent = "" }, 2000)
+    if (!ok) log(self.id + ": save failed " + xhr.status)
+  }
+  xhr.onerror = function () { log(self.id + ": save failed (network)") }
+  xhr.send(JSON.stringify({ rotate: this.rotate, mirror: this.mirror, flip: this.flip, k1: this.lens.k1, k2: this.lens.k2, zoom: this.lens.zoom, cx: this.lens.cx, cy: this.lens.cy }))
+}
+function pct(arr, p) { if (!arr.length) return 0; var a = arr.slice().sort(function (x, y) { return x - y }); return a[Math.min(a.length - 1, Math.floor(a.length * p))] }
+View.prototype.report = function () {
+  var s = this.stats
+  var hops = s.hops
+  s.hops = []
+  return { stream: this.stream, width: this.frameWidth, height: this.frameHeight, hopP50: pct(hops, 0.5), hopP90: pct(hops, 0.9), hopMax: pct(hops, 1), id: this.id, mode: this.workerDraws ? "webgl-worker" : "webgl-main", fps: s.lastFps, latencyMs: Math.round(s.latencyMs), netMs: Math.round(s.netMs),
+    decodeMs: Math.round(s.decodeMs * 10) / 10, keyDecodeMs: Math.round(s.keyDecodeMs * 10) / 10, hopMs: Math.round(s.hopMs), drawMs: Math.round(s.drawMs * 10) / 10,
+    recv: s.recv, drawn: s.drawn, skipped: s.skipped, errors: s.errors, kb: s.bytes / 1024 | 0,
+    rotate: this.rotate, mirror: this.mirror, flip: this.flip, lens: this.lens }
+}
+
+var rotButtons = document.querySelectorAll("button.rot")
+function refreshButtons() {
+  var v = selected
+  document.getElementById("selname").textContent = v ? (v.cam.label || v.id) : "-"
+  for (var j = 0; j < rotButtons.length; j++) {
+    rotButtons[j].className = "rot" + (v && parseInt(rotButtons[j].getAttribute("data-rot"), 10) === v.rotate ? " on" : "")
+  }
+  document.getElementById("mirror").className = v && v.mirror ? "on" : ""
+  document.getElementById("flip").className = v && v.flip ? "on" : ""
+  for (var k = 0; k < lensSliders.length; k++) {
+    var key = lensSliders[k].getAttribute("data-lens")
+    var val = v ? v.lens[key] : (key === "zoom" ? 1 : 0)
+    lensSliders[k].value = val
+    document.getElementById(key + "v").textContent = val.toFixed(3)
+  }
+}
+var lensSliders = document.querySelectorAll("#lens input[type=range]")
+for (var li = 0; li < lensSliders.length; li++) {
+  lensSliders[li].oninput = function () {
+    if (!selected) return
+    var key = this.getAttribute("data-lens")
+    selected.lens[key] = parseFloat(this.value)
+    document.getElementById(key + "v").textContent = selected.lens[key].toFixed(3)
+    selected.apply(); selected.saveSoon()
+  }
+}
+document.getElementById("lensreset").onclick = function () {
+  if (!selected) return
+  selected.lens = { k1: 0, k2: 0, zoom: 1, cx: 0, cy: 0 }
+  selected.apply(); selected.save(); refreshButtons()
+}
+function select(v) {
+  selected = v
+  views.forEach(function (x) { x.el.className = "cam" + (x === v ? " sel" : "") })
+  refreshButtons()
+}
+for (var i = 0; i < rotButtons.length; i++) {
+  rotButtons[i].onclick = function () {
+    if (!selected) return
+    selected.rotate = parseInt(this.getAttribute("data-rot"), 10)
+    selected.apply(); selected.save(); refreshButtons()
+  }
+}
+document.getElementById("mirror").onclick = function () { if (!selected) return; selected.mirror = !selected.mirror; selected.apply(); selected.save(); refreshButtons() }
+document.getElementById("flip").onclick = function () { if (!selected) return; selected.flip = !selected.flip; selected.apply(); selected.save(); refreshButtons() }
+window.addEventListener("resize", function () { views.forEach(function (v) { v.place() }) })
+
+// system line: cores, draw path, and a cheap main-thread load estimate (timer lag)
+var lagMax = 0, lagMax5 = 0, lagT = performance.now()
+setInterval(function () {
+  var now = performance.now()
+  var lag = now - lagT - 100
+  lagMax = Math.max(lagMax, lag)
+  lagMax5 = Math.max(lagMax5, lag)
+  lagT = now
+}, 100)
+// how often the compositor asks for a frame: the screen cannot update faster than this
+var rafCount = 0, rafHz = 0, rafT0 = performance.now()
+function onRaf() {
+  rafCount++
+  var now = performance.now()
+  if (now - rafT0 >= 1000) { rafHz = Math.round((rafCount * 1000) / (now - rafT0)); rafCount = 0; rafT0 = now }
+  window.requestAnimationFrame(onRaf)
+}
+window.requestAnimationFrame(onRaf)
+setInterval(function () {
+  document.getElementById("sys").textContent = "cores " + (navigator.hardwareConcurrency || "?") + "  ui lag " + lagMax.toFixed(0) + " ms  " + window.innerWidth + "x" + window.innerHeight +
+    "  raf " + rafHz + " Hz"
+  lagMax = 0
+}, 1000)
+
+// every 5 s, tell the relay how this browser is doing (read it back in /stats.json)
+setInterval(function () {
+  var xhr = new XMLHttpRequest()
+  xhr.open("POST", base + "report")
+  xhr.setRequestHeader("Content-Type", "application/json")
+  xhr.send(JSON.stringify({ page: PAGE, ua: navigator.userAgent, cores: navigator.hardwareConcurrency || null, viewport: window.innerWidth + "x" + window.innerHeight,
+    offscreen: canOffscreen, uiLagMs: Math.round(lagMax5), rafHz: rafHz, clockOffsetMs: clockOffset === null ? null : Math.round(clockOffset), clockRttMs: clockRtt,
+    views: views.map(function (v) { return v.report() }) }))
+  lagMax5 = 0
+}, 5000)
+
+// camera list from the relay: one view per camera, orientation as stored on the boat
+var listXhr = new XMLHttpRequest()
+listXhr.open("GET", base + "cameras.json")
+listXhr.onload = function () {
+  try {
+    var list = JSON.parse(listXhr.responseText)
+    log("cameras: " + list.map(function (c) { return c.id + " (" + c.state + ", rot " + c.rotate + (c.main ? ", main stream" : "") + ")" }).join(", ") + "; stream " + streamPref + "; offscreen canvas " + (canOffscreen ? "yes" : "no") + ", draw in " + (drawInWorker ? "worker" : "main"))
+    list.forEach(function (c, i) { views.push(new View(c, i)) })
+    views.forEach(function (v) { v.place() })
+    if (views.length) select(views[0])
+  } catch (err) { log("cameras.json: " + err) }
+}
+listXhr.onerror = function () { log("cameras.json failed") }
+listXhr.send()
+</script>
+</body>
+</html>

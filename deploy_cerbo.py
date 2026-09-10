@@ -24,6 +24,7 @@ Host and password come from CERBO_HOST / CERBO_PASS (never from a file).
 """
 import argparse
 import difflib
+import hashlib
 import os
 import posixpath
 import re
@@ -155,6 +156,21 @@ PACKAGES = {
             ("com.victronenergy.motordrive.edrive_stbd", "/Connected"),
         ],
     },
+    "camerarelay": {
+        "dir": "camera-relay",
+        "service": "camera-relay",
+        "install_arg": "",
+        "version_file": "camera_relay.py",
+        "files": ["camera_relay.py", "config.json.example", "README.md", "install.sh",
+                  "uninstall.sh", "service/run", "service/log/run",
+                  "www/index.html", "www/decoder-worker.js", "www/yuv-canvas.js",
+                  "www/h264dec.js", "www/h264dec.wasm"],
+        # config.json holds the camera URLs and stays on the boat (not in git)
+        "configs": [],
+        "verify": [],
+        # no D-Bus: ask the relay itself
+        "verify_cmds": ["wget -qO- http://127.0.0.1:8095/stats.json 2>&1 | cut -c1-600"],
+    },
 }
 EXEC_SUFFIXES = (".py", ".sh", "/run")
 # Everything shipped is text destined for a Linux box. A CRLF in a `#!/bin/sh`
@@ -163,7 +179,8 @@ EXEC_SUFFIXES = (".py", ".sh", "/run")
 # core.autocrlf=true has CRLF on disk and sftp copies it byte for byte, so the
 # line endings are normalised here rather than trusted. (.gitattributes also
 # pins the working tree to LF; this is the belt to that pair of braces.)
-TEXT_SUFFIXES = (".py", ".sh", ".ini", ".md", "/run")
+TEXT_SUFFIXES = (".py", ".sh", ".ini", ".md", "/run", ".js", ".html", ".json")
+BINARY_SUFFIXES = (".wasm", ".png", ".jpg", ".gz", ".tgz")
 
 
 def die(msg, code=2):
@@ -326,7 +343,12 @@ def main():
                 lp = os.path.join(REPO, pkg["dir"], f)
                 rp = base + "/" + f
                 local_txt = open(lp, "rb").read()
-                live_txt = cb.cat(rp).encode() if cb.exists(rp) else None
+                if f.endswith(BINARY_SUFFIXES):
+                    # compare by hash: cat + decode mangles binaries and re-uploads them every time
+                    live_md5 = cb.run("md5sum '%s' 2>/dev/null" % rp)[0].split()[:1] if cb.exists(rp) else None
+                    live_txt = local_txt if live_md5 and live_md5[0] == hashlib.md5(local_txt).hexdigest() else (b"" if live_md5 else None)
+                else:
+                    live_txt = cb.cat(rp).encode() if cb.exists(rp) else None
                 if f in pkg["configs"] and live_txt is not None:
                     head = git_head(pkg["dir"] + "/" + f)
                     live_vals = ini_values(live_txt.decode(errors="replace"))
@@ -396,6 +418,9 @@ def verify(cb, pkg, base):
     print("log:\n" + "\n".join("   " + l for l in o.strip().splitlines()))
     for svc, path in pkg["verify"]:
         print("   %-42s %s" % (svc.split(".")[-1] + path, cb.dbus_get(svc, path)))
+    for cmd in pkg.get("verify_cmds", []):
+        o, e = cb.run(cmd, timeout=15)
+        print("   $ %s\n     %s" % (cmd, (o or e).strip().replace("\n", "\n     ")))
 
 
 if __name__ == "__main__":

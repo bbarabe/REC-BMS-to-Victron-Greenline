@@ -97,7 +97,10 @@ python deploy_cerbo.py recbms --dry-run        # show the plan / config diff onl
 python deploy_cerbo.py czone --verify-only     # no upload, no restart
 ```
 
-Packages: `recbms`, `solarpriority`, `czone`, `batteries`, `edrive`.
+Packages: `recbms`, `solarpriority`, `czone`, `batteries`, `edrive`, `camerarelay`
+(the last one is `camera-relay/`: RTSP-to-WebSocket H.264 relay plus its
+WASM decoder test page; its `config.json` with the camera URLs lives only on
+the boat, `./cerbo put` it before `--install`).
 `python test_drivers.py` runs `dbus-batteries` and `dbus-edrive` off the boat
 against stubbed D-Bus, velib and SocketCAN — run it before every deploy of
 either. `python test_solar_priority.py` does the same for dbus-recbms' sustain
