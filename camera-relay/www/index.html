@@ -10,20 +10,24 @@
   .cam { position: absolute; top: 0; height: 100%; background: #000; overflow: hidden; border: 2px solid transparent; box-sizing: border-box; }
   .cam.sel { border-color: #3584e4; }
   .cam canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: block; }
-  .cam .hud { position: absolute; left: 6px; top: 6px; padding: 2px 6px; background: rgba(0,0,0,0.55); font-size: 12px; font-family: monospace; white-space: pre; pointer-events: none; }
+  .cam .hud { position: absolute; left: 6px; right: 6px; top: 6px; width: -webkit-max-content; width: max-content; max-width: calc(100% - 12px); box-sizing: border-box; padding: 2px 6px; background: rgba(0,0,0,0.55); font-size: 12px; font-family: monospace; white-space: pre-wrap; pointer-events: none; }
   body.nohud .cam .hud { display: none; }
   /* floating controls, bottom centre, over the empty middle */
   #ctl { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; }
   #ctl button, #panel button { font: inherit; padding: 10px 16px; min-width: 48px; min-height: 48px; background: rgba(40,40,40,0.75); color: #eee; border: 1px solid rgba(255,255,255,0.25); border-radius: 8px; }
   #panel button.on { background: rgba(26,95,180,0.9); border-color: #3584e4; }
-  #panel { position: absolute; left: 50%; bottom: 76px; transform: translateX(-50%); display: none; flex-direction: column; gap: 10px; align-items: center; padding: 12px; background: rgba(20,20,20,0.85); border-radius: 10px; }
+  /* centred by auto margins, not left:50% + translate: an absolutely positioned box
+     placed at left:50% can only grow to half the screen, which squeezed the rows
+     and wrapped the button labels on a 1691px-wide tablet. */
+  #panel { position: absolute; left: 0; right: 0; margin: 0 auto; width: -webkit-max-content; width: max-content; max-width: 96vw; box-sizing: border-box; bottom: 76px; display: none; flex-direction: column; gap: 10px; align-items: center; padding: 12px; background: rgba(20,20,20,0.85); border-radius: 10px; }
   #panel.show { display: flex; }
-  #panel .row { display: flex; gap: 8px; align-items: center; }
+  #panel .row { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; align-items: center; }
+  #panel button { white-space: nowrap; }
   #selname { min-width: 90px; font-family: monospace; }
   #saved { font-size: 13px; color: #8c8; min-width: 50px; }
   #sys { font-family: monospace; font-size: 12px; color: #aaa; }
-  #lens { display: grid; grid-template-columns: 52px 320px 64px; gap: 4px 10px; align-items: center; font-family: monospace; font-size: 14px; }
-  #lens input[type=range] { width: 320px; height: 44px; margin: 0; }
+  #lens { display: grid; grid-template-columns: 52px minmax(200px, 320px) 64px; gap: 4px 10px; align-items: center; font-family: monospace; font-size: 14px; }
+  #lens input[type=range] { width: 100%; height: 44px; margin: 0; }
   #lens .val { text-align: right; }
   #log { position: absolute; left: 0; right: 0; bottom: 0; max-height: 30%; overflow: auto; background: rgba(0,0,0,0.75); font: 12px/1.3 monospace; padding: 4px 8px; white-space: pre-wrap; display: none; }
   #log.show { display: block; }
@@ -67,7 +71,7 @@
 // browser has OffscreenCanvas (Chromium 69 does), the WebGL draw as well. The
 // main thread then only ever sees a few numbers per frame.
 // Plain ES2015: the Simrad's webview is Chromium 69.
-var PAGE = 7
+var PAGE = 8
 var host = window.location.host
 var base = window.location.pathname.replace(/[^/]*$/, "")
 var logEl = document.getElementById("log")
@@ -244,7 +248,8 @@ View.prototype.place = function () {
   else if (this.index === 1) { this.el.style.left = "auto"; this.el.style.right = "0" }
   else { this.el.style.left = Math.round((sw - w) / 2) + "px"; this.el.style.right = "auto"; this.el.style.height = "50%"; this.el.style.top = "0" }
   if (this.workerDraws) {
-    this.worker.postMessage({ type: "resize", width: this.canvas.clientWidth || w, height: this.canvas.clientHeight || sh })
+    var dpr = window.devicePixelRatio > 0 ? window.devicePixelRatio : 1
+    this.worker.postMessage({ type: "resize", width: Math.round((this.canvas.clientWidth || w) * dpr), height: Math.round((this.canvas.clientHeight || sh) * dpr) })
   }
 }
 View.prototype.onWorker = function (m) {

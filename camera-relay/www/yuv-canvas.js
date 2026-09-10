@@ -139,13 +139,16 @@ YuvCanvas.prototype._updateTransform = function () {
   this.gl.uniformMatrix3fv(this.uTex, false, new Float32Array([a, b, 0, cc, d, 0, tx, ty, 1]))
 }
 
-// Size the canvas backing store to the displayed size and keep the frame's aspect
-// (after rotation) inside it with letterboxing.
+// Size the canvas backing store to the displayed size in device pixels (a tablet
+// at devicePixelRatio 1.75 would otherwise show 1080p through a 494px-wide
+// buffer) and keep the frame's aspect (after rotation) inside it with letterboxing.
+// An OffscreenCanvas has no clientWidth; the page sizes it through "resize".
 YuvCanvas.prototype._fit = function (w, h) {
   var gl = this.gl
   var canvas = this.canvas
-  var cw = canvas.clientWidth || canvas.width
-  var ch = canvas.clientHeight || canvas.height
+  var dpr = typeof window !== "undefined" && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1
+  var cw = canvas.clientWidth ? Math.round(canvas.clientWidth * dpr) : canvas.width
+  var ch = canvas.clientHeight ? Math.round(canvas.clientHeight * dpr) : canvas.height
   if (canvas.width !== cw || canvas.height !== ch) {
     canvas.width = cw
     canvas.height = ch
