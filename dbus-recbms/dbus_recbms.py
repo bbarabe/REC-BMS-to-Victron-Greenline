@@ -113,7 +113,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -1721,8 +1721,15 @@ class RecBmsDriver:
         # Sustain (v1.5.0, voltage-anchored since v1.8.0): while held, the
         # charge voltage comes from the hold, not from the slider's curve.
         # In fallback the hold stands still (no SOC, no voltage to judge).
-        held = self._service_sustain(now, soc if live else None, slider,
-                                     volts if live else None, amps if live else None)
+        # Only the BMS's OWN figures go in, never the safe substitutes: a
+        # pending floor anchored on the first live tick after a restart,
+        # before the SOC frame had arrived, took the 50 % stand-in as the
+        # held SOC (2026-09-10 17:01 UTC, bank at 36 %).
+        bms_soc = bms.get("socHiRes") if bms.get("socHiRes") is not None else bms.get("soc")
+        held = self._service_sustain(
+            now, float(bms_soc) if (live and bms_soc is not None) else None, slider,
+            bms["voltage"] if (live and bms.get("voltage") is not None) else None,
+            bms["current"] if (live and bms.get("current") is not None) else None)
         slider_cvl = held if held is not None else self._slider_cvl(slider)
         eq = self.eq
         eq_last = float(self.settings["eqlast"] or 0)

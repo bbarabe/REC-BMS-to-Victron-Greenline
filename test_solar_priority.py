@@ -316,8 +316,15 @@ check("pending: slider CVL meanwhile", mppt() == curve(80) and
       batt["/RecBms/Sustain/Soc"] is None and hold() is None,
       "cvl %s vs %s, soc %s, status %s" % (mppt(), curve(80),
                                           batt["/RecBms/Sustain/Soc"], batt["/RecBms/Sustain/Status"]))
-rtick(soc=64, v=56.8)                                   # BMS back: anchored
-check("pending hold starts on the first live tick", batt["/RecBms/Sustain/Status"] == "floor" and
+# BMS back but only the voltage frame so far: the 50 % safe substitute must not be anchored
+T[0] += 1
+drv.bms.update({"_lastUpdate": T[0], "socHiRes": None, "soc": None, "voltage": 56.8, "current": 0.0})
+drv._tick()
+check("pending: a live tick without an SOC frame stays pending (never the 50 % stand-in)",
+      batt["/RecBms/Sustain/Status"] == "pending: no SOC yet" and batt["/RecBms/Sustain/Soc"] is None,
+      "%s %s" % (batt["/RecBms/Sustain/Status"], batt["/RecBms/Sustain/Soc"]))
+rtick(soc=64, v=56.8)                                   # SOC frame in: anchored
+check("pending hold starts on the first live tick with an SOC", batt["/RecBms/Sustain/Status"] == "floor" and
       batt["/RecBms/Sustain/Soc"] == 64.0 and hold() == 56.8 and mppt() == r2(56.8 + BAND))
 batt.write("/RecBms/Sustain/Request", 0); rtick()
 check("bad mode refused", not batt.write("/RecBms/Sustain/Request", 7))
