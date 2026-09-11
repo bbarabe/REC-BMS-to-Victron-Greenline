@@ -39,7 +39,8 @@ check("config: [sustain] parsed", rcfg.sustain_enabled and rcfg.sustain_hold_s =
 check("config: servo and taper tunables", rcfg.sustain_servo_v == 0.02 and rcfg.sustain_servo_s == 30
       and rcfg.sustain_servo_db == 0.1 and rcfg.sustain_servo_up == 0.5 and rcfg.sustain_servo_down == 2.0
       and rcfg.sustain_taper_a == 3 and rcfg.sustain_taper_s == 60 and rcfg.sustain_q_idle_a == 1
-      and rcfg.sustain_pv_min_a == 0.5 and rcfg.sustain_band_v == 0.30 and rcfg.sustain_anchor_r == 0.003)
+      and rcfg.sustain_pv_min_a == 0.5 and rcfg.sustain_band_v == 0.30 and rcfg.sustain_anchor_r == 0.003
+      and rcfg.sustain_drain_a == 0.3 and rcfg.sustain_slope == 0.10)
 
 T = [1_800_000_000.0]
 R.time = types.SimpleNamespace(time=lambda: T[0])
@@ -121,13 +122,14 @@ check("floor telemetry", batt["/RecBms/Sustain/Active"] == 1 and
       hold() == 56.6 and batt["/RecBms/Sustain/Servo"] == 0.0 and
       batt["/RecBms/Sustain/Status"] == "floor")
 rtick(soc=62.9, v=56.7, pv=5.0)
-check("floor keeps every bit the sun adds, re-anchors only on a full step",
-      hold() == 56.6 and batt["/RecBms/Sustain/Soc"] == 62.9)
+SLOPE = rcfg.sustain_slope
+check("floor keeps every bit the sun adds and feeds the hold voltage forward along the slope",
+      hold() == r2(56.6 + 0.9 * SLOPE) and batt["/RecBms/Sustain/Soc"] == 62.9, "%s" % hold())
 rtick(soc=62.95, v=56.7, i=0.5, pv=0.0)
 check("...but not a rise made without the sun (Quattro trickle at night)",
-      batt["/RecBms/Sustain/Soc"] == 62.9, str(batt["/RecBms/Sustain/Soc"]))
-rtick(soc=63.0, v=56.72, i=10.0, pv=12.0)             # solar did it: re-anchor
-A1 = r2(56.72 + ir(10.0))
+      batt["/RecBms/Sustain/Soc"] == 62.9 and hold() == r2(56.6 + 0.9 * SLOPE), str(batt["/RecBms/Sustain/Soc"]))
+rtick(soc=63.0, v=56.72, i=10.0, pv=12.0)             # solar did it: re-anchor (never below the estimate)
+A1 = r2(max(56.72 + ir(10.0), 56.6 + 1.0 * SLOPE))
 check("floor follows the bank up a full step and re-anchors to the pack voltage less the IR drop",
       batt["/RecBms/Sustain/Soc"] == 63.0 and hold() == A1 and quattro() == A1 and
       mppt() == r2(A1 + BAND), "%s %s %s" % (batt["/RecBms/Sustain/Soc"], hold(), mppt()))
@@ -155,15 +157,15 @@ check("below the curve: anchored to the pack (IR-corrected), not clipped to the 
       batt["/RecBms/Sustain/Soc"] == 23.3, "%s %s %s" % (hold(), quattro(), mppt()))
 check("below the curve: nothing near curve(40) = %.2f" % curve(40), abs(quattro() - curve(40)) > 0.3)
 # the bank settles under the anchor overnight (taken under load): the servo lifts the command
-rtick(n=1, soc=23.15, i=-2.0, pv=0.0, dt=31)
-check("servo: bank 0.15 % under the held SOC and draining -> command up one step",
+rtick(n=1, soc=23.15, i=-0.9, pv=0.0, dt=31)          # the DC loads alone: 0.9 A
+check("servo: bank 0.15 % under the held SOC and draining at 0.9 A -> command up one step",
       hold() == r2(A0 + 0.02) and batt["/RecBms/Sustain/Servo"] == 0.02, "%s" % hold())
 rtick(n=5, dt=31)
 check("servo: one step per period", batt["/RecBms/Sustain/Servo"] == 0.12, str(batt["/RecBms/Sustain/Servo"]))
 rtick(n=2, dt=10)
 check("servo: not inside a period", batt["/RecBms/Sustain/Servo"] == 0.12, str(batt["/RecBms/Sustain/Servo"]))
-rtick(n=3, soc=23.15, i=0.0, dt=31)
-check("servo: still under the held SOC but no longer draining (Quattro covering) -> holds",
+rtick(n=3, soc=23.15, i=-0.2, dt=31)
+check("servo: still under the held SOC but no longer draining (Quattro covering, -0.2 A) -> holds",
       batt["/RecBms/Sustain/Servo"] == 0.12, str(batt["/RecBms/Sustain/Servo"]))
 rtick(n=1, soc=23.3, i=0.5, dt=31)
 check("servo: bank back at the held SOC -> holds there", batt["/RecBms/Sustain/Servo"] == 0.12)
@@ -179,11 +181,12 @@ drv.pv_current = None
 rtick(n=1, dt=31)
 check("servo: unknown PV current never lowers", batt["/RecBms/Sustain/Servo"] == 0.10)
 rtick(n=80, soc=22.0, i=-5.0, pv=0.0, dt=31)
-check("servo: bounded upward at servo_max_up_v", batt["/RecBms/Sustain/Servo"] == 0.5 and hold() == r2(A0 + 0.5))
+A0b = A0 + 0.15 * SLOPE                                 # the sun's 0.15 % fed forward
+check("servo: bounded upward at servo_max_up_v", batt["/RecBms/Sustain/Servo"] == 0.5 and hold() == r2(A0b + 0.5), str(hold()))
 check("servo: MPPT ceiling rides on it", mppt() == r2(hold() + BAND))
 rtick(n=200, soc=24.0, i=5.0, pv=0.0, dt=31)
 check("servo: bounded downward at the larger servo_max_down_v",
-      batt["/RecBms/Sustain/Servo"] == -2.0 and hold() == r2(A0 - 2.0), str(batt["/RecBms/Sustain/Servo"]))
+      batt["/RecBms/Sustain/Servo"] == -2.0 and hold() == r2(A0b - 2.0), str(batt["/RecBms/Sustain/Servo"]))
 
 # ---- staircase: the band absorbed on sun steps the hold up ----
 batt.write("/RecBms/Sustain/Request", 0); rtick()
@@ -209,9 +212,10 @@ rtick(n=70, v=top2 - 0.10, i=2.0, pv=4.0)              # sun, but under the ceil
 check("staircase: never steps under the ceiling", hold() == r2(top - 0.01))
 rtick(n=61, v=top2 - 0.01, i=0.0, pv=4.0)
 check("staircase: second step", hold() == r2(top2 - 0.01), str(hold()))
-rtick(n=1, soc=31.5, v=hold() + 0.12, i=10.0, pv=20.0)
-check("staircase: a full SOC step also re-anchors (IR-corrected)", hold() == r2(top2 - 0.01 + 0.12 + ir(10.0)) and
-      batt["/RecBms/Sustain/Soc"] == 31.5, str(hold()))
+h0 = hold()
+rtick(n=1, soc=31.5, v=h0 + 0.12, i=10.0, pv=20.0)
+check("staircase: a full SOC step also re-anchors (the higher of estimate and IR-corrected measurement)",
+      hold() == r2(max(h0 + 0.12 + ir(10.0), h0 + 1.5 * SLOPE)) and batt["/RecBms/Sustain/Soc"] == 31.5, str(hold()))
 
 # EQ due while held: it must wait, not run
 FakeBus.store["/Settings/RecBms/EqLastCompleted"] = 0
@@ -245,9 +249,10 @@ check("ceiling: MPPTs at the pack voltage, Quattro a lead under",
       batt["/RecBms/Sustain/Mode"] == 2 and batt["/RecBms/Sustain/Status"] == "ceiling",
       "%s %s" % (mppt(), quattro()))
 rtick(soc=89.3, v=60.2, i=-10.0)
-check("ceiling follows the drain, re-anchors only on a full step", hold() == 60.3 and batt["/RecBms/Sustain/Soc"] == 89.3)
+check("ceiling follows the drain down the slope, re-anchors only on a full step",
+      hold() == r2(60.3 - 0.7 * SLOPE) and batt["/RecBms/Sustain/Soc"] == 89.3, str(hold()))
 rtick(soc=89.0, v=60.15, i=-10.0)
-C1 = r2(60.15 + ir(-10.0))
+C1 = r2(min(60.15 + ir(-10.0), 60.3 - 1.0 * SLOPE))
 check("ceiling follows the bank down a full step and re-anchors lower (IR-corrected)",
       hold() == C1 and mppt() == C1 and batt["/RecBms/Sustain/Soc"] == 89.0, str(hold()))
 rtick(soc=91, v=60.5, i=6.0, pv=8.0)

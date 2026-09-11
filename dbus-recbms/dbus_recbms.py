@@ -113,7 +113,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -285,6 +285,11 @@ class Config:
         self.sustain_taper_margin = max(0.0, float(su.get("taper_margin_v", 0.03)))
         self.sustain_q_idle_a = max(0.0, float(su.get("quattro_idle_a", 1)))
         self.sustain_pv_min_a = max(0.0, float(su.get("pv_min_a", 0.5)))
+        # v1.8.3: what counts as the bank draining (the DC loads alone are
+        # ~0.9 A on this boat), and the hold voltage's feed-forward per
+        # percent of held SOC between re-anchors
+        self.sustain_drain_a = max(0.0, float(su.get("servo_drain_a", 0.3)))
+        self.sustain_slope = max(0.0, float(su.get("slope_v_per_pct", 0.10)))
 
 
 # ----------------------------------------------------------------------------
@@ -1154,7 +1159,7 @@ class RecBmsDriver:
         commanded a lead under the target as always, which lands it ON the
         hold voltage under a floor and a lead under it under a ceiling."""
         su = self.sustain
-        hold_v = su["anchor_v"] + su["servo_v"]
+        hold_v = round(su["anchor_v"] + su["servo_v"], 2)
         return round(min(hold_v + band, self.cfg.cvl_max), 2)
 
     def _sustain_clear(self, reason):
@@ -1209,7 +1214,16 @@ class RecBmsDriver:
         held_eff = su["soc"]
         if soc is not None:
             sun = pv_a is not None and pv_a >= c.sustain_pv_min_a
+            before = su["soc"]
             su["soc"] = sustain_hold(su["mode"], su["soc"], soc, charging, sun)
+            # v1.8.3 feed-forward: as the held SOC moves, the hold voltage
+            # moves with it along the nominal slope, so a sunny afternoon
+            # does not leave the Quattro's command a percent under the
+            # bank at dusk (the night of 2026-09-10: held 36.5 %, command
+            # anchored at 36.1 % and never lifted, 1.5 % drained). The next
+            # full-step re-anchor replaces the estimate with a measurement.
+            if su["soc"] != before:
+                su["anchor_v"] += (su["soc"] - before) * c.sustain_slope
             # The held SOC has moved a full step the hold's way since the
             # hold voltage was last anchored: the voltage follows it (a
             # floor only ever rises this way on sun, see sustain_hold).
@@ -1222,7 +1236,10 @@ class RecBmsDriver:
             held_eff = min(su["soc"], slider) if floor else max(su["soc"], slider)
             if now - su["servo_ts"] >= c.sustain_servo_s:
                 su["servo_ts"] = now
-                draining = amps is not None and amps < -c.sustain_q_idle_a
+                # v1.8.3: the DC loads alone drain this bank at ~0.9 A, under
+                # the 1 A "Quattro charging" threshold 1.8.1 reused here, so
+                # a whole night's drain went unseen. Draining has its own bar.
+                draining = amps is not None and amps < -c.sustain_drain_a
                 d = sustain_servo(su["mode"], soc - held_eff, charging, c.sustain_servo_db, draining)
                 if d:
                     su["servo_v"] = max(-c.sustain_servo_down, min(

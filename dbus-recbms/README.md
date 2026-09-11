@@ -308,7 +308,10 @@ while the ratchet waited for a 41 % that could never come. Now:
   the sun condition was added in 1.8.1) — and the hold voltage
   re-anchors to the present (resistance-corrected) pack voltage when the
   held SOC has gained a full `step_pct` (1 %) since the last anchor, or
-  when the **band is absorbed** — the pack sits at the MPPT ceiling with the
+  and between re-anchors it moves along `slope_v_per_pct` (0.10 V) with
+  every bit of held SOC the sun adds, so the command keeps up with the
+  afternoon instead of sitting a percent under the bank at dusk (1.8.3) —
+  or when the **band is absorbed** — the pack sits at the MPPT ceiling with the
   charge current tapered to `taper_a` (3 A) or less, on sun (`pv_min_a`)
   and with the Quattro idle, for `taper_s` (60 s). The second trigger is
   the safety net where the curve is steep: a band there may be less than a
@@ -322,7 +325,10 @@ while the ratchet waited for a 41 % that could never come. Now:
   `servo_period_s` (30 s) the hold voltage moves one `servo_step_v`
   (0.02 V) when the bank is more than `servo_deadband_pct` (0.1 %) from the
   held SOC in the direction the hold forbids: under a floor **up** while
-  the bank sits below the held SOC *and is still draining* (a sag the
+  the bank sits below the held SOC *and is still draining* — more than
+  `servo_drain_a` (0.3 A) leaving it; the DC loads alone are 0.9 A here, and
+  1.8.1's reuse of the 1 A Quattro threshold let a whole night's 50 W drain
+  go unseen on 2026-09-10 — (a sag the
   Quattro is not covering; once the bank sits still the Quattro is covering
   the loads and the command is where it needs to be — 1.8.0 kept pushing
   until the bank was back above the line, wound up 0.5 V ahead of the
