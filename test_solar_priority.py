@@ -40,7 +40,7 @@ check("config: servo and taper tunables", rcfg.sustain_servo_v == 0.02 and rcfg.
       and rcfg.sustain_servo_db == 0.1 and rcfg.sustain_servo_up == 0.5 and rcfg.sustain_servo_down == 2.0
       and rcfg.sustain_taper_a == 3 and rcfg.sustain_taper_s == 60 and rcfg.sustain_q_idle_a == 1
       and rcfg.sustain_pv_min_a == 0.5 and rcfg.sustain_band_v == 0.30 and rcfg.sustain_anchor_r == 0.003
-      and rcfg.sustain_drain_a == 0.3 and rcfg.sustain_slope == 0.10)
+      and rcfg.sustain_drain_a == 0.3 and rcfg.sustain_dusk_s == 300)
 
 T = [1_800_000_000.0]
 R.time = types.SimpleNamespace(time=lambda: T[0])
@@ -122,14 +122,13 @@ check("floor telemetry", batt["/RecBms/Sustain/Active"] == 1 and
       hold() == 56.6 and batt["/RecBms/Sustain/Servo"] == 0.0 and
       batt["/RecBms/Sustain/Status"] == "floor")
 rtick(soc=62.9, v=56.7, pv=5.0)
-SLOPE = rcfg.sustain_slope
-check("floor keeps every bit the sun adds and feeds the hold voltage forward along the slope",
-      hold() == r2(56.6 + 0.9 * SLOPE) and batt["/RecBms/Sustain/Soc"] == 62.9, "%s" % hold())
+check("floor keeps every bit the sun adds, re-anchors only on a full step (no creep)",
+      hold() == 56.6 and batt["/RecBms/Sustain/Soc"] == 62.9, "%s" % hold())
 rtick(soc=62.95, v=56.7, i=0.5, pv=0.0)
 check("...but not a rise made without the sun (Quattro trickle at night)",
-      batt["/RecBms/Sustain/Soc"] == 62.9 and hold() == r2(56.6 + 0.9 * SLOPE), str(batt["/RecBms/Sustain/Soc"]))
+      batt["/RecBms/Sustain/Soc"] == 62.9 and hold() == 56.6, str(batt["/RecBms/Sustain/Soc"]))
 rtick(soc=63.0, v=56.72, i=10.0, pv=12.0)             # solar did it: re-anchor (never below the estimate)
-A1 = r2(max(56.72 + ir(10.0), 56.6 + 1.0 * SLOPE))
+A1 = r2(56.72 + ir(10.0))
 check("floor follows the bank up a full step and re-anchors to the pack voltage less the IR drop",
       batt["/RecBms/Sustain/Soc"] == 63.0 and hold() == A1 and quattro() == A1 and
       mppt() == r2(A1 + BAND), "%s %s %s" % (batt["/RecBms/Sustain/Soc"], hold(), mppt()))
@@ -180,11 +179,11 @@ rtick(n=1, soc=23.45, i=3.0, pv=None, dt=31)
 drv.pv_current = None
 rtick(n=1, dt=31)
 check("servo: unknown PV current never lowers", batt["/RecBms/Sustain/Servo"] == 0.10)
-rtick(n=80, soc=22.0, i=-5.0, pv=0.0, dt=31)
-A0b = A0 + 0.15 * SLOPE                                 # the sun's 0.15 % fed forward
+rtick(n=80, soc=22.0, i=-5.0, pv=4.0, dt=31)          # sun up, so no dusk snap: the bounds alone
+A0b = A0
 check("servo: bounded upward at servo_max_up_v", batt["/RecBms/Sustain/Servo"] == 0.5 and hold() == r2(A0b + 0.5), str(hold()))
 check("servo: MPPT ceiling rides on it", mppt() == r2(hold() + BAND))
-rtick(n=200, soc=24.0, i=5.0, pv=0.0, dt=31)
+rtick(n=200, soc=24.0, i=6.0, pv=4.0, dt=31)          # the Quattro 2 A over PV
 check("servo: bounded downward at the larger servo_max_down_v",
       batt["/RecBms/Sustain/Servo"] == -2.0 and hold() == r2(A0b - 2.0), str(batt["/RecBms/Sustain/Servo"]))
 
@@ -214,8 +213,24 @@ rtick(n=61, v=top2 - 0.01, i=0.0, pv=4.0)
 check("staircase: second step", hold() == r2(top2 - 0.01), str(hold()))
 h0 = hold()
 rtick(n=1, soc=31.5, v=h0 + 0.12, i=10.0, pv=20.0)
-check("staircase: a full SOC step also re-anchors (the higher of estimate and IR-corrected measurement)",
-      hold() == r2(max(h0 + 0.12 + ir(10.0), h0 + 1.5 * SLOPE)) and batt["/RecBms/Sustain/Soc"] == 31.5, str(hold()))
+check("staircase: a full SOC step also re-anchors (IR-corrected)",
+      hold() == r2(h0 + 0.12 + ir(10.0)) and batt["/RecBms/Sustain/Soc"] == 31.5, str(hold()))
+
+# ---- the dusk snap: the sun's afternoon, then five minutes of no PV ----
+rtick(n=5, soc=31.9, v=hold() + 0.06, i=6.0, pv=8.0)  # afternoon: +0.4 % on sun, no full step
+h1 = hold()
+check("dusk: no creep while the sun still shines", h1 == hold() and batt["/RecBms/Sustain/Soc"] == 31.9)
+rtick(n=200, v=h1 + 0.05, i=-0.9, pv=0.0)            # PV gone: the bank rests 0.05 V over the command
+check("dusk: nothing for the first five minutes", hold() == h1, str(hold()))
+rtick(n=101, v=h1 + 0.05, i=-0.9, pv=0.0)
+check("dusk: snapped to the bank's own (IR-corrected) voltage", hold() == r2(h1 + 0.05 + ir(-0.9)) and
+      batt["/RecBms/Sustain/Servo"] == 0.0, str(hold()))
+h2 = hold()
+rtick(n=400, v=h2 + 0.10, i=1.0, pv=0.0)            # the Quattro's overshoot at night: no second snap
+check("dusk: one snap per night, never on the Quattro's own overshoot", hold() == h2, str(hold()))
+rtick(n=60, v=h2, i=2.0, pv=3.0)                      # a lit-up morning re-arms it
+rtick(n=301, v=h2 + 0.02, i=-0.5, pv=0.0)
+check("dusk: re-armed only by a new day of sun", hold() == r2(h2 + 0.02 + ir(-0.5)), str(hold()))
 
 # EQ due while held: it must wait, not run
 FakeBus.store["/Settings/RecBms/EqLastCompleted"] = 0
@@ -249,10 +264,10 @@ check("ceiling: MPPTs at the pack voltage, Quattro a lead under",
       batt["/RecBms/Sustain/Mode"] == 2 and batt["/RecBms/Sustain/Status"] == "ceiling",
       "%s %s" % (mppt(), quattro()))
 rtick(soc=89.3, v=60.2, i=-10.0)
-check("ceiling follows the drain down the slope, re-anchors only on a full step",
-      hold() == r2(60.3 - 0.7 * SLOPE) and batt["/RecBms/Sustain/Soc"] == 89.3, str(hold()))
+check("ceiling follows the drain, re-anchors only on a full step",
+      hold() == 60.3 and batt["/RecBms/Sustain/Soc"] == 89.3, str(hold()))
 rtick(soc=89.0, v=60.15, i=-10.0)
-C1 = r2(min(60.15 + ir(-10.0), 60.3 - 1.0 * SLOPE))
+C1 = r2(60.15 + ir(-10.0))
 check("ceiling follows the bank down a full step and re-anchors lower (IR-corrected)",
       hold() == C1 and mppt() == C1 and batt["/RecBms/Sustain/Soc"] == 89.0, str(hold()))
 rtick(soc=91, v=60.5, i=6.0, pv=8.0)

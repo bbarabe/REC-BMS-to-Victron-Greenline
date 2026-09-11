@@ -308,10 +308,11 @@ while the ratchet waited for a 41 % that could never come. Now:
   the sun condition was added in 1.8.1) — and the hold voltage
   re-anchors to the present (resistance-corrected) pack voltage when the
   held SOC has gained a full `step_pct` (1 %) since the last anchor, or
-  and between re-anchors it moves along `slope_v_per_pct` (0.10 V) with
-  every bit of held SOC the sun adds, so the command keeps up with the
-  afternoon instead of sitting a percent under the bank at dusk (1.8.3) —
-  or when the **band is absorbed** — the pack sits at the MPPT ceiling with the
+  or **at dusk** — once PV current has been under `pv_min_a` for `dusk_s`
+  (5 min) after a day of sun, so an afternoon's gain that never completed
+  a step is not left a tenth of a volt above the command all night
+  (2026-09-10: 0.13 V under, 50 W out, 1.5 % lost) — or when the
+  **band is absorbed** — the pack sits at the MPPT ceiling with the
   charge current tapered to `taper_a` (3 A) or less, on sun (`pv_min_a`)
   and with the Quattro idle, for `taper_s` (60 s). The second trigger is
   the safety net where the curve is steep: a band there may be less than a

@@ -113,7 +113,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -289,7 +289,9 @@ class Config:
         # ~0.9 A on this boat), and the hold voltage's feed-forward per
         # percent of held SOC between re-anchors
         self.sustain_drain_a = max(0.0, float(su.get("servo_drain_a", 0.3)))
-        self.sustain_slope = max(0.0, float(su.get("slope_v_per_pct", 0.10)))
+        # v1.8.4: the dusk snap -- PV current under pv_min_a for this long,
+        # after a day of sun, re-anchors the hold to the bank's own voltage
+        self.sustain_dusk_s = max(0.0, float(su.get("dusk_s", 300)))
 
 
 # ----------------------------------------------------------------------------
@@ -1031,7 +1033,8 @@ class RecBmsDriver:
     def _sustain_idle():
         return {"active": False, "mode": 0, "req_ts": 0.0, "soc": None,
                 "anchor_v": None, "anchor_soc": None, "servo_v": 0.0,
-                "servo_ts": 0.0, "taper_since": 0.0, "logged_soc": None,
+                "servo_ts": 0.0, "taper_since": 0.0, "sun_seen": False,
+                "dark_since": 0.0, "logged_soc": None,
                 "logged_servo": 0.0}
 
     def _live_soc(self):
@@ -1214,16 +1217,7 @@ class RecBmsDriver:
         held_eff = su["soc"]
         if soc is not None:
             sun = pv_a is not None and pv_a >= c.sustain_pv_min_a
-            before = su["soc"]
             su["soc"] = sustain_hold(su["mode"], su["soc"], soc, charging, sun)
-            # v1.8.3 feed-forward: as the held SOC moves, the hold voltage
-            # moves with it along the nominal slope, so a sunny afternoon
-            # does not leave the Quattro's command a percent under the
-            # bank at dusk (the night of 2026-09-10: held 36.5 %, command
-            # anchored at 36.1 % and never lifted, 1.5 % drained). The next
-            # full-step re-anchor replaces the estimate with a measurement.
-            if su["soc"] != before:
-                su["anchor_v"] += (su["soc"] - before) * c.sustain_slope
             # The held SOC has moved a full step the hold's way since the
             # hold voltage was last anchored: the voltage follows it (a
             # floor only ever rises this way on sun, see sustain_hold).
@@ -1261,6 +1255,30 @@ class RecBmsDriver:
             target = self._sustain_target(0.0)
             if soc is not None and soc < slider:
                 target = max(target, round(self._slider_cvl(slider), 2))
+        # Dusk snap (v1.8.4). A hold's voltage is only ever set from a
+        # measurement: when the hold is taken, on a full SOC step, when the
+        # band is absorbed -- and here, when the sun goes. A sunny afternoon
+        # raises the held SOC without a full step, and the Quattro's command
+        # then sits under the bank all night (2026-09-10: 0.13 V under, a
+        # steady 50 W out, 1.5 % lost). Once PV current has been under
+        # pv_min_a for dusk_s after a day of sun, the hold snaps to the
+        # bank's present voltage (less the drop across the pack): a floor
+        # never down, a ceiling never up. One snap per night; the servo
+        # below is only the backstop after it.
+        if soc is not None and volts is not None:
+            sun_now = pv_a is not None and pv_a >= c.sustain_pv_min_a
+            if sun_now:
+                su["sun_seen"] = True
+                su["dark_since"] = 0.0
+            elif su["sun_seen"]:
+                if not su["dark_since"]:
+                    su["dark_since"] = now
+                elif now - su["dark_since"] >= c.sustain_dusk_s:
+                    su["sun_seen"] = False
+                    su["dark_since"] = 0.0
+                    self._sustain_reanchor(volts, amps, "dusk: PV gone %.0fs, bank %.2fV at %.1fA"
+                                           % (c.sustain_dusk_s, volts, amps if amps is not None else 0.0))
+                    target = self._sustain_target(band)
         # Band absorbed: the MPPTs sit at their ceiling, the charge current
         # has tapered, the sun (not the Quattro) is what holds it there.
         # The bank has genuinely taken the band, so the staircase steps up
