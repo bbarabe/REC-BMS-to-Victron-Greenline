@@ -40,7 +40,10 @@ What it does (see README.md "Solar Priority driver"):
     ONEWAY_MIN_SOC (25 %) instead of MIN_SOC (40 %), and the emergency
     lockout stands aside while the sun is carrying the bank above it.
     Since 4.8 a one-way solar stint ends on a three-minute mean below
-    -50 W: a bank that is being charged is never left to drain.
+    -50 W: a bank that is being charged is never left to drain. Since 4.9
+    one-way charge skips the probe when both arrays already run
+    unthrottled on the floor's band (the capture is the capacity), and no
+    measurement boost is asked for in that state either.
 
 Differences from the flow (all deliberate):
   - inputs come from a velib DbusMonitor (signal-driven cache). Values stay
@@ -76,7 +79,7 @@ import dbus.mainloop.glib
 from gi.repository import GLib
 
 VERSION = "1.4.0"
-ENGINE_VERSION = "4.8"
+ENGINE_VERSION = "4.9"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-solarpriority")
@@ -167,6 +170,14 @@ ENGINE_DEFAULTS = {
     # on a marina-light open-circuit voltage with zero yield; each lifts
     # dbus-recbms' sustain charge-current cap for two minutes for nothing.
     "BOOST_MIN_PV_W": 20,
+    # 4.9: on the sustain floor the MPPTs sit one solar band above the
+    # bank and run unthrottled, so the capture IS the capacity and a probe
+    # proves nothing (2026-09-10: one probe, est 572 W vs need 529 W, both
+    # arrays in tracker mode, accepted on -133 W). With both arrays
+    # unthrottled and fresh captures, one-way charge goes straight to
+    # solar like one-way discharge does; the three-minute deficit exit
+    # stands guard. 0 keeps the probe.
+    "ONEWAY_SKIP_PROBE": 1,
 }
 
 
@@ -736,8 +747,19 @@ class Engine:
                 # Measurement boost (not gated on cooldown/backoff). Never
                 # while discharging one-way: a boost charges from solar, and
                 # dbus-recbms would refuse it under a sustain ceiling anyway.
+                # 4.9: no boost while the arrays already run unthrottled --
+                # no producing array at its ceiling (mode 1) and at least
+                # one in tracker mode (2) with a fresh capture. The live
+                # capture is the measurement, and every boost lifts the
+                # floor's charge-current cap for two minutes.
+                def cap_fresh(cap):
+                    return cap is not None and (now - cap["ts"]) <= t["CAP_FRESH_MS"]
+                throttled_any = any(m is not None and m.v == 1 for m in (m6, m7))
+                live_any = any(m is not None and m.v == 2 and cap_fresh(cp)
+                               for m, cp in ((m6, st["cap6"]), (m7, st["cap7"])))
+                unthrottled = live_any and not throttled_any
                 if (not boosting and dayOk and vocMax >= t["VOC_DAY_V"] and not vocRising
-                        and pvNow >= t["BOOST_MIN_PV_W"]
+                        and pvNow >= t["BOOST_MIN_PV_W"] and not unthrottled
                         and not aboveCvl and not shoreMissing and soc.v >= minSoc
                         and quattroW <= t["SURPLUS_QUIET_W"] and not owd
                         and (now - st["lastBoostTs"]) >=
@@ -754,6 +776,15 @@ class Engine:
                     # No probe: nothing to prove, the loads may run the bank
                     # down. The AC-control fault check lives in solar too.
                     enter_solar("one-way discharge %.1f%% -> %.0f%%" % (soc.v, tgt.v))
+                elif (owc and t["ONEWAY_SKIP_PROBE"] and unthrottled
+                      and est >= needW and ready and gateOk and (now - st["readySince"]) >= t["READY_MS"]):
+                    # 4.9: the arrays run unthrottled on the floor's band and
+                    # the captures are fresh -- there is nothing a probe
+                    # could measure that the capture has not (the balance
+                    # gate in `ready` has already passed)
+                    enter_solar("one-way charge on a live capture: %.0f+%.0fW vs need %.0fW, bal %s" % (
+                        faded(st["cap6"]), faded(st["cap7"]), needW,
+                        "%.2f" % balance if balance is not None else "-"))
                 elif ready and gateOk and (now - st["readySince"]) >= t["READY_MS"]:
                     enter_probe(("est %.0fW" % est if est >= needW else "exploratory") +
                                 " vs load %.0fW need %.0fW" % (loadJudge, needW) +

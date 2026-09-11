@@ -366,7 +366,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 5 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 1 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.8")
+check("engine version bumped", SP.ENGINE_VERSION == "4.9")
 Val = SP.Val
 
 
@@ -451,12 +451,14 @@ n0 = len(s.sustains)
 s.tick(31)
 check("charge: floor re-asserted every ASSERT_MS", len(s.sustains) == n0 + 1 and s.sustain == 1)
 s.tick(304)
-check("charge: aboveCvl neither burns down nor blocks the probe",
-      s.state == "probe" and s.cmd == 1, "state %s" % s.state)
+check("charge: aboveCvl neither burns down nor blocks leaving shore; unthrottled arrays -> straight to solar",
+      s.state == "solar" and s.cmd == 1 and "probe" not in s.states and
+      any(tr.startswith("-> SOLAR (one-way charge on a live capture") for tr in s.transitions),
+      "state %s %s" % (s.state, s.transitions[-1:]))
 check("charge: sustain released while shore is off", s.sustain == 0 and s.sustains[-1][1] == 0)
-check("charge: probe boost requested", s.boosts and s.boosts[-1] == s.t["BOOST_V"])
+check("charge: no probe boost, no measurement boost on unthrottled arrays", s.boosts == [], str(s.boosts))
 s.tick(95, batt=100.0, cvl=59.49)       # hold released: the real target is back
-check("charge: probe -> solar", s.state == "solar" and s.sustain == 0)
+check("charge: still on solar", s.state == "solar" and s.sustain == 0)
 s.tick(60, soc=68.0)
 check("charge: solar stays while the bank fills", s.state == "solar" and s.oneway == "charge")
 # night: PV gone, the loads draw from the bank -> three-minute deficit exit -> shore + sustain
@@ -564,9 +566,9 @@ check("...and clears once the slow average drops", s.state == "probe")
 
 # ---- one-way charge is patient with a deficit, and with a probe ----
 s = Sim()
-s.tick(1, soc=60, target=95, batt_v=56.4)
+s.tick(1, soc=60, target=95, batt_v=56.4, m=1)   # throttled arrays: the probe still runs
 s.tick(340)
-check("patient: probe", s.state == "probe")
+check("patient: probe when an array is throttled", s.state == "probe", s.state)
 s.tick(50, batt=100.0, cvl=59.49, load=350.0)   # avg*1.2 = 420 > est: 4.2 would have quit
 check("patient: a creeping load does not end a one-way probe",
       not any("big load" in tr for tr in s.transitions), str(s.transitions))
@@ -580,11 +582,18 @@ s.tick(300, batt=-100.0)
 check("4.8: -100 W three-minute mean -> shore", any(tr.startswith("-> SHORE (deficit: batt avg -") for tr in s.transitions),
       str(s.transitions))
 s = Sim()
-s.tick(1, soc=60, target=95, batt_v=56.4)
+s.tick(1, soc=60, target=95, batt_v=56.4, m=1)
 s.tick(340)
 s.tick(100, batt=-120.0, cvl=59.49)              # the whole ramp drains: not a stint to start
 check("4.8: probe verdict refuses a draining stint", s.state == "shore" and
       any("probe failed" in tr for tr in s.transitions), str(s.transitions[-1:]))
+s = Sim()
+s.tick(1, soc=60, target=95, batt_v=56.4)         # unthrottled: straight in, the deficit exit guards
+s.tick(340)
+check("4.9: straight to solar", s.state == "solar" and "probe" not in s.states)
+s.tick(300, batt=-120.0, cvl=59.49)
+check("4.9: a draining stint ends by the deficit exit", s.state == "shore" and
+      any("deficit" in tr for tr in s.transitions), str(s.transitions[-1:]))
 s = Sim()
 s.tick(1, soc=60, target=95, batt_v=56.4)
 s.tick(340)
@@ -596,7 +605,7 @@ check("patient: heater-class load still suspends", s.state == "suspend")
 s = Sim()
 s.tick(1, soc=60, target=95, batt_v=56.4)
 s.tick(340, pv=345.0, m=2, batt=250.0, load=178.0, dc_load=85.0)   # bank +250 W, all of it solar
-check("solar charging the band does not block the probe", s.state == "probe", s.state)
+check("solar charging the band does not block leaving shore", s.state == "solar", s.state)
 s = Sim()
 s.tick(1, soc=60, target=95, batt_v=56.4)
 s.tick(340, pv=0.0, m=1, batt=250.0, load=178.0)                   # bank +250 W from the Quattro
@@ -672,7 +681,7 @@ s = Sim()
 s.tick(1, soc=30.0, target=60, batt_v=54.4, cvl=54.69, batt=300.0)
 check("4.6: 30 -> 60 engages one-way charge with the floor", s.oneway == "charge" and s.sustain == 1)
 s.tick(340)
-check("4.6: probe at 30 % (min_soc 40 no longer gates one-way charge)", s.state == "probe", s.state)
+check("4.6: leaves shore at 30 % (min_soc 40 no longer gates one-way charge)", s.state == "solar", s.state)
 s.tick(95, batt=100.0, cvl=56.42)
 check("4.6: on solar at 30 %, floor released, real target", s.state == "solar" and s.sustain == 0)
 s.tick(120, soc=29.0, batt=150.0)
@@ -684,7 +693,7 @@ check("4.6: 28.5 % with the bank draining: emergency lockout", s.state == "shore
 s = Sim()
 s.tick(1, soc=27.0, target=60, batt_v=54.2, cvl=54.5, batt=300.0)
 s.tick(340)
-check("4.6: 27 % still probes (above oneway_min_soc)", s.state == "probe", s.state)
+check("4.6: 27 % still leaves shore (above oneway_min_soc)", s.state == "solar", s.state)
 s.tick(95, batt=100.0, cvl=56.42)
 s.tick(1, soc=24.9, batt=150.0)
 check("4.6: under oneway_min_soc the emergency lockout fires even with the sun carrying the bank",
@@ -701,6 +710,17 @@ s = Sim()
 s.tick(1, soc=35.0, target=100, batt_v=54.9, cvl=55.2)
 s.tick(340)
 check("4.6: a full charge (100 %) is not one-way and keeps min_soc", s.state == "shore", s.state)
+
+# ---- 4.9: no measurement boost while both arrays are unthrottled ----
+s = Sim()
+s.tick(400, soc=60, pv=500.0, m=2, load=1000.0, batt_v=56.4)   # on shore (need 1200 > est), tracker active
+check("4.9: no measurement boost while the arrays are unthrottled", s.boosts == [] and s.state == "shore", str(s.boosts))
+s.tick(400, m=1)
+check("4.9: measurement boost once an array is throttled", s.boosts and s.boosts[-1] == s.t["BOOST_V"] and s.state == "shore", str(s.boosts))
+s = Sim(ONEWAY_SKIP_PROBE=0)
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)
+check("4.9: oneway_skip_probe = 0 keeps the probe", s.state == "probe", s.state)
 
 # ---- 4.7: no measurement boost without real PV ----
 s = Sim()

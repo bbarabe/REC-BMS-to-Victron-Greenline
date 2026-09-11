@@ -550,6 +550,23 @@ circuit: every watt of sun goes in and there are no re-anchor ticks. The
 on-shore staircase (dbus-recbms 1.8.0) remains the behaviour for every hour
 the engine has to stay on shore.
 
+### Nothing to probe on the band (engine 4.9)
+
+On the sustain floor the MPPTs sit one solar band above the bank and run
+unthrottled, so what they report *is* the capacity: the only probe of
+2026-09-10 went out with both arrays in tracker mode and fresh captures of
+156 + 416 W, and measured nothing the engine did not already know. While
+charging one-way with no producing array at its ceiling, at least one in
+tracker mode with a fresh capture, and the captures clearing the need, the
+engine now goes **straight to solar** —
+as one-way discharge always has — with no 90 s ramp, no probe boost and no
+lifted charge-current cap; the three-minute deficit exit stands guard, and
+re-entry is exactly when the live capture clears the need again. For the
+same reason no measurement boost is asked for while the arrays are
+unthrottled (eight fired on the morning of 2026-09-10 for nothing). The
+probe still runs whenever an array is throttled, and `oneway_skip_probe = 0`
+restores it.
+
 ### A charging bank is never left to drain (engine 4.8)
 
 2026-09-10, on solar since 10:13 with loads of 360–410 W against 400–750 W
