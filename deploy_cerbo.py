@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-deploy_cerbo.py — ship a standalone driver to the Cerbo over ONE SSH session.
+deploy_cerbo.py — ship drivers through the shared ./cerbo SSH daemon.
 
     python deploy_cerbo.py recbms                 # upload + svc -t + verify
     python deploy_cerbo.py solarpriority --install   # first install (install.sh)
-    python deploy_cerbo.py recbms solarpriority   # several, one session
+    python deploy_cerbo.py recbms solarpriority   # several, shared daemon
+    python deploy_cerbo.py solarpriority --start # update/resume a stopped service
     python deploy_cerbo.py czone --verify-only    # no upload, no restart
     python deploy_cerbo.py recbms --dry-run       # show what would change
 
 Encodes the rules in CLAUDE.md so nobody re-derives them:
-  * one SSH session per run, 30 s keepalive, NEVER retries a failed connect
-    (repeated connects exhaust the Cerbo and it drops off the network)
+  * reuse the shared ./cerbo daemon for every command and upload; its single
+    SSH transport, keepalive and failed-connect backoff remain authoritative
   * the on-boat config (calibration!) is diffed against the repo's committed
     copies BEFORE anything is overwritten; a value set that matches no commit
     (an on-boat edit) aborts unless --force-config, a comment-only difference
@@ -28,11 +29,11 @@ import hashlib
 import os
 import posixpath
 import re
+import shlex
 import subprocess
 import sys
 import time
-
-import paramiko
+import tempfile
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
@@ -45,7 +46,10 @@ PACKAGES = {
         "service": "dbus-recbms",
         "install_arg": "recbms",
         "version_file": "dbus_recbms.py",
-        "files": ["dbus_recbms.py", "config.ini", "README.md", "install.sh",
+        "files": ["dbus_recbms.py", "rec_policy_adapter.py", "energy_accounting.py",
+                  "control_inputs.py", "policy_contract.py", "rec_control_config.py",
+                  "control_watchdog.py", "policy_telemetry.py",
+                  "config.ini", "README.md", "install.sh",
                   "uninstall.sh", "service/run", "service/log/run"],
         "configs": ["config.ini"],
         "verify": [
@@ -57,6 +61,9 @@ PACKAGES = {
             ("com.victronenergy.battery.recbms", "/RecBms/LeadFault"),
             ("com.victronenergy.battery.recbms", "/RecBms/TargetSoc"),
             ("com.victronenergy.battery.recbms", "/RecBms/Sustain/Status"),
+            ("com.victronenergy.battery.recbms", "/RecBms/Policy/Status"),
+            ("com.victronenergy.battery.recbms", "/RecBms/Health/CriticalValid"),
+            ("com.victronenergy.battery.recbms", "/RecBms/Voltage/Ready"),
             ("com.victronenergy.system", "/Control/EffectiveChargeVoltage"),
             ("com.victronenergy.system", "/ActiveBmsInstance"),
         ],
@@ -66,7 +73,8 @@ PACKAGES = {
         "service": "dbus-solarpriority",
         "install_arg": "solarpriority",
         "version_file": "solar_priority.py",
-        "files": ["solar_priority.py", "solar_priority.ini", "README.md",
+        "files": ["solar_priority.py", "solar_engine.py", "control_inputs.py",
+                  "policy_contract.py", "solar_priority.ini", "README.md",
                   "install.sh", "uninstall.sh",
                   "service-solarpriority/run", "service-solarpriority/log/run"],
         "configs": ["solar_priority.ini"],
@@ -230,53 +238,59 @@ def local_version(pkg):
 
 
 class Cerbo:
+    """Deployment operations over the existing CLI and its shared transport.
+
+    Credentials stay in the child process environment. Closing this client does
+    not close the daemon used by other Cerbo work in the same session.
+    """
+
     def __init__(self, host, password):
-        self.c = paramiko.SSHClient()
-        self.c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            self.c.connect(host, username="root", password=password, timeout=15,
-                           allow_agent=False, look_for_keys=False)
-        except Exception as e:
-            die("cannot connect to %s (%s). Do NOT retry in a loop — wait a few "
-                "minutes; repeated connects are what knock the Cerbo offline." % (host, e))
-        self.c.get_transport().set_keepalive(30)
-        self.sftp = None
+        self.environ = dict(os.environ, CERBO_HOST=host, CERBO_PASS=password)
+        self._call("up")
+
+    def _call(self, *arguments):
+        result = subprocess.run([os.path.join(REPO, "cerbo"), *arguments],
+                                env=self.environ, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace")
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError("Cerbo %s failed (exit %d): %s" %
+                               (arguments[0], result.returncode, detail))
+        return result.stdout, result.stderr
 
     def run(self, cmd, timeout=60):
-        _, out, err = self.c.exec_command(cmd, timeout=timeout)
-        o = out.read().decode(errors="replace")
-        e = err.read().decode(errors="replace")
-        return o, e
+        return self._call("run", cmd, str(timeout))
 
     def cat(self, path):
-        o, e = self.run("cat '%s' 2>/dev/null" % path)
-        return o if not e.strip() else o
+        return self.run("cat %s" % shlex.quote(path))[0]
 
     def exists(self, path):
-        o, _ = self.run("[ -e '%s' ] && echo yes || echo no" % path)
-        return o.strip() == "yes"
+        out, _ = self.run("[ -e %s ] && echo yes || echo no" % shlex.quote(path))
+        return out.strip() == "yes"
 
     def put(self, local, remote):
-        if self.sftp is None:
-            self.sftp = self.c.open_sftp()
-        self.run("mkdir -p '%s'" % posixpath.dirname(remote))
-        data = open(local, "rb").read()
+        self.run("mkdir -p %s" % shlex.quote(posixpath.dirname(remote)))
+        with open(local, "rb") as handle:
+            data = handle.read()
         if remote.endswith(TEXT_SUFFIXES):
             data = data.replace(b"\r\n", b"\n")
-        with self.sftp.open(remote, "wb") as fh:
-            fh.write(data)
+        # Normalize a temporary copy so the user's working file stays intact.
+        # Uploads still travel through the daemon's single SFTP transport.
+        with tempfile.NamedTemporaryFile(prefix="cerbo-upload-") as staging:
+            staging.write(data)
+            staging.flush()
+            self._call("put", staging.name, remote)
         if remote.endswith(EXEC_SUFFIXES):
-            self.run("chmod 755 '%s'" % remote)
+            self.run("chmod 755 %s" % shlex.quote(remote))
 
     def dbus_get(self, service, path):
-        o, e = self.run("dbus -y %s %s GetValue 2>&1" % (service, path), timeout=15)
-        lines = (o or e).strip().splitlines()
-        return lines[-1].strip() if lines else ""   # dbus CLI errors are tracebacks; the last line says it
+        out, err = self.run("dbus -y %s %s GetValue 2>&1" %
+                            (shlex.quote(service), shlex.quote(path)), timeout=15)
+        lines = (out or err).strip().splitlines()
+        return lines[-1].strip() if lines else ""
 
     def close(self):
-        if self.sftp:
-            self.sftp.close()
-        self.c.close()
+        self.environ.pop("CERBO_PASS", None)
 
 
 def main():
@@ -284,6 +298,8 @@ def main():
     ap.add_argument("packages", nargs="+", choices=sorted(PACKAGES))
     ap.add_argument("--install", action="store_true", help="first install: run install.sh instead of svc -t")
     ap.add_argument("--no-restart", action="store_true", help="upload only")
+    ap.add_argument("--start", action="store_true",
+                    help="start an existing stopped service; restart it if already running")
     ap.add_argument("--verify-only", action="store_true", help="no upload, no restart")
     ap.add_argument("--dry-run", action="store_true", help="diff and plan only")
     ap.add_argument("--force-config", action="store_true",
@@ -291,6 +307,8 @@ def main():
     ap.add_argument("--tag", default=time.strftime("%Y%m%d-%H%M"), help="backup suffix (.bak-<tag>)")
     ap.add_argument("--settle", type=float, default=8.0, help="seconds to wait after restart before verifying")
     args = ap.parse_args()
+    if args.start and (args.install or args.no_restart or args.verify_only):
+        ap.error("--start cannot be combined with --install, --no-restart or --verify-only")
 
     host = os.environ.get("CERBO_HOST")
     pw = os.environ.get("CERBO_PASS")
@@ -319,6 +337,7 @@ def main():
         rc = 0
         for name, pkg in plan:
             base = "/data/" + pkg["dir"]
+            restart_command = "svc -%s /service/%s" % ("tu" if args.start else "t", pkg["service"])
             print("\n#### %s" % name)
             o, _ = cb.run("grep -m1 '^VERSION' %s/%s 2>/dev/null; svstat /service/%s 2>&1" % (
                 base, pkg["version_file"], pkg["service"]))
@@ -381,7 +400,7 @@ def main():
             if args.dry_run:
                 print("-- dry run: %d file(s) would be uploaded; %s" % (
                     len(uploads), "install.sh %s" % pkg["install_arg"] if args.install
-                    else ("no restart" if args.no_restart else "svc -t /service/%s" % pkg["service"])))
+                    else ("no restart" if args.no_restart else restart_command)))
                 continue
 
             # --- backup + upload ---
@@ -399,10 +418,10 @@ def main():
                 print((o + e).strip())
             elif args.no_restart:
                 print("-- not restarted (--no-restart)")
-            elif uploads:
-                cb.run("svc -t /service/%s" % pkg["service"])
-                print("-- svc -t /service/%s" % pkg["service"])
-            if (args.install or (uploads and not args.no_restart)):
+            elif uploads or args.start:
+                cb.run(restart_command)
+                print("-- " + restart_command)
+            if (args.install or args.start or (uploads and not args.no_restart)):
                 time.sleep(args.settle)
             verify(cb, pkg, base)
     finally:
@@ -424,4 +443,7 @@ def verify(cb, pkg, base):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        die(str(exc))

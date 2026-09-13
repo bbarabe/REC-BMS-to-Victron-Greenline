@@ -8,3 +8,7 @@ __pycache__/
 # Claude Code machine-local settings
 .claude/settings.local.json
 camera-relay/config.json
+
+# Runtime REC accounting is boat state, never a deployable source artifact.
+dbus-recbms/solar-control-state.json
+dbus-recbms/.energy-*

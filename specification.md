@@ -363,22 +363,9 @@ The 127489 messages also carry engine hours and engine temperature; oil temp, co
 
 ## REC-BMS Driver (`dbus-recbms/`)
 
-Standalone Python D-Bus service that replaces the Node-RED Virtual BMS flow. Runs under daemontools (`/service/dbus-recbms`, installed via `install.sh`, survives firmware updates through `/data/rc.local`), starts seconds after D-Bus at boot — independent of Signal K / Node-RED (which took minutes to bring the virtual battery up) — and is untouched by Node-RED deploys (which could wedge the D-Bus connection and force a reboot).
+Standalone Python service replacing the retired Virtual BMS flow. Raw SocketCAN on `can0` decodes YDNB-wrapped REC frames into independently fresh limits, voltage/current, SOC, cells, temperature and module groups. Battery instance 200 and Max Charge switch 220 retain their identities. Missing critical data grants no charge permission.
 
-**Data path**: raw SocketCAN socket on `can0` (kernel filter `0x18FF0000/0x1FFFF800`, 29-bit only) -> `decode_frame()` (strips wrapper: `id & 0x7FF`) -> 1s publish tick -> `com.victronenergy.battery.recbms` (instance 200) + `com.victronenergy.switch.recbms_maxcharge` (VRM "Max Charge" slider, instance 220).
-
-Behavior is a 1:1 port of the flow (staged fallback, startup grace, Quattro voltage fallback, slider→CVL, weekly EQ, synthetic alarms — all documented below; thresholds/timings live in `dbus-recbms/config.ini`). Differences from the flow:
-
-- No candump subprocess, watchdog, pkill, or chunked line parsing — the kernel filters and delivers frames directly.
-- Persistence moved from the `virtual-bms-state.json` writable-dir hack to localsettings (`/Settings/RecBms/ChargeSlider`, `/Settings/RecBms/EqLastCompleted`, `/Settings/RecBms/CustomName`) — no restore/retry dance, saves are synchronous.
-- Instance pinning is built in: the driver seeds `/Settings/Devices/recbms|recbms_maxcharge/ClassAndVrmInstance` and reconverges to 200/220 at startup if localsettings granted something else while the wanted instance is free (registry-style self-heal). The settings ids deliberately have no `virtual_` prefix so the Node-RED palette's auto-cleanup never touches them.
-- Publishes paths the virtual battery node rejected: hi-res `/Soc` (0.01% from 0x355 bytes 4-5), `/Soh`, `/Capacity` (remaining = SOC × installed), `/ConsumedAmphours` (negative, BMV convention), `/InstalledCapacity` (from 0x379), `/TimeToGo`, `/System/MinCellVoltage`–`MaxCellTemperature` (cell extremes from 0x373), `/System/Min|MaxVoltageCellId` + `/System/Min|MaxTemperatureCellId` (extreme-cell identity from 0x374-0x377), module counts from 0x372, `/History/ChargeCycles`, live `/Serial` + FW/HW version, plus diagnostics: `/RecBms/Phase`, `/RecBms/EqStatus`, `/RecBms/TimeToFull` (from 60s-smoothed charge current) and `/RecBms/ForceChargeRequest` (0x360; forwarded to `/Info/ChargeRequest` only if `forward_charge_request = true` in config).
-
-- **Solar boost (v1.2.0)**: writeable `/RecBms/SolarBoost/Request` raises only the solar chargers above the Quattro's regulation point (via the systemcalc `SolarVoltageOffset`, which applies to MPPTs only), so they run unthrottled and their output can be measured as capacity without dropping shore power. Gated every tick on live cell data (max cell 4.05V, temps 5–45°C, ceiling 62.70V, ≥0.10V margin over pack voltage); hard 120s expiry, cleared at startup/shutdown — never sticky.
-- **Lead verification (v1.4.0)**: systemcalc applies the Debug voltage offsets only while the GX access level is **Superuser** (`/Settings/System/AccessLevel > 2`, evaluated once per systemcalc process), and the D-Bus write succeeds regardless. The driver therefore compares `com.victronenergy.system /Control/EffectiveChargeVoltage` (what DVCC really sends the MPPTs) with published CVL + written offset every 3 s; a 10 s mismatch is a **lead fault**: full target published (lead 0), boosts refused, `/RecBms/LeadFault` explains (access level + fix), `/Alarms/InternalFailure` raised to warning so the GUI notifies and VRM can mail. Self-clears once the offset is seen applied (raise access level, `svc -t /service/dbus-systemcalc-py`). Also pins `/Settings/SystemSetup/BmsInstance` to 200 while it is on automatic. See `dbus-recbms/README.md` for the other dvcc.py facts (3 s cadence, user voltage cap does not cap a boost, driver death → MPPT error #67).
-- **Solar lead (v1.3.0)**: the Quattro's absorption holds +0.05–0.15V *above* its commanded CVL (measured 2026-08-19: SVS on, BMS/Quattro/sense meters within 10mV, `VebusChargeState` = absorption — the bias is in its regulation, not a sense error). The driver therefore publishes `/Info/MaxChargeVoltage` = target − `solar_lead_v` (0.15V) and holds `SolarVoltageOffset` at the lead, so only the MPPTs see the true target: the Quattro lands at or just under the calibrated equilibrium and the accurately-regulating MPPTs finish the top-off. True target on `/RecBms/TargetChargeVoltage`, lead in force on `/RecBms/SolarLead`; if the offset write fails the driver publishes the full target (fail-safe to pre-lead behavior). Side effect: below target only solar has charging headroom on shore.
-
-Install/migration/rollback procedure: `dbus-recbms/README.md`.
+The version 3 architecture restores the committed Solar Priority decision engine while retaining REC as the sole relay executor, voltage-command ordering/readbacks, native energy accounting and successful-tick watchdog. Historical energy uncertainty is diagnostic, not an operational veto. Live calibration, target settings and newest ledger survive upgrades. See [the current architecture and deployment reference](dbus-recbms/README.md) and [restoration evidence](reviews/solar-priority-restoration-2026-09-13.md).
 
 ## CZone Driver (`dbus-czone/`)
 
@@ -591,11 +578,13 @@ Install/migration/rollback: `dbus-edrive/README.md`. Migration needs
 or localsettings will not hand 210/211 back.
 
 
-## Solar Priority Driver (`dbus-recbms/solar_priority.py`) — DEPLOYED 2026-08-21
+## Solar Priority Driver (`dbus-recbms/solar_priority.py`)
 
-The retired flow (algorithm described under **Retired Node-RED flows** below), ported line-for-line to a standalone daemontools service (`/service/dbus-solarpriority`) that ships in the `dbus-recbms/` package but stays separate (own config `solar_priority.ini`, own log, own D-Bus service `com.victronenergy.switch.solarpriority` instance 221 carrying the toggle and the PV-capacity slider as two outputs). Inputs via velib `DbusMonitor` (last-known-good + heartbeat liveness, as in the flow); outputs `IgnoreAcIn1` and the dbus-recbms boost request over D-Bus. Differences from the flow are deliberate and listed in `dbus-recbms/README.md`: `IgnoreAcIn1` forced to 0 on exit/SIGTERM/exception, FAULT/emergency lockouts are hard 1 h holds (the flow's evidence release cleared them), transitions logged durably. The flow and the driver must never run together (both write `IgnoreAcIn1`); migration steps in the README. `SolarPriority.json` is now in `archive/` and instance 222 is retired.
+The separate `/service/dbus-solarpriority` service owns the restored `shore`, `probe`, `solar`, `burndown` and `suspend` decision states, with one-way charge/discharge and full-target behavior. It keeps switch instance 221 and localsettings enable/rated-PV values; instance 222 remains retired.
 
-**One-way charge / discharge (engine 4.3, driver 1.1.0, needs dbus-recbms ≥ 1.5.0)**: while the Max Charge target is more than 5 % away from the SOC the bank is only ever moved toward it. Charging: solar does all the charging through the normal shore → probe → solar cycle, and whenever shore is connected the engine asks dbus-recbms to *sustain* the bank (`/RecBms/Sustain/Request` = 1: the slider is read as the present SOC, ratcheting upward only) so the Quattro holds instead of charging; burn-downs are off. Discharging: a sustain ceiling (mode 2, ratcheting downward only) is held the whole time so nothing charges, shore is left without a probe as soon as the gates allow, and the deficit/surge/drift exits are off — only the SOC floor, a heater-class suspend and the AC faults end it. Stands down within 1 % of the target. Details in `dbus-recbms/README.md` ("Sustain", "One-way charge / discharge"); `test_solar_priority.py` drives both off the boat.
+The pure engine emits shore, sustain floor/ceiling/release and bounded boost intentions through REC protocol v2. It never writes `IgnoreAcIn` directly. REC checks generation, lease, actual feedback, command safety, connected dwell and relay rate limits. Accounting and historical trials do not select operating phases or veto departures. Fresh measured Quattro V×I replaces inferred net power; observed timestamps distinguish unchanged values from stale data.
+
+The [README](dbus-recbms/README.md) is the current behavior, module and deployment reference. Retired flow descriptions below document history only.
 
 ## Device Instance Allocation
 
@@ -674,7 +663,7 @@ Subscribed to Signal K `electrical.batteries.1..3.*` and
 `propulsion.{port,starboard}.alternatorVoltage`, assembled them in flow context,
 and published five `victron-virtual` batteries on a 1 s tick with a 10 s
 staleness check. SOC arrived as a Signal K ratio and was multiplied by 100.
-Replaced by [`dbus-batteries/`](../dbus-batteries/), which reads the same three
+Replaced by [`dbus-batteries/`](dbus-batteries/), which reads the same three
 PGNs directly off `can0` and makes the choice of which batteries to forward a
 runtime setting rather than five hardcoded nodes.
 
@@ -684,7 +673,7 @@ Ran `candump -L can0,<13 filters>` as an exec-node subprocess, parsed the
 chunked stdout, and published two `victron-virtual` motordrives; a watchdog
 `pkill`ed any stale capture and restarted 5 s after candump exited. The wire
 decode it implemented is unchanged and now lives in
-[`dbus-edrive/`](../dbus-edrive/), which reads the bus with kernel filters and
+[`dbus-edrive/`](dbus-edrive/), which reads the bus with kernel filters and
 starts no subprocess.
 
 
@@ -728,7 +717,9 @@ commands go out as PGN 127502. Circuit names, the circuit count and the
 momentary/latching split are all hardcoded in the flow. The driver replaces all
 of that with discovery and a single multi-output bank.
 
-### Solar Priority (`archive/SolarPriority.json`) — RETIRED, the algorithm description below still applies to the driver
+### Solar Priority (`archive/SolarPriority.json`) — RETIRED, historical algorithm
+
+This section records the original policy and its evolution into the driver. Its zero-cycle objective and harvest/maintenance details are superseded as intended behavior by the [2026-09-11 revised design](dbus-recbms/SOLAR_PRIORITY_DESIGN.md); the replacement implementation, installed revision and outstanding acceptance are described in the current driver sections above.
 
 Automatically powers AC loads from solar instead of shore power when the panels can carry them. Designed for storage mode: the battery is held at a target SOC by the Max Charge slider and the goal is **zero energy cycled through the battery** — battery power is therefore the primary control signal, not PV-vs-load comparison. Charging in solar mode is allowed (surplus charges the pack until DVCC/CVL caps it at the target).
 

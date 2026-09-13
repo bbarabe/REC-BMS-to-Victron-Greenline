@@ -1,99 +1,22 @@
 #!/usr/bin/env python3
-"""
-dbus-recbms — standalone Venus OS driver for the REC-BMS main bank.
+"""REC-BMS CAN publisher and Solar Priority safety/actuator owner.
 
-Replaces the Node-RED "Virtual BMS" flow (archive/Virtual BMS.json). Runs as a
-daemontools service, starts seconds after D-Bus at boot — independent of
-Node-RED / Signal K — and is untouched by Node-RED deploys.
+YDNB-07 forwards 11-bit REC frames as 0x18FF0NNN on SocketCAN. This driver
+publishes battery instance 200 and Max Charge slider instance 220, validates
+CAN groups independently, and clamps both charger commands to fresh REC and
+installation limits through verified base/offset transitions.
 
-Data path:
-    YDNB-07 repackages the REC-BMS 11-bit CAN-BMS frames (0x351..0x404)
-    as 29-bit 0x18FF0NNN frames on can0. This driver reads them with a
-    raw SocketCAN socket (kernel filter 0x18FF0000/0x1FFFF800 — no
-    candump subprocess, no line parsing), decodes them and publishes:
-      - com.victronenergy.battery.<suffix>  (the BMS, instance 200)
-      - com.victronenergy.switch.<suffix>   (VRM "Max Charge" slider, 220)
+The v2 policy adapter owns measured energy references, durable wear/relay
+budgets, battery-power regulation and the only new-protocol IgnoreAcIn writer.
+Solar Priority sends acknowledged, expiring intents. Legacy sustain/boost
+callbacks remain available only before the publisher-first ownership handover.
+Maintenance requires calibrated evidence; there is no calendar-only charge.
 
-Persistence (slider position, equalization schedule, custom name) lives
-in localsettings (com.victronenergy.settings) — no state file, no
-writable-directory discovery, survives reboots/updates natively.
-
-Behavior ported 1:1 from the Node-RED flow:
-  - staged fallback   LIVE -> ALERT -> RESTRICT -> SURVIVAL on CAN loss
-  - startup grace     cold boot is not CAN loss (benign STARTUP phase)
-  - Quattro /Dc/0/Voltage as independent pack-voltage source when stale
-  - CVL from Max Charge slider (40-100% -> base+span mapping on the REC's
-    SOC scale, clipped to max_v; the EQ boost may ride above the clip)
-  - weekly 1h equalization boost (+0.44V), only while LIVE
-  - synthetic alarms (REC-BMS sends no 0x35A frame)
-
-v1.3.0 solar lead: the Quattro's absorption holds +0.05..0.15V ABOVE its
-commanded CVL (measured 2026-08-19 with SVS on and the BMS/Quattro/sense
-meters agreeing to 10mV), so the driver commands the Quattro solar_lead_v
-below the slider/EQ target and raises only the solar chargers back up to it
-via the systemcalc SolarVoltageOffset — the MPPTs, which regulate
-accurately, finish the top-off at the true target.
-
-v1.7.0 lead gating: the lead exists for Solar Priority (it is what leaves
-the MPPTs headroom on shore). With Solar Priority disabled, or the slider at
-lead_full_pct (100 %), the owner wants a FULL charge from whatever charger is
-on: the lead is 0, the Quattro is commanded the true target and the offset is
-cleared. The Quattro's +0.05..0.15V bias is a hold-at-voltage effect; a bulk
-charge to the calibrated 100 % point does not overshoot it.
-
-v1.4.0 lead verification: systemcalc applies the Debug voltage offsets only
-when /Settings/System/AccessLevel > 2 (Superuser) — and it evaluates that
-once per process (reify). The D-Bus write succeeds regardless, so v1.3 could
-believe a lead was in force while the MPPTs were actually held at target -
-lead. The driver now compares com.victronenergy.system
-/Control/EffectiveChargeVoltage (the voltage DVCC really sends the MPPTs)
-against what it expects; on a sustained mismatch it publishes the FULL
-target, refuses boosts, raises /Alarms/InternalFailure to warning and
-explains itself in /RecBms/LeadFault. It also pins
-/Settings/SystemSetup/BmsInstance to its own instance when that is still on
-automatic, so no other battery service can take over the CVL.
-
-v1.5.0 sustain: a request-and-forget control (/RecBms/Sustain/Request, same
-shape as the solar boost) that makes the driver read the Max Charge slider as
-the PRESENT SOC instead of its set value -- so the chargers hold the bank
-where it is rather than moving it. Mode 1 (floor) lets the held SOC ratchet
-upward only, mode 2 (ceiling) downward only, and both stay inside the real
-slider target. Solar Priority's one-way charge/discharge uses it so that
-shore only ever sustains the bank while solar (or the loads) do the moving.
-It expires by itself after [sustain] hold_s and dies with the process, so a
-dead requester can never leave the charger pinned. The slider value itself
-is published as /RecBms/TargetSoc.
-
-v1.8.0 voltage-anchored sustain. A hold is anchored to the bank's MEASURED
-voltage the moment it is taken, never to the curve: the curve is calibrated
-on settled holds between 58.6 and 62.3 % only, and a floor requested at
-23 % (2026-09-07, after a motoring stint) was clipped to the slider's 40 %
-minimum and its 54.42 V -- which this pack reaches at 30 % by coulomb count.
-Every charger sat at that ceiling through two sunny days while the ratchet
-waited for 41 %. Now a floor holds the pack voltage, gives the MPPTs one
-solar lead of headroom above it, and moves UP only: when the bank has
-gained a full step of SOC, or when the MPPTs have filled that headroom and
-the charge current has tapered (the band is absorbed). A slow servo on the
-coulomb count then holds the SOC exactly -- the hold voltage creeps up
-while the bank sits under the held SOC (a sag the Quattro is not covering)
-and down while the Quattro is charging it above -- so the Quattro's own
-+0.05..0.15 V hold bias and the curve's error no longer matter. The result
-is a pure staircase: the sun is taken when there is sun, and the bank is
-held exactly where the sun left it when there is not. A ceiling is the
-mirror image. snap_pct is gone; the servo replaces it. Under a floor the
-solar lead is widened to band_v (0.30 V) so the MPPTs are not throttled
-inside a band the bank fills in an hour, and every anchor is corrected for
-the drop across the pack's resistance (anchor_ir_mohm).
-
-v1.3.1 capacity fix: 0x35F bytes 4-5 are the capacity CONFIGURED in the BMS
-(1400 Ah), not a firmware version — reading them as one published a bogus
-"1400" to /FirmwareVersion. They now feed /RecBms/ConfiguredCapacity, and
-/FirmwareVersion has no source. /InstalledCapacity is unchanged: it stays on
-0x379 ("BatterySize", 1440 Ah rated), the frame the protocol designates for it.
-
-Baselines:
-  https://github.com/victronenergy/velib_python           (dbusdummyservice.py)
-  https://github.com/mr-manuel/venus-os_dbus-mqtt-battery (service structure)
+Localsettings stores UI settings. The versioned atomic energy ledger stores
+control history separately. The service wrapper supervises completed REC ticks
+so a stalled executor can be restarted. Installation timing, physical voltage
+margin, REC completion and balancing remain commissioning requirements; see
+SOLAR_PRIORITY_FACTS.md and SOLAR_PRIORITY_ROLLOUT.md.
 """
 
 import configparser
@@ -113,8 +36,12 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.8.4"
+VERSION = "3.0.0"
 BUSITEM = "com.victronenergy.BusItem"
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rec_policy_adapter import RecPolicyAdapter
+from control_watchdog import Heartbeat
 
 log = logging.getLogger("dbus-recbms")
 
@@ -145,12 +72,37 @@ from settingsdevice import SettingsDevice   # noqa: E402
 # Config
 # ----------------------------------------------------------------------------
 class Config:
+    @staticmethod
+    def _number(value):
+        """Reject nonfinite input before clamps can accidentally conceal it."""
+        try:
+            if isinstance(value, bool):
+                raise ValueError()
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('configuration value must be numeric: %r' % (value,))
+        if not math.isfinite(number):
+            raise ValueError('configuration value must be finite: %r' % (value,))
+        return number
+
     def __init__(self, path):
         cp = configparser.ConfigParser(interpolation=None)
         cp.read(path)
         g = cp["general"] if cp.has_section("general") else {}
         self.log_level = str(g.get("log_level", "INFO")).upper()
 
+        policy = cp['policy'] if cp.has_section('policy') else {}
+        self.policy_state_path = os.path.join(os.path.dirname(os.path.abspath(path)),
+                                             policy.get('state_file', 'solar-control-state.json'))
+        self.capacity_version = policy.get('capacity_version', 'rated-1440')
+        self.policy_calendar_timezone = policy.get('calendar_timezone', 'UTC')
+        self.policy_ac_input = int(policy.get('shore_ac_input', 1))
+        self.policy_consumer_suffix = policy.get('consumer_service_suffix', 'solarpriority')
+        self.policy_consumer_instance = int(policy.get('consumer_instance', 221))
+        if self.policy_ac_input not in (1, 2):
+            raise ValueError('policy shore_ac_input must be 1 or 2')
+        self.policy_mppt_instances = tuple(int(v.strip()) for v in policy.get('mppt_instances', '278,279').split(','))
+        self.policy_parameters = dict(cp['control']) if cp.has_section('control') else {}
         c = cp["can"] if cp.has_section("can") else {}
         self.can_iface = c.get("interface", "can0")
         self.can_filter_id = int(str(c.get("filter_id", "0x18FF0000")), 16)
@@ -163,7 +115,7 @@ class Config:
         self.batt_instance = int(b.get("instance", 200))
         self.product_name = b.get("product_name", "REC-BMS")
         self.custom_name = b.get("custom_name", "REC-BMS Main Bank")
-        self.installed_ah = float(b.get("installed_capacity_ah", 1440))
+        self.installed_ah = self._number(b.get("installed_capacity_ah", 1440))
         self.nr_of_cells = int(b.get("nr_of_cells", 15))
         self.serial_default = b.get("serial", "REC-BMS")
         # forward the BMS 0x360 flag to /Info/ChargeRequest — off by
@@ -185,37 +137,36 @@ class Config:
         self.slider_name = s.get("custom_name", "Max Charge")
         self.slider_group = s.get("group", "BMS")
         self.slider_unit = s.get("unit", "%")
-        self.slider_min = float(s.get("min", 40))
-        self.slider_max = float(s.get("max", 100))
-        self.slider_step = float(s.get("step", 5))
-        self.slider_default = float(s.get("default", 100))
+        self.slider_min = self._number(s.get("min", 40))
+        self.slider_max = self._number(s.get("max", 100))
+        self.slider_step = self._number(s.get("step", 5))
+        self.slider_default = self._number(s.get("default", 100))
 
         v = cp["cvl"] if cp.has_section("cvl") else {}
         # piecewise-linear slider% -> CVL breakpoints "pct:volts, pct:volts, ..."
         curve = v.get("curve", "40:54.42, 62.3:56.65, 100:62.70")
-        self.cvl_curve = sorted(
-            (float(p.split(":")[0]), float(p.split(":")[1]))
-            for p in curve.split(",") if p.strip()
-        )
+        points = [point.split(':') for point in curve.split(',') if point.strip()]
+        if any(len(point) != 2 for point in points):
+            raise ValueError('[cvl] curve points must be pct:volts pairs')
+        self.cvl_curve = sorted((self._number(pct), self._number(volts)) for pct, volts in points)
         if len(self.cvl_curve) < 2:
             raise ValueError("[cvl] curve needs at least two pct:volts points")
-        self.cvl_max = float(v.get("max_v", 61.96))
-        self.eq_boost = float(v.get("eq_boost_v", 0.44))
-        self.eq_interval_s = float(v.get("eq_interval_days", 7)) * 86400
-        self.eq_duration_s = float(v.get("eq_duration_min", 60)) * 60
+        self.cvl_max = self._number(v.get("max_v", 61.96))
+        self.installation_max_v = min(62.40, self._number(v.get("installation_max_v", 62.40)))
+        self.voltage_guard_v = max(0.0, self._number(v.get("voltage_guard_v", 0.10)))
         # standing Quattro/solar split: command the vebus this far below the
         # target and raise only the MPPTs back to it (0 disables)
-        self.solar_lead = max(0.0, min(0.30, float(v.get("solar_lead_v", 0.0))))
+        self.solar_lead = max(0.0, min(0.30, self._number(v.get("solar_lead_v", 0.0))))
         # v1.7.0: the lead only while Solar Priority is enabled (its
         # /Settings/SolarPriority/Enabled), and never at/above this slider
         # position -- a full charge is every charger commanded the target
         self.lead_needs_sp = \
             str(v.get("lead_needs_solar_priority", "true")).lower() != "false"
-        self.lead_full_pct = float(v.get("lead_full_pct", 100))
+        self.lead_full_pct = self._number(v.get("lead_full_pct", 100))
         # verify the offset against systemcalc /Control/EffectiveChargeVoltage:
         # a mismatch must persist this long before it counts (DVCC only
         # adjusts every 3 s, so a slider move is briefly inconsistent)
-        self.lead_verify_s = float(v.get("lead_verify_s", 10))
+        self.lead_verify_s = self._number(v.get("lead_verify_s", 10))
         self.lead_fault_alarm = \
             str(v.get("lead_fault_alarm", "true")).lower() != "false"
 
@@ -224,74 +175,107 @@ class Config:
         # ItemsChanged. Control paths (CVL/CCL/DCL, targets, lead, alarms,
         # sustain/boost) are published at full resolution regardless.
         pb = cp["publish"] if cp.has_section("publish") else {}
-        self.voltage_step = float(pb.get("voltage_step", 0.05))
-        self.current_step = float(pb.get("current_step", 0.5))
-        self.power_step = float(pb.get("power_step", 10))
-        self.temperature_step = float(pb.get("temperature_step", 0.5))
-        self.soc_step = float(pb.get("soc_step", 0.1))
-        self.ah_step = float(pb.get("ah_step", 1))
-        self.time_step = float(pb.get("time_step", 60))
+        self.voltage_step = self._number(pb.get("voltage_step", 0.05))
+        self.current_step = self._number(pb.get("current_step", 0.5))
+        self.power_step = self._number(pb.get("power_step", 10))
+        self.temperature_step = self._number(pb.get("temperature_step", 0.5))
+        self.soc_step = self._number(pb.get("soc_step", 0.1))
+        self.ah_step = self._number(pb.get("ah_step", 1))
+        self.time_step = self._number(pb.get("time_step", 60))
 
         f = cp["fallback"] if cp.has_section("fallback") else {}
-        self.live_timeout = float(f.get("live_timeout_s", 60))
-        self.alert_timeout = float(f.get("alert_timeout_s", 120))
-        self.restrict_timeout = float(f.get("restrict_timeout_s", 300))
-        self.startup_grace = float(f.get("startup_grace_s", 180))
-        self.alert_dcl = float(f.get("alert_dcl_a", 100))
-        self.alert_dvl = float(f.get("alert_dvl_v", 52.0))
-        self.restrict_dcl = float(f.get("restrict_dcl_a", 30))
-        self.restrict_dvl = float(f.get("restrict_dvl_v", 53.0))
-        self.survival_dcl = float(f.get("survival_dcl_a", 15))
-        self.survival_dvl = float(f.get("survival_dvl_v", 54.0))
-        self.safe_cvl = float(f.get("safe_cvl_v", 62.7))
-        self.safe_voltage = float(f.get("safe_voltage_v", 54.0))
-        self.safe_soc = float(f.get("safe_soc", 50))
+        self.live_timeout = self._number(f.get("live_timeout_s", 60))
+        self.alert_timeout = self._number(f.get("alert_timeout_s", 120))
+        self.restrict_timeout = self._number(f.get("restrict_timeout_s", 300))
+        self.startup_grace = self._number(f.get("startup_grace_s", 180))
+        self.alert_dcl = self._number(f.get("alert_dcl_a", 100))
+        self.alert_dvl = self._number(f.get("alert_dvl_v", 52.0))
+        self.restrict_dcl = self._number(f.get("restrict_dcl_a", 30))
+        self.restrict_dvl = self._number(f.get("restrict_dvl_v", 53.0))
+        self.survival_dcl = self._number(f.get("survival_dcl_a", 15))
+        self.survival_dvl = self._number(f.get("survival_dvl_v", 54.0))
+        # Unknown limits never authorize charging, including old 62.7 V configs.
+        self.safe_cvl = min(54.0, self._number(f.get("safe_cvl_v", 54.0)))
+        self.safe_voltage = self._number(f.get("safe_voltage_v", 54.0))
+        self.safe_soc = self._number(f.get("safe_soc", 50))
 
         q = cp["quattro"] if cp.has_section("quattro") else {}
         self.vebus_instance = int(q.get("vebus_instance", 276))
-        self.extv_max_age = float(q.get("max_age_s", 30))
+        self.extv_max_age = self._number(q.get("max_age_s", 30))
         self.extv_poll_s = int(q.get("poll_s", 5))
 
         sb = cp["solarboost"] if cp.has_section("solarboost") else {}
         self.boost_enabled = str(sb.get("enabled", "true")).lower() != "false"
-        self.boost_max_v = float(sb.get("max_boost_v", 0.30))
-        self.boost_hold_s = float(sb.get("hold_s", 120))
-        self.boost_measure_start_s = float(sb.get("measure_start_s", 75))
-        self.boost_measure_len_s = float(sb.get("measure_len_s", 30))
-        self.boost_cell_max_v = float(sb.get("cell_max_v", 4.05))
-        self.boost_cell_min_t = float(sb.get("cell_min_t", 5))
-        self.boost_cell_max_t = float(sb.get("cell_max_t", 45))
-        self.boost_ceiling_v = float(sb.get("ceiling_v", 62.70))
-        self.boost_min_margin_v = float(sb.get("min_margin_v", 0.10))
+        self.boost_max_v = self._number(sb.get("max_boost_v", 0.30))
+        self.boost_hold_s = self._number(sb.get("hold_s", 120))
+        self.boost_measure_start_s = self._number(sb.get("measure_start_s", 75))
+        self.boost_measure_len_s = self._number(sb.get("measure_len_s", 30))
+        self.boost_cell_max_v = self._number(sb.get("cell_max_v", 4.05))
+        self.boost_cell_min_t = self._number(sb.get("cell_min_t", 5))
+        self.boost_cell_max_t = self._number(sb.get("cell_max_t", 45))
+        self.boost_ceiling_v = self._number(sb.get("ceiling_v", 62.70))
+        self.boost_min_margin_v = self._number(sb.get("min_margin_v", 0.10))
         self.boost_service = sb.get("target_service", "com.victronenergy.system")
         self.boost_path = sb.get(
             "target_path", "/Debug/BatteryOperationalLimits/SolarVoltageOffset")
 
         su = cp["sustain"] if cp.has_section("sustain") else {}
         self.sustain_enabled = str(su.get("enabled", "true")).lower() != "false"
-        self.sustain_hold_s = float(su.get("hold_s", 120))
-        self.sustain_step = max(0.0, float(su.get("step_pct", 1)))
-        self.sustain_ccl_a = max(0.0, float(su.get("charge_limit_a", 5)))
+        self.sustain_hold_s = self._number(su.get("hold_s", 120))
+        self.sustain_step = max(0.0, self._number(su.get("step_pct", 1)))
+        self.sustain_ccl_a = max(0.0, self._number(su.get("charge_limit_a", 5)))
         # v1.8.0: the voltage anchor's SOC servo and the band-absorbed step
-        self.sustain_servo_v = max(0.0, float(su.get("servo_step_v", 0.02)))
-        self.sustain_servo_s = max(1.0, float(su.get("servo_period_s", 30)))
-        self.sustain_servo_db = max(0.0, float(su.get("servo_deadband_pct", 0.1)))
-        self.sustain_servo_up = max(0.0, float(su.get("servo_max_up_v", 0.5)))
-        self.sustain_servo_down = max(0.0, float(su.get("servo_max_down_v", 2.0)))
-        self.sustain_band_v = max(0.0, min(1.0, float(su.get("band_v", 0.30))))
-        self.sustain_anchor_r = max(0.0, float(su.get("anchor_ir_mohm", 3))) / 1000.0
-        self.sustain_taper_a = max(0.0, float(su.get("taper_a", 3)))
-        self.sustain_taper_s = max(0.0, float(su.get("taper_s", 60)))
-        self.sustain_taper_margin = max(0.0, float(su.get("taper_margin_v", 0.03)))
-        self.sustain_q_idle_a = max(0.0, float(su.get("quattro_idle_a", 1)))
-        self.sustain_pv_min_a = max(0.0, float(su.get("pv_min_a", 0.5)))
+        self.sustain_servo_v = max(0.0, self._number(su.get("servo_step_v", 0.02)))
+        self.sustain_servo_s = self._number(su.get("servo_period_s", 30))
+        self.sustain_servo_db = max(0.0, self._number(su.get("servo_deadband_pct", 0.1)))
+        self.sustain_servo_up = max(0.0, self._number(su.get("servo_max_up_v", 0.5)))
+        self.sustain_servo_down = max(0.0, self._number(su.get("servo_max_down_v", 2.0)))
+        self.sustain_band_v = max(0.0, min(1.0, self._number(su.get("band_v", 0.30))))
+        self.sustain_anchor_r = max(0.0, self._number(su.get("anchor_ir_mohm", 3))) / 1000.0
+        self.sustain_taper_a = max(0.0, self._number(su.get("taper_a", 3)))
+        self.sustain_taper_s = max(0.0, self._number(su.get("taper_s", 60)))
+        self.sustain_taper_margin = max(0.0, self._number(su.get("taper_margin_v", 0.03)))
+        self.sustain_q_idle_a = max(0.0, self._number(su.get("quattro_idle_a", 1)))
+        self.sustain_pv_min_a = max(0.0, self._number(su.get("pv_min_a", 0.5)))
         # v1.8.3: what counts as the bank draining (the DC loads alone are
         # ~0.9 A on this boat), and the hold voltage's feed-forward per
         # percent of held SOC between re-anchors
-        self.sustain_drain_a = max(0.0, float(su.get("servo_drain_a", 0.3)))
+        self.sustain_drain_a = max(0.0, self._number(su.get("servo_drain_a", 0.3)))
         # v1.8.4: the dusk snap -- PV current under pv_min_a for this long,
         # after a day of sun, re-anchors the hold to the bank's own voltage
-        self.sustain_dusk_s = max(0.0, float(su.get("dusk_s", 300)))
+        self.sustain_dusk_s = max(0.0, self._number(su.get("dusk_s", 300)))
+
+        # Unit conversions (minutes/days) must remain finite as well.
+        for key, value in vars(self).items():
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError('configuration parameter overflow: ' + key)
+        positive = (
+            'can_reconnect_s', 'installed_ah', 'nr_of_cells', 'slider_step',
+            'cvl_max', 'installation_max_v',
+            'lead_verify_s', 'live_timeout', 'alert_timeout', 'restrict_timeout',
+            'startup_grace', 'safe_cvl', 'safe_voltage', 'extv_max_age', 'extv_poll_s',
+            'boost_hold_s', 'boost_measure_start_s', 'boost_measure_len_s',
+            'sustain_hold_s', 'sustain_servo_s', 'sustain_taper_s', 'sustain_dusk_s')
+        for key in positive:
+            if getattr(self, key) <= 0:
+                raise ValueError('configuration parameter must be positive: ' + key)
+        if self.cvl_max > 61.96:
+            raise ValueError('normal CVL may not exceed 61.96 V')
+        if not 0 <= self.slider_min < self.slider_max <= 100 or not self.slider_min <= self.slider_default <= self.slider_max:
+            raise ValueError('invalid slider bounds or default')
+        if not 0 <= self.safe_soc <= 100 or not 0 <= self.lead_full_pct <= 100:
+            raise ValueError('configured SOC must be within 0..100')
+        if not 0 < self.live_timeout <= self.alert_timeout <= self.restrict_timeout:
+            raise ValueError('fallback timeouts must be ordered')
+        if any(not 0 <= pct <= 100 or volts <= 0 for pct, volts in self.cvl_curve):
+            raise ValueError('invalid CVL curve point')
+        if any(right[0] <= left[0] or right[1] < left[1]
+               for left, right in zip(self.cvl_curve, self.cvl_curve[1:])):
+            raise ValueError('CVL curve requires unique SOC points and nondecreasing voltage')
+        if (not self.policy_mppt_instances or len(set(self.policy_mppt_instances)) != len(self.policy_mppt_instances)
+                or any(instance < 0 for instance in self.policy_mppt_instances)):
+            raise ValueError('policy MPPT instances must be distinct nonnegative numbers')
+
 
 
 # ----------------------------------------------------------------------------
@@ -302,6 +286,126 @@ MIN_LEN = {
     0x370: 1, 0x371: 1, 0x372: 8, 0x373: 8, 0x374: 1, 0x375: 1,
     0x376: 1, 0x377: 1, 0x379: 2, 0x380: 1, 0x381: 1, 0x404: 1,
 }
+
+
+
+# Cell and temperature extrema share a frame, but have distinct consumers.
+CAN_GROUPS = {
+    0x351: ("Limits",), 0x355: ("Soc",), 0x356: ("Measurements",),
+    0x372: ("Modules",), 0x373: ("Cells", "Temperature"),
+}
+CRITICAL_GROUPS = ("Limits", "Measurements", "Soc", "Cells", "Temperature", "Modules")
+GROUP_FIELDS = {
+    "Limits": ("cvl", "ccl", "dcl", "dvl"),
+    "Measurements": ("voltage", "current", "temperature"),
+    "Soc": ("soc",), "Cells": ("minCellV", "maxCellV"),
+    "Temperature": ("minCellT", "maxCellT"),
+    "Modules": ("modulesOnline", "modulesBlockingCharge", "modulesBlockingDischarge", "modulesOffline"),
+}
+
+
+def rec_health(bms, now, timeout):
+    """Return independent receipt ages/validity, never numeric-change ages."""
+    received = bms.get("_received", {})
+    health = {}
+    for group in CRITICAL_GROUPS:
+        stamp = received.get(group)
+        age = None if stamp is None else max(0.0, now - stamp)
+        values = [bms.get(key) for key in GROUP_FIELDS[group]]
+        valid = (age is not None and stamp <= now and age <= timeout and
+                 all(isinstance(v, (int, float)) and math.isfinite(v) for v in values))
+        if valid:
+            if group == "Limits":
+                valid = (0 < bms["cvl"] <= 80 and 0 <= bms["ccl"] <= 5000 and
+                         0 <= bms["dcl"] <= 5000 and 0 < bms["dvl"] <= bms["cvl"])
+            elif group == "Measurements":
+                valid = 20 <= bms["voltage"] <= 80 and abs(bms["current"]) <= 5000
+            elif group == "Soc":
+                soc = bms.get("socHiRes") if bms.get("socHiRes") is not None else bms["soc"]
+                valid = math.isfinite(soc) and 0 <= soc <= 100
+            elif group == "Cells":
+                valid = 0 < bms["minCellV"] <= bms["maxCellV"] <= 6
+            elif group == "Temperature":
+                valid = -60 <= bms["minCellT"] <= bms["maxCellT"] <= 120
+            elif group == "Modules":
+                valid = all(0 <= v <= 65535 for v in values)
+        health[group] = {"age": age, "valid": bool(valid)}
+    return health
+
+
+def voltage_floor(value):
+    """Round down so decimal publication cannot cross a hard cap."""
+    return math.floor(max(0.0, value) * 100 + 1e-8) / 100.0
+
+
+class VoltageEnvelope:
+    """Sequence DVCC base/offset updates through a verified safe base.
+
+    Callbacks publish the base immediately, write/read the offset, and verify
+    downstream application. A failed or missing readback inhibits charging.
+    """
+    def __init__(self, publish_base, write_offset, read_offset, applied):
+        self.publish_base, self.write_offset = publish_base, write_offset
+        self.read_offset, self.applied = read_offset, applied
+        self.base, self.offset = None, None
+        self.ready, self.status = False, "unverified startup"
+        self.requested_quattro, self.requested_solar = None, None
+        self.pending_offset = None
+        self.pending_offset_max = 0.0
+
+    def _publish(self, base):
+        base = voltage_floor(base)
+        if self.base != base:
+            self.publish_base(base)
+            self.base = base
+
+    def step(self, quattro, solar, safe):
+        self.ready = False
+        self.requested_quattro = voltage_floor(min(quattro, safe))
+        self.requested_solar = voltage_floor(min(solar, safe))
+        new_offset = round(self.requested_solar - self.requested_quattro, 2)
+        observed = self.read_offset()
+        if observed is None or not math.isfinite(observed):
+            self.offset = None
+            self._publish(0.0)
+            self.status = "offset unknown; charging inhibited"
+            return False
+        self.offset = observed
+        # A confirmed Debug-property write can precede downstream application.
+        # Retain the safe base until the changed offset is effective as well.
+        if self.pending_offset is not None:
+            if abs(observed - self.pending_offset) <= 0.001:
+                if not self.applied(self.base, observed):
+                    self._publish(min(self.base, safe - max(0.0, observed, self.pending_offset_max)))
+                    self.status = "waiting for effective offset readback"
+                    return False
+            self.pending_offset = None
+        intermediate = voltage_floor(min(self.requested_quattro,
+                                          safe - max(0.0, observed, new_offset)))
+        if self.base is None or self.base > intermediate + 0.001:
+            self._publish(intermediate)
+        if abs(observed - new_offset) > 0.001:
+            if not self.applied(self.base, observed):
+                self.status = "waiting for safe intermediate voltage"
+                return False
+            old_offset = observed
+            if not self.write_offset(new_offset):
+                self.status = "offset write refused; retaining safe base"
+                return False
+            observed = self.read_offset()
+            if observed is None or abs(observed - new_offset) > 0.001:
+                self.status = "offset readback pending; retaining safe base"
+                return False
+            self.offset = observed
+            if not self.applied(self.base, observed):
+                self.pending_offset = observed
+                self.pending_offset_max = max(0.0, old_offset, observed)
+                self.status = "waiting for effective offset readback"
+                return False
+        self._publish(self.requested_quattro)
+        self.ready = self.applied(self.base, self.offset)
+        self.status = "verified" if self.ready else "waiting for charger voltage readback"
+        return self.ready
 
 
 def _u16(d, o):
@@ -316,9 +420,8 @@ def _ascii(d):
     return d.split(b"\0")[0].decode("ascii", errors="replace").strip("�")
 
 
-def decode_frame(bms, canid, data):
-    """Update the live BMS state dict from one decoded frame.
-    Returns True if the frame refreshed the staleness timestamp."""
+def decode_frame(bms, canid, data, received_at=None):
+    """Decode a frame, refreshing only groups it carries (monotonic time)."""
     if canid < 0x351 or canid > 0x404 or canid not in MIN_LEN:
         return False
     if len(data) < MIN_LEN[canid]:
@@ -332,8 +435,7 @@ def decode_frame(bms, canid, data):
     elif canid == 0x355:
         bms["soc"] = _u16(data, 0)
         bms["soh"] = _u16(data, 2)
-        if len(data) >= 6:
-            bms["socHiRes"] = _u16(data, 4) / 100.0
+        bms["socHiRes"] = _u16(data, 4) / 100.0 if len(data) >= 6 else None
     elif canid == 0x356:
         bms["voltage"] = _s16(data, 0) / 100.0
         bms["current"] = _s16(data, 2) / 10.0
@@ -388,7 +490,11 @@ def decode_frame(bms, canid, data):
     elif canid == 0x404:
         bms["statusByte"] = data[0]
 
-    bms["_lastUpdate"] = time.time()
+    received_at = time.monotonic() if received_at is None else received_at
+    received = bms.setdefault("_received", {})
+    for group in CAN_GROUPS.get(canid, ()):
+        received[group] = received_at
+    bms["_lastFrame"] = received_at
     return True
 
 
@@ -542,11 +648,12 @@ def fmt_int(unit=""):
 # ----------------------------------------------------------------------------
 class RecBmsDriver:
     def __init__(self, cfg):
+        self.heartbeat = Heartbeat.from_environment()
         self.cfg = cfg
         self.bms = {}
         self.start_ts = time.time()
+        self.start_mono = time.monotonic()
         self.phase_name = None          # for change-only logging
-        self.eq = {"active": False, "startTime": 0.0}
         self.extv = None                # (volts, ts) from the Quattro
         self.current_ema = None         # ~60s-smoothed current for TimeToFull
         self._vebus_name = None
@@ -577,7 +684,11 @@ class RecBmsDriver:
         self.eff_cv = None                  # (volts or None, ts) from systemcalc
         self.pv_current = None              # (amps or None, ts) from systemcalc
         self._last_pub_cvl = None           # /Info/MaxChargeVoltage we published
-        self._last_offset = 0.0             # offset we last wrote
+        self._last_offset = None            # unknown until actual readback
+        self.charge_guard_reason = ""
+        self.voltage_control = VoltageEnvelope(
+            self._publish_voltage_base, self._boost_write,
+            self._read_solar_offset, self._voltage_applied)
         self.sp_enabled = None              # /Settings/SolarPriority/Enabled, polled
         self.lead_v = 0.0                   # standing lead in force this tick
         self._lead_logged = None
@@ -586,7 +697,8 @@ class RecBmsDriver:
         self._check_access_level()
         if cfg.pin_bms_instance:
             self._pin_bms_instance()
-        self._boost_write(0.0, quiet=True)   # first tick sets the real lead
+        self.batt["/Info/MaxChargeCurrent"] = 0.0
+        self.policy_adapter = RecPolicyAdapter(self, clock=time)
         atexit.register(self._boost_shutdown)
         for _sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -756,6 +868,21 @@ class RecBmsDriver:
         # the frame the Victron CAN-BMS protocol designates for it.
         svc.add_path("/RecBms/ConfiguredCapacity", None,
                      gettextcallback=fmt("Ah", 0))
+        svc.add_path("/RecBms/Health/Source", "can:%s:%08x/%08x" % (
+            c.can_iface, c.can_filter_id, c.can_filter_mask))
+        svc.add_path("/RecBms/Health/CriticalValid", 0)
+        for group in CRITICAL_GROUPS:
+            svc.add_path("/RecBms/Health/%s/Age" % group, None)
+            svc.add_path("/RecBms/Health/%s/Valid" % group, 0)
+        for name in ("Voltage", "Current", "Soc", "ChargeVoltageLimit",
+                     "ChargeCurrentLimit", "DischargeCurrentLimit"):
+            svc.add_path("/RecBms/Raw/" + name, None)
+        svc.add_path("/RecBms/SafeChargeVoltage", c.safe_cvl)
+        for name in ("RequestedQuattro", "RequestedSolar", "AcceptedQuattro", "AcceptedSolar"):
+            svc.add_path("/RecBms/Voltage/" + name, None)
+        svc.add_path("/RecBms/Voltage/Ready", 0)
+        svc.add_path("/RecBms/Voltage/Status", "unverified startup")
+
 
         # Solar boost: a REQUEST-and-forget control that biases only the solar
         # chargers above the published CVL, so they out-regulate the Quattro
@@ -914,19 +1041,197 @@ class RecBmsDriver:
     # the CVL this same driver publishes -- so the clamp can be checked against
     # live cell data rather than a fixed guess.
 
-    def _boost_write(self, volts, quiet=False):
-        """Push the offset into systemcalc. Returns True on success."""
-        c = self.cfg
+    def _read_number(self, service, path):
+        # Voltage guards consume the same bounded, timestamped root samples as
+        # policy. Re-reading every charger synchronously in every guard blocks
+        # the event loop which must deliver those samples. Missing/stale cache
+        # entries remain unavailable; writes and offset acknowledgement stay
+        # synchronous and are never satisfied by a cached readback.
+        adapter = getattr(self, 'policy_adapter', None)
+        if (adapter is not None and adapter.contract.owned and path in (
+                '/Connected', '/Link/ChargeVoltage',
+                '/BatteryOperationalLimits/MaxChargeVoltage', '/Control/EffectiveChargeVoltage')
+                and service in adapter.sources_names.values()):
+            value = adapter.sources.get(service, path, time.monotonic())
+            try:
+                value = float(value)
+                return value if math.isfinite(value) else None
+            except (TypeError, ValueError):
+                return None
         try:
-            obj = shared_bus().get_object(c.boost_service, c.boost_path)
-            obj.SetValue(dbus.Double(float(volts)),
-                         dbus_interface="com.victronenergy.BusItem")
-            return True
-        except Exception as e:
+            value = self.sbus.call_blocking(service, path, BUSITEM,
+                                           "GetValue", "", [], timeout=2)
+            value = float(value)
+            return value if math.isfinite(value) else None
+        except Exception:
+            return None
+
+    def _read_solar_offset(self):
+        return self._read_number(self.cfg.boost_service, self.cfg.boost_path)
+
+    def _boost_write(self, volts, quiet=False):
+        """Accept only SetValue success AND actual offset readback."""
+        try:
+            result = self.sbus.call_blocking(
+                self.cfg.boost_service, self.cfg.boost_path, BUSITEM,
+                "SetValue", "v", [float(volts)], timeout=2)
+            actual = self._read_solar_offset()
+            return (result == 0 and actual is not None and
+                    abs(actual - volts) <= 0.001)
+        except Exception as exc:
             if not quiet:
-                log.warning("solar boost: cannot write %s%s: %s",
-                            c.boost_service, c.boost_path, e)
+                log.warning("solar offset write failed: %s", exc)
             return False
+
+    def _publish_voltage_base(self, volts):
+        # Deliberately outside the telemetry batch: offset writes must never
+        # overtake a buffered reduction of the battery's base CVL.
+        self.batt["/Info/MaxChargeVoltage"] = volts
+        self._last_pub_cvl = volts
+
+    def _voltage_applied(self, base, offset):
+        """Fresh DVCC and charger setpoints must confirm the safe pair.
+
+        Lower charger limits are safe (a device can impose its own cap); the
+        systemcalc effective limit must acknowledge the requested base/offset.
+        Missing control paths are a commissioning/availability fault.
+        """
+        effective = self._read_number(self.cfg.boost_service,
+                                      "/Control/EffectiveChargeVoltage")
+        safe = self._safe_voltage()
+        if effective is None or effective > safe + 1e-8 or abs(effective - (base + offset)) > 0.015:
+            return False
+        seen = False
+        for name in self.sbus.list_names():
+            name = str(name)
+            if name.startswith("com.victronenergy.solarcharger."):
+                path, ceiling = "/Link/ChargeVoltage", base + offset
+            elif name.startswith("com.victronenergy.vebus."):
+                path, ceiling = "/BatteryOperationalLimits/MaxChargeVoltage", base
+            else:
+                continue
+            connected = self._read_number(name, "/Connected")
+            if connected == 0:
+                continue
+            if connected != 1:
+                return False
+            actual = self._read_number(name, path)
+            if actual is None or actual < 0 or actual > min(ceiling + 0.015, safe + 1e-8):
+                return False
+            seen = True
+        return seen
+
+    def _voltage_within_envelope(self, safe):
+        """Charging can continue during a safe servo update; transfer readiness
+        still requires the precise requested protection to be acknowledged."""
+        if self.voltage_control.offset is None:
+            return False
+        effective = self._read_number(self.cfg.boost_service, '/Control/EffectiveChargeVoltage')
+        if effective is None or not 0 <= effective <= safe + 0.001:
+            return False
+        adapter = getattr(self, 'policy_adapter', None)
+        islanded = bool(adapter is not None and adapter.transfer.feedback is False)
+        # An unchanged, previously accepted envelope survives loss of an MPPT
+        # report while islanded. New departures still require fresh exact
+        # readbacks. Known unsafe observations and requested increases fail. Reductions
+        # may wait for readback while the previous safe pair remains in force.
+        controller = self.voltage_control
+        verified = getattr(self, '_last_verified_voltage', None)
+        cached_solar_safe = bool(islanded and verified is not None and controller.base is not None and
+            controller.offset is not None and controller.requested_solar is not None and
+            controller.requested_solar <= controller.base + controller.offset + .015 and
+            0 <= controller.base + controller.offset <= min(safe, verified[1]) + .001 and
+            self._health()['Measurements']['valid'] and
+            0 < self.bms.get('voltage', 0) <= safe + .001)
+        seen = False
+        for name in self.sbus.list_names():
+            name = str(name)
+            solar = name.startswith('com.victronenergy.solarcharger.')
+            if solar:
+                path = '/Link/ChargeVoltage'
+            elif name.startswith('com.victronenergy.vebus.'):
+                path = '/BatteryOperationalLimits/MaxChargeVoltage'
+            else:
+                continue
+            connected = self._read_number(name, '/Connected')
+            if connected == 0:
+                continue
+            value = self._read_number(name, path)
+            if value is not None and not 0 <= value <= safe + .001:
+                return False
+            if connected != 1 or value is None:
+                if solar and cached_solar_safe:
+                    continue
+                return False
+            seen = True
+        return seen
+
+    def _health(self, now=None):
+        return rec_health(self.bms, time.monotonic() if now is None else now,
+                          self.cfg.live_timeout)
+
+    def _safe_voltage(self, health=None):
+        health = self._health() if health is None else health
+        rec_limit = self.bms["cvl"] if health["Limits"]["valid"] else self.cfg.safe_cvl
+        # A last known lower REC limit remains restrictive through an outage.
+        previous = self.bms.get("cvl")
+        if isinstance(previous, (int, float)) and math.isfinite(previous) and previous > 0:
+            rec_limit = min(rec_limit, previous)
+        return min(self.cfg.installation_max_v, rec_limit)
+
+    def _charge_voltage_ceiling(self, safe, charge_permission=None):
+        """A charge ban removes voltage headroom independently of DVCC CCL.
+
+        Generic DVCC still adds rounded inverter compensation at CCL=0. This
+        final command guard therefore sacrifices PV load service during a ban.
+        The existing voltage-guard margin is provisional, not a new SOC/CVL
+        calibration or a claim of instantaneous physical charger response.
+        """
+        health = self._health()
+        safe = min(safe, self._safe_voltage(health))
+        bms = self.bms
+        if not all(item['valid'] for item in health.values()):
+            reason = 'critical REC data unavailable'
+        elif bms['ccl'] <= 0:
+            reason = 'REC charge current limit is zero'
+        elif (not bms['modulesOnline'] or bms['modulesBlockingCharge'] or bms['modulesOffline']):
+            reason = 'REC module charging prohibition'
+        elif bms['voltage'] >= safe - self.cfg.voltage_guard_v:
+            reason = 'pack voltage guard'
+        elif charge_permission is not None and charge_permission <= 0:
+            reason = 'charging explicitly inhibited'
+        else:
+            return safe, ''
+        # At least one command quantum below a fresh terminal measurement;
+        # an unavailable bank cannot justify any nonzero voltage headroom.
+        ceiling = (max(0.0, bms['voltage'] - max(self.cfg.voltage_guard_v, .01))
+                   if health['Measurements']['valid'] else 0.0)
+        return min(safe, voltage_floor(ceiling)), 'charge prohibited: ' + reason
+
+    def _apply_voltage_commands(self, quattro, solar, safe, now, charge_permission=None):
+        """Apply clamped individual commands; return (base, ready).
+
+        A final raw-REC charge guard applies in every mode and during fallback.
+        Readiness is command acknowledgment; physical response has its own delay.
+        """
+        safe, self.charge_guard_reason = self._charge_voltage_ceiling(safe, charge_permission)
+        if self.charge_guard_reason:
+            quattro, solar = min(quattro, safe), min(solar, safe)
+            self.batt["/Info/MaxChargeCurrent"] = 0.0
+        controller = self.voltage_control
+        ready = controller.step(quattro, solar, safe)
+        self._last_offset = controller.offset
+        s = self._pub
+        s["/RecBms/Voltage/RequestedQuattro"] = controller.requested_quattro
+        s["/RecBms/Voltage/RequestedSolar"] = controller.requested_solar
+        s["/RecBms/Voltage/AcceptedQuattro"] = controller.base
+        s["/RecBms/Voltage/AcceptedSolar"] = (None if controller.offset is None
+                                                  else controller.base + controller.offset)
+        s["/RecBms/Voltage/Ready"] = int(ready)
+        s["/RecBms/Voltage/Status"] = ((self.charge_guard_reason + "; ") if self.charge_guard_reason else "") + controller.status
+        if not ready and not self._voltage_within_envelope(safe):
+            self.batt["/Info/MaxChargeCurrent"] = 0.0
+        return controller.base, ready
 
     def _boost_allowed(self, volts):
         """Safety gate, evaluated on request AND on every tick while active."""
@@ -942,8 +1247,11 @@ class RecBmsDriver:
         if volts <= 0 or volts > c.boost_max_v:
             return False, "%.2fV outside 0..%.2fV" % (volts, c.boost_max_v)
         bms = self.bms
-        if "_lastUpdate" not in bms or                 (time.time() - bms["_lastUpdate"]) > c.live_timeout:
-            return False, "BMS not live"
+        health = self._health()
+        if not all(item["valid"] for item in health.values()):
+            return False, "critical BMS data unavailable"
+        if bms["ccl"] <= 0 or not bms["modulesOnline"] or bms["modulesBlockingCharge"] or bms["modulesOffline"]:
+            return False, "REC prohibits charging"
         cmax = bms.get("maxCellV")
         if cmax is None:
             return False, "no cell voltage"
@@ -960,16 +1268,17 @@ class RecBmsDriver:
         target = self.last_target
         if target is None:
             return False, "no CVL published yet"
-        if float(target) + volts > c.boost_ceiling_v:
+        ceiling = min(c.boost_ceiling_v, self._safe_voltage(health))
+        if float(target) + volts > ceiling:
             return False, "target %.2f + %.2f > ceiling %.2fV" % (
-                target, volts, c.boost_ceiling_v)
+                target, volts, ceiling)
         # The MPPTs ramp at a rate set by how far the bus sits below their
         # target. Measured 2026-08-19: ~0.15V of margin -> unthrottled in
         # 43-45 s, but only ~0.05V -> 126 s to reach 5 % of the step. With too
         # little margin the measurement window would open on an array that has
         # barely started, and that reading would be recorded as its capacity.
         # Refuse rather than return a number that is wrong and looks real.
-        packv = self._pub["/Dc/0/Voltage"]
+        packv = bms.get("voltage")
         if packv is None:
             return False, "no pack voltage"
         margin = (float(target) + volts) - float(packv)
@@ -979,9 +1288,17 @@ class RecBmsDriver:
         return True, ""
 
     def _boost_requested(self, path, value):
+        if hasattr(self, 'policy_adapter') and self.policy_adapter.contract.owned:
+            return False
+        return self._set_boost(value)
+
+    def _set_boost(self, value):
+        """Internal actuator primitive; protocol owns authorization."""
         try:
             volts = float(value)
         except (TypeError, ValueError):
+            return False
+        if not math.isfinite(volts):
             return False
         if volts <= 0:
             self._boost_clear("released by requester")
@@ -990,9 +1307,6 @@ class RecBmsDriver:
         if not ok:
             log.warning("solar boost refused (%.2fV): %s", volts, why)
             self._pub["/RecBms/SolarBoost/Status"] = "refused: " + why
-            return False
-        if not self._boost_write(self.lead_v + volts):
-            self._pub["/RecBms/SolarBoost/Status"] = "refused: systemcalc write failed"
             return False
         self.boost = {"active": True, "req_ts": time.time(), "volts": volts}
         self._pub["/RecBms/SolarBoost/Applied"] = round(volts, 2)
@@ -1006,7 +1320,6 @@ class RecBmsDriver:
     def _boost_clear(self, reason):
         was = self.boost["active"]
         self.boost = {"active": False, "req_ts": 0.0, "volts": 0.0}
-        self._boost_write(self.lead_v)   # keep the standing lead
         s = self._pub
         s["/RecBms/SolarBoost/Request"] = 0.0
         s["/RecBms/SolarBoost/Applied"] = 0.0
@@ -1038,20 +1351,13 @@ class RecBmsDriver:
                 "logged_servo": 0.0}
 
     def _live_soc(self):
-        bms = self.bms
-        if "_lastUpdate" not in bms or \
-                (time.time() - bms["_lastUpdate"]) > self.cfg.live_timeout:
+        if not self._health()["Soc"]["valid"]:
             return None
-        soc = bms["socHiRes"] if bms.get("socHiRes") is not None else bms.get("soc")
-        return float(soc) if soc is not None else None
+        soc = self.bms.get("socHiRes")
+        return float(self.bms["soc"] if soc is None else soc)
 
     def _live_volts(self):
-        bms = self.bms
-        if "_lastUpdate" not in bms or \
-                (time.time() - bms["_lastUpdate"]) > self.cfg.live_timeout:
-            return None
-        v = bms.get("voltage")
-        return float(v) if v is not None else None
+        return self.bms["voltage"] if self._health()["Measurements"]["valid"] else None
 
     def _fresh_pv(self, now):
         """PV current from systemcalc, or None when unknown or stale (the
@@ -1062,6 +1368,12 @@ class RecBmsDriver:
         return a
 
     def _sustain_requested(self, path, value):
+        if hasattr(self, 'policy_adapter') and self.policy_adapter.contract.owned:
+            return False
+        return self._set_sustain(value)
+
+    def _set_sustain(self, value):
+        """Internal actuator primitive; protocol owns authorization."""
         try:
             mode = int(value)
         except (TypeError, ValueError):
@@ -1386,9 +1698,9 @@ class RecBmsDriver:
         # installed) reads as off, and then no lead is applied.
         sp = self._settings_get("/Settings/SolarPriority/Enabled")
         try:
-            self.sp_enabled = bool(int(sp)) if sp is not None else False
+            self.sp_enabled = bool(int(sp)) if sp is not None else None
         except (TypeError, ValueError):
-            self.sp_enabled = False
+            self.sp_enabled = None
         # PV current for the sustain charge limit (same 3 s cadence as DVCC)
         try:
             raw = self.sbus.call_blocking(
@@ -1431,7 +1743,7 @@ class RecBmsDriver:
         c = self.cfg
         f = self.lead_fault
         pub, off = self._last_pub_cvl, self._last_offset
-        if pub is None or off <= 0.005:
+        if pub is None or off is None or off <= 0.005:
             return not f["active"]          # nothing to verify this tick
         v, ts = self.eff_cv if self.eff_cv else (None, 0.0)
         stale = (now - ts) > 15
@@ -1496,50 +1808,31 @@ class RecBmsDriver:
                     s["/RecBms/SolarBoost/Status"] = (
                         "measure" if window
                         else ("ramp" if elapsed < win_from else "settling"))
-        lead = 0.0
-        verified = self._verify_lead(now)
-        if not verified and boost_v > 0:
-            self._boost_clear("aborted: solar lead fault")
-            boost_v = 0.0
-        lead_v = self.lead_v
-        if lead_v > 0 or boost_v > 0:
-            # Keep writing the offset even while faulted: if the access
-            # level is raised and systemcalc restarted, the next poll sees
-            # the offset applied and the fault self-clears.
-            if self._boost_write(lead_v + boost_v, quiet=True):
-                self._last_offset = lead_v + boost_v
-                # While faulted publish the FULL target (lead 0): the MPPT
-                # ceiling is never silently lowered by a lead that is not
-                # actually in force.
-                lead = lead_v if verified else 0.0
-            else:
-                # Unwritable offset (Debug path — may vanish in a Venus
-                # update): publish the FULL target as the CVL so the MPPT
-                # ceiling is never silently lowered by a lead that is not
-                # actually in force. A boost cannot be honored either.
-                if boost_v > 0:
-                    self._boost_clear("aborted: systemcalc write failed")
-                    boost_v = 0.0
-                self._last_offset = 0.0
-                if now - self._last_offset_warn > 60:
-                    log.warning("solar lead: cannot write systemcalc offset; "
-                                "publishing the full target CVL")
-                    self._last_offset_warn = now
-        else:
-            # No lead wanted this tick (v1.7.0: Solar Priority off, or the
-            # slider at full). The offset persists inside systemcalc, so
-            # drop it once when it was in force.
-            if self._last_offset > 0.005:
-                self._boost_write(0.0, quiet=True)
-            self._last_offset = 0.0
-        s["/RecBms/SolarBoost/EffectiveChargeVoltage"] = round(target + boost_v, 2)
-        s["/RecBms/LeadFault"] = self.lead_fault["msg"] if self.lead_fault["active"] else ""
-        return lead
+        lead = self.lead_v
+        if not all(item["valid"] for item in self._health().values()):
+            lead, boost_v = 0.0, 0.0
+        safe = self._safe_voltage()
+        base, ready = self._apply_voltage_commands(
+            target - lead, target + boost_v, safe, now)
+        accepted = self.voltage_control
+        effective = None if accepted.offset is None else base + accepted.offset
+        s["/RecBms/SolarBoost/EffectiveChargeVoltage"] = effective
+        s["/RecBms/SolarBoost/Applied"] = max(0.0, (effective or target) - target) if ready else 0.0
+        s["/RecBms/SolarBoost/WindowOpen"] = int(bool(s["/RecBms/SolarBoost/WindowOpen"]) and ready)
+        if ready and accepted.offset is not None:
+            self._last_verified_voltage = (base, base + accepted.offset)
+        maintained = ready or self._voltage_within_envelope(safe)
+        s["/RecBms/LeadFault"] = "" if maintained else accepted.status
+        return min(lead, max(0.0, target - base)) if maintained else 0.0
 
     def _boost_shutdown(self):
+        if hasattr(self, 'policy_adapter'):
+            self.policy_adapter.shutdown()
         if self.boost.get("active"):
             log.info("solar boost released on shutdown")
-        self._boost_write(0.0, quiet=True)
+        self.batt["/Info/MaxChargeCurrent"] = 0.0
+        self._apply_voltage_commands(self.cfg.safe_cvl, self.cfg.safe_cvl,
+                                     self._safe_voltage(), time.time(), charge_permission=0.0)
 
     def _boost_signal(self, signum, frame):
         self._boost_shutdown()
@@ -1679,19 +1972,29 @@ class RecBmsDriver:
         with self.batt as ctx:
             self._pub = ctx
             try:
-                return self._tick_inner()
+                result = self._tick_inner()
             finally:
                 self._pub = self.batt
+        if not self.heartbeat.pulse():
+            self._boost_shutdown()
+            raise SystemExit('REC watchdog supervisor disappeared')
+        return result
 
     def _tick_inner(self):
         c = self.cfg
         bms = self.bms
         now = time.time()
 
-        # ---- staged fallback (port of the NR State Assembler) ----
-        never_seen = "_lastUpdate" not in bms
-        age = now - (self.start_ts if never_seen else bms["_lastUpdate"])
-        live = (not never_seen) and age <= c.live_timeout
+        # Critical receipt clocks are independent. A serial/heartbeat frame
+        # cannot keep stale limits, shunt samples or cell protections LIVE.
+        health = self._health()
+        received = bms.get("_received", {})
+        never_seen = not received
+        ages = [item["age"] if item["age"] is not None else
+                max(0.0, time.monotonic() - self.start_mono)
+                for item in health.values()]
+        age = max(ages)
+        live = all(item["valid"] for item in health.values())
         startup = never_seen and age <= c.startup_grace
 
         if live:
@@ -1734,6 +2037,7 @@ class RecBmsDriver:
 
         # ---- CVL control: slider (or sustain) + weekly equalization ----
         slider = float(self.settings["chargeslider"] or c.slider_default)
+        self.policy_adapter.prepare_intents(slider)
         # The standing solar lead (v1.7.0) is decided first: a sustain hold
         # uses it as the MPPTs' headroom over the hold voltage.
         self.lead_v = standing_lead(c.solar_lead, slider, c.lead_full_pct,
@@ -1766,46 +2070,17 @@ class RecBmsDriver:
             bms["voltage"] if (live and bms.get("voltage") is not None) else None,
             bms["current"] if (live and bms.get("current") is not None) else None)
         slider_cvl = held if held is not None else self._slider_cvl(slider)
-        eq = self.eq
-        eq_last = float(self.settings["eqlast"] or 0)
-        # An equalization is a deliberate charge from shore; it waits while
-        # a sustain hold is in force (eqlast is untouched, so it stays due).
-        eq_eligible = live and held is None
-        eq_due = (now - eq_last) >= c.eq_interval_s
-        eq_label = ""
+        final_cvl = slider_cvl
+        eq_label = 'disabled: engine controls full-charge target'
 
-        if eq["active"]:
-            elapsed = now - eq["startTime"]
-            if elapsed >= c.eq_duration_s:
-                eq["active"] = False
-                self.settings["eqlast"] = now
-                log.info("equalization completed")
-                final_cvl = slider_cvl
-                eq_label = "EQ done"
-            elif not eq_eligible:
-                eq["active"] = False
-                log.warning("equalization aborted (%s)",
-                            "sustain hold" if live else "BMS not live")
-                final_cvl = slider_cvl
-                eq_label = "EQ aborted"
-            else:
-                mins_left = int((c.eq_duration_s - elapsed) / 60) + 1
-                eq_label = "EQ %dmin left" % mins_left
-                final_cvl = slider_cvl + c.eq_boost
-        elif eq_eligible and eq_due:
-            eq["active"] = True
-            eq["startTime"] = now
-            log.info("equalization starting (+%.2fV for %.0fmin)",
-                     c.eq_boost, c.eq_duration_s / 60)
-            eq_label = "EQ starting"
-            final_cvl = slider_cvl + c.eq_boost
-        else:
-            final_cvl = slider_cvl
-            if eq_eligible and not eq_due:
-                eq_label = "next EQ ~%dh" % round((c.eq_interval_s - (now - eq_last)) / 3600)
-
-        bms_cvl = v("cvl") if live else c.safe_cvl
-        final_cvl = min(final_cvl, bms_cvl)
+        safe_voltage = self._safe_voltage(health)
+        final_cvl = min(final_cvl, safe_voltage)
+        voltage_guard = (health["Measurements"]["valid"] and
+                         bms["voltage"] >= safe_voltage - c.voltage_guard_v)
+        if voltage_guard or not live:
+            self.lead_v = 0.0
+            if self.boost["active"]:
+                self._boost_clear("pack voltage guard" if voltage_guard else "critical BMS data unavailable")
 
         # ---- resolve outputs ----
         if live:
@@ -1814,6 +2089,14 @@ class RecBmsDriver:
             self._pub["/RecBms/Sustain/ChargeLimit"] = applied
         else:
             ccl, dcl, dvl = fb
+            # Retain a lower known prohibition through partial-data outages.
+            if bms.get("dcl") is not None:
+                dcl = min(dcl, max(0.0, bms["dcl"]))
+        no_modules = bms.get("modulesOnline") == 0
+        if voltage_guard or no_modules or bms.get("modulesBlockingCharge") or bms.get("modulesOffline"):
+            ccl = 0.0
+        if no_modules or bms.get("modulesBlockingDischarge") or bms.get("modulesOffline"):
+            dcl = 0.0
 
         cell_min, cell_max = v("minCellV"), v("maxCellV")
         cell_min_t, cell_max_t = v("minCellT"), v("maxCellT")
@@ -1842,14 +2125,14 @@ class RecBmsDriver:
         # so command the Quattro solar_lead_v BELOW the target and raise
         # only the solar chargers back up to it: the Quattro lands at or
         # under the calibrated equilibrium and solar finishes the top-off.
-        target = round(final_cvl, 2)
+        target = voltage_floor(final_cvl)
         lead = self._service_boost(now, target)
         s["/RecBms/TargetChargeVoltage"] = target
         s["/RecBms/TargetSoc"] = slider
         s["/RecBms/SolarLead"] = round(lead, 2)
-        s["/Info/MaxChargeVoltage"] = round(target - lead, 2)
-        self._last_pub_cvl = round(target - lead, 2)
-        s["/Info/MaxChargeCurrent"] = ccl
+        s["/Info/MaxChargeCurrent"] = (ccl if self.voltage_control.ready or
+            (getattr(self, '_last_verified_voltage', None) is not None and
+             self._voltage_within_envelope(safe_voltage)) else 0.0)
         s["/Info/MaxDischargeCurrent"] = dcl
         s["/Info/BatteryLowVoltage"] = dvl
         s["/Dc/0/Voltage"] = _q(volts, c.voltage_step)
@@ -1900,7 +2183,26 @@ class RecBmsDriver:
             s["/HardwareVersion"] = bms["hwVersion"]
         s["/RecBms/ConfiguredCapacity"] = bms.get("configuredAh")
 
+        s["/RecBms/Health/CriticalValid"] = int(live)
+        for group, item in health.items():
+            s["/RecBms/Health/%s/Age" % group] = item["age"]
+            s["/RecBms/Health/%s/Valid" % group] = int(item["valid"])
+        raw_fields = {
+            "Voltage": ("voltage", "Measurements"),
+            "Current": ("current", "Measurements"), "Soc": ("soc", "Soc"),
+            "ChargeVoltageLimit": ("cvl", "Limits"),
+            "ChargeCurrentLimit": ("ccl", "Limits"),
+            "DischargeCurrentLimit": ("dcl", "Limits"),
+        }
+        for name, (key, group) in raw_fields.items():
+            raw = (bms.get("socHiRes") if key == "soc" and bms.get("socHiRes") is not None
+                   else bms.get(key))
+            s["/RecBms/Raw/" + name] = raw if health[group]["valid"] else None
+        s["/RecBms/SafeChargeVoltage"] = safe_voltage
         s["/RecBms/Phase"] = phase_name
+        policy_control = self.policy_adapter.tick(
+            live, slider, soc, volts, amps, self._slider_cvl(slider), safe_voltage,
+            ccl)
         s["/RecBms/EqStatus"] = eq_label
         s["/RecBms/TimeToFull"] = _q(ttf, c.time_step)
         force = (1 if bms.get("forceCharge") else 0) if live else 0

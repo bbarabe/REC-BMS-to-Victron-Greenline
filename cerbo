@@ -53,7 +53,9 @@ while not buf.endswith(b"\n"):
 r = json.loads(buf.decode())
 sys.stdout.write(r.get("out", ""))
 if r.get("err"): sys.stderr.write(r["err"])
-sys.exit(0 if r.get("ok") else (r.get("rc") or 1))
+if not r.get("ok") or r.get("alive") is False:
+    sys.exit(r.get("rc") or 1)
+sys.exit(r.get("rc", 0))
 PYCLIENT
 }
 

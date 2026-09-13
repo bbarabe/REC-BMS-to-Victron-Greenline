@@ -1,0 +1,119 @@
+{
+  "general": {
+    "log_level": "INFO"
+  },
+  "can": {
+    "interface": "can0",
+    "filter_id": "0x18FF0000",
+    "filter_mask": "0x1FFFF800",
+    "reconnect_delay_s": "5"
+  },
+  "battery": {
+    "service_suffix": "recbms",
+    "settings_id": "recbms",
+    "instance": "200",
+    "product_name": "REC-BMS",
+    "custom_name": "REC-BMS Main Bank",
+    "installed_capacity_ah": "1440",
+    "nr_of_cells": "15",
+    "serial": "REC-BMS",
+    "forward_charge_request": "false",
+    "pin_bms_instance": "true"
+  },
+  "slider": {
+    "enabled": "true",
+    "service_suffix": "recbms_maxcharge",
+    "settings_id": "recbms_maxcharge",
+    "instance": "220",
+    "custom_name": "Max Charge",
+    "group": "BMS",
+    "unit": "%",
+    "min": "40",
+    "max": "100",
+    "step": "5",
+    "default": "100"
+  },
+  "cvl": {
+    "installation_max_v": "62.40",
+    "voltage_guard_v": "0.10",
+    "curve": "40:54.42, 62.3:56.65, 100:62.70",
+    "max_v": "61.96",
+    "solar_lead_v": "0.15",
+    "lead_needs_solar_priority": "true",
+    "lead_full_pct": "100",
+    "lead_verify_s": "10",
+    "lead_fault_alarm": "true"
+  },
+  "fallback": {
+    "live_timeout_s": "60",
+    "alert_timeout_s": "120",
+    "restrict_timeout_s": "300",
+    "startup_grace_s": "180",
+    "alert_dcl_a": "100",
+    "alert_dvl_v": "52.0",
+    "restrict_dcl_a": "30",
+    "restrict_dvl_v": "53.0",
+    "survival_dcl_a": "15",
+    "survival_dvl_v": "54.0",
+    "safe_cvl_v": "54.0",
+    "safe_voltage_v": "54.0",
+    "safe_soc": "50"
+  },
+  "quattro": {
+    "vebus_instance": "276",
+    "max_age_s": "30",
+    "poll_s": "5"
+  },
+  "solarboost": {
+    "enabled": "true",
+    "max_boost_v": "0.30",
+    "hold_s": "120",
+    "measure_start_s": "75",
+    "measure_len_s": "30",
+    "cell_max_v": "4.05",
+    "cell_min_t": "5",
+    "cell_max_t": "45",
+    "ceiling_v": "62.40",
+    "min_margin_v": "0.10",
+    "target_service": "com.victronenergy.system",
+    "target_path": "/Debug/BatteryOperationalLimits/SolarVoltageOffset"
+  },
+  "sustain": {
+    "enabled": "true",
+    "hold_s": "120",
+    "step_pct": "1",
+    "charge_limit_a": "5",
+    "servo_step_v": "0.02",
+    "servo_period_s": "30",
+    "servo_deadband_pct": "0.1",
+    "servo_max_up_v": "0.5",
+    "servo_max_down_v": "2.0",
+    "anchor_ir_mohm": "3",
+    "band_v": "0.30",
+    "quattro_idle_a": "1",
+    "taper_a": "3",
+    "taper_s": "60",
+    "taper_margin_v": "0.03",
+    "pv_min_a": "0.5",
+    "servo_drain_a": "0.3",
+    "dusk_s": "300"
+  },
+  "publish": {
+    "voltage_step": "0.05",
+    "current_step": "0.5",
+    "power_step": "10",
+    "temperature_step": "0.5",
+    "soc_step": "0.1",
+    "ah_step": "1",
+    "time_step": "60"
+  },
+  "policy": {
+    "state_file": "solar-control-state.json",
+    "capacity_version": "rated-1440",
+    "calendar_timezone": "UTC",
+    "shore_ac_input": "1",
+    "consumer_service_suffix": "solarpriority",
+    "consumer_instance": "221",
+    "mppt_instances": "278,279"
+  }
+}
