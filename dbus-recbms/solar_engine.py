@@ -6,10 +6,15 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.12"
+ENGINE_VERSION = "4.13"
 
 ENGINE_DEFAULTS = {
-    "SOLAR_MARGIN": 1.2, "MIN_EST_W": 100, "READY_MS": 30000, "RAMP_MS": 90000,
+    # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
+    # through the inverter's efficiency and idle, the DC loads, its own
+    # uncertainty allowance) rather than 1.2 x the AC load, which passed
+    # 400 W of PV against 300 W AC + 300 W DC (E09: need 360 W, actual
+    # 693 W). SOLAR_MARGIN now multiplies that complete demand, so 1.0.
+    "SOLAR_MARGIN": 1.0, "MIN_EST_W": 100, "READY_MS": 30000, "RAMP_MS": 90000,
     "EVAL_MS": 15000, "DISCHARGE_TOL_W": 50, "LOAD_EXCEED_MS": 15000,
     "SOLAR_SETTLE_MS": 90000, "DEFICIT_AVG_MS": 90000, "SURGE_W": 400,
     "SURGE_MS": 3000, "COOLDOWN_MS": 300000, "BACKOFF_MAX_MS": 3600000,
@@ -130,7 +135,11 @@ class Inputs:
     FIELDS = ("soc", "batt", "load_now", "load_avg", "load_slow", "feed", "ac_out",
               "voc6", "voc7", "y6", "y7", "m6", "m7", "batt_v", "cvl",
               "boost_active", "boost_window", "boost_eff", "lead",
-              "target_soc", "sustain_active", "dc_load", "quattro_w")
+              "target_soc", "sustain_active", "dc_load", "quattro_w",
+              # 4.13: dbus-recbms' complete DC-bus island demand, smoothed by
+              # the consumer over LOAD_AVG_MS / LOAD_SLOW_MS, and its
+              # uncertainty allowance. None: no elective solar admission.
+              "demand_avg", "demand_slow", "demand_margin")
 
     def __init__(self):
         for f in self.FIELDS:
@@ -461,7 +470,7 @@ class Engine:
             st["state"] = "probe"
             st["desired"] = 1
             st["probeStart"] = now
-            st["probeEst"] = max(est, needW)
+            st["probeEst"] = max(est, needW or 0.0)
             st["evalPv"] = []
             st["evalBatt"] = []
             st["lastTransition"] = now
@@ -602,7 +611,21 @@ class Engine:
             sinceTrans = now - st["lastTransition"]
             loadSlow = inp.load_slow
             loadJudge = max(loadAvg.v, loadSlow.v) if loadSlow is not None else loadAvg.v
-            needW = max(t["MIN_EST_W"], loadJudge * t["SOLAR_MARGIN"])
+            # The need, in DC-bus watts, in this order: the consumer's 60 s
+            # and 300 s means of dbus-recbms' complete island demand (the
+            # larger wins, as the AC means did), plus dbus-recbms' own
+            # uncertainty allowance once, times SOLAR_MARGIN. With no
+            # fresh valid demand there is no need to clear: no probe, no
+            # direct solar entry, no exploration (DISCHARGE leaves anyway;
+            # the deficit is the plan).
+            demandAvg, demandSlow, margin = inp.demand_avg, inp.demand_slow, inp.demand_margin
+            if demandAvg is not None and demandSlow is not None and margin is not None:
+                needW = max(t["MIN_EST_W"],
+                            (max(demandAvg.v, demandSlow.v) + margin.v) * t["SOLAR_MARGIN"])
+            else:
+                needW = None
+            covers = lambda watts: needW is not None and watts >= needW
+            needTxt = "%.0f" % needW if needW is not None else "?"
             # Signed measured Quattro DC voltage * current is authoritative.
             # Missing metering is never reconstructed from mixed-age totals.
             quattroW = inp.quattro_w.v
@@ -611,12 +634,13 @@ class Engine:
                 shoreMissing = (feed.v == 240 and sinceTrans > t["FEEDBACK_GRACE_MS"])
 
                 if st["backoffUntil"] > now:
-                    if evidence >= needW:
+                    if covers(evidence):
                         st["backoffUntil"] = 0
                         st["backoffMs"] = t["COOLDOWN_MS"]
 
-                explore = (dayOk and not vocRising and vocMax >= t["VOC_EXPLORE_V"]
-                           and capSum <= 0 and not (plantConf is not None and plantConf < needW))
+                dim = plantConf is not None and needW is not None and plantConf < needW
+                explore = (needW is not None and dayOk and not vocRising
+                           and vocMax >= t["VOC_EXPLORE_V"] and capSum <= 0 and not dim)
 
                 if st["burnDoneCvl"] is not None and cvl is not None:
                     if (abs(cvl.v - st["burnDoneCvl"]) > 0.02 or
@@ -650,7 +674,7 @@ class Engine:
                     # reason to wait.
                     ready = (not shoreMissing and (not aboveCvl or owc)
                              and soc.v >= minSoc and not shaded
-                             and quattroW <= t["SURPLUS_QUIET_W"] and (est >= needW or explore))
+                             and quattroW <= t["SURPLUS_QUIET_W"] and (covers(est) or explore))
                 if ready:
                     if not st["readySince"]:
                         st["readySince"] = now
@@ -703,17 +727,17 @@ class Engine:
                     # down. The AC-control fault check lives in solar too.
                     enter_solar("one-way discharge %.1f%% -> %.0f%%" % (soc.v, tgt.v))
                 elif (owc and t["ONEWAY_SKIP_PROBE"] and unthrottled
-                      and est >= needW and ready and gateOk and (now - st["readySince"]) >= t["READY_MS"]):
+                      and covers(est) and ready and gateOk and (now - st["readySince"]) >= t["READY_MS"]):
                     # 4.9: the arrays run unthrottled on the floor's band and
                     # the captures are fresh -- there is nothing a probe
                     # could measure that the capture has not (the balance
                     # gate in `ready` has already passed)
-                    enter_solar("one-way charge on a live capture: %.0f+%.0fW vs need %.0fW, bal %s" % (
-                        faded(st["cap6"]), faded(st["cap7"]), needW,
+                    enter_solar("one-way charge on a live capture: %.0f+%.0fW vs need %sW, bal %s" % (
+                        faded(st["cap6"]), faded(st["cap7"]), needTxt,
                         "%.2f" % balance if balance is not None else "-"))
                 elif ready and gateOk and (now - st["readySince"]) >= t["READY_MS"]:
-                    enter_probe(("est %.0fW" % est if est >= needW else "exploratory") +
-                                " vs load %.0fW need %.0fW" % (loadJudge, needW) +
+                    enter_probe(("est %.0fW" % est if covers(est) else "exploratory") +
+                                " vs load %.0fW need %sW" % (loadJudge, needTxt) +
                                 " | cap %.0f+%.0f mdl %.0f+%.0f PV %.0fW Voc %.0fV mode %s/%s bal %s" % (
                                     faded(st["cap6"]), faded(st["cap7"]),
                                     me6["w"] if me6 else 0, me7["w"] if me7 else 0, pvNow, vocMax,
@@ -736,15 +760,17 @@ class Engine:
                 else:
                     status[0] = "red" if shoreMissing else "blue"
                     s = ("NO SHORE? | " if shoreMissing else "SHORE | ") + \
-                        "est %.0fW need %.0fW" % (est, needW)
+                        "est %.0fW need %sW" % (est, needTxt)
                     if capSum > 0:
                         s += " cap %.0f" % capSum
                     if modelSum > 0:
                         s += " mdl %.0f" % modelSum + ("+" if ((me6 and me6["lb"]) or (me7 and me7["lb"])) else "")
                     if explore:
                         s += " (explore-ok)"
-                    if plantConf is not None and plantConf < needW:
+                    if dim:
                         s += " (dim)"
+                    if needW is None:
+                        s += " [no demand]"
                     if batt.v > t["SURPLUS_QUIET_W"]:
                         s += " [chg +%.0fW%s]" % (batt.v, "" if quattroW > t["SURPLUS_QUIET_W"] else " solar")
                     if harvestArmed:
@@ -844,7 +870,7 @@ class Engine:
                         enter_solar("burn-down handover, PV %.0fW" % pvNow)
                     elif st["burnExitStart"] and now - st["burnExitStart"] >= t["BURN_EXIT_MS"]:
                         st["burnDoneCvl"] = cvl.v
-                        if est >= needW:
+                        if covers(est):
                             enter_probe("after burn-down, est %.0fW" % est)
                         else:
                             toShore("burn-down complete (batt %.2fV)" % battV.v)

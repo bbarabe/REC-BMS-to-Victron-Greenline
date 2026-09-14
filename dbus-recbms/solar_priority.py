@@ -24,8 +24,8 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.0.3"
-ENGINE_VERSION = "4.12-restored"
+VERSION = "3.0.4"
+ENGINE_VERSION = "4.13-restored"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -185,6 +185,9 @@ class SolarPriorityDriver:
         self.sources = SourceRegistry()
         self.load_mean = TimedMean(cfg.engine["LOAD_AVG_MS"] / 1000)
         self.load_slow_mean = TimedMean(cfg.engine["LOAD_SLOW_MS"] / 1000)
+        # 4.13: the same two means over REC's complete DC-bus island demand
+        self.demand_mean = TimedMean(cfg.engine["LOAD_AVG_MS"] / 1000)
+        self.demand_slow_mean = TimedMean(cfg.engine["LOAD_SLOW_MS"] / 1000)
         self.field_sources = {}
         self.last_verify = None
         self.read_issued = {}
@@ -630,6 +633,20 @@ class SolarPriorityDriver:
             self.inp.load_avg = self.inp.load_slow = None
             self.load_mean.points.clear()
             self.load_slow_mean.points.clear()
+        # REC's DemandModel result rides in its snapshot: AC through the
+        # inverter (or the measured inverter DC while islanded), the DC
+        # loads and its uncertainty allowance. Invalid or stale demand
+        # authorizes no elective departure.
+        demand = snapshot.get('demand', {}) if source_valid else {}
+        island = demand.get('island_w') if demand.get('valid') else None
+        if isinstance(island, (int, float)) and math.isfinite(island) and island >= 0:
+            self.inp.demand_avg = Val(self.demand_mean.update(now, island), now * 1000)
+            self.inp.demand_slow = Val(self.demand_slow_mean.update(now, island), now * 1000)
+            self.inp.demand_margin = Val(max(0.0, float(demand.get('uncertainty_w') or 0.0)), now * 1000)
+        else:
+            self.inp.demand_avg = self.inp.demand_slow = self.inp.demand_margin = None
+            self.demand_mean.points.clear()
+            self.demand_slow_mean.points.clear()
         self.inp.departure_allowed = status.get('departure_allowed', False)
         protocol_ready = (status.get('version') == PROTOCOL_VERSION and
                           bool(status.get('generation')) and source_valid)

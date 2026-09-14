@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.12")
+check("engine version bumped", SP.ENGINE_VERSION == "4.13")
 Val = SP.Val
 
 
@@ -67,6 +67,11 @@ class Sim:
             inp.voc7, inp.y7, inp.m7 = Val(0.0, n), Val(0.0, n), Val(0, n)
             inp.batt_v, inp.cvl = Val(v["batt_v"], n), Val(v["cvl"], n)
             inp.dc_load = Val(v.get("dc_load", 0.0), n)
+            # dbus-recbms' DemandModel defaults: AC / 0.9 + 30 W idle + DC, 30 W uncertainty
+            island = lambda ac: ac / 0.9 + 30.0 + v.get("dc_load", 0.0)
+            inp.demand_avg = Val(v.get("demand_avg", island(v.get("load_avg", v["load"]))), n)
+            inp.demand_slow = Val(v.get("demand_slow", island(v.get("load_slow", v["load"]))), n)
+            inp.demand_margin = Val(v.get("demand_margin", 30.0), n)
             inp.quattro_w = Val(v.get("quattro_w", v["batt"] + max(0, v.get("dc_load", 0)) - v["pv"]), n)
             inp.target_soc = Val(v["target"], n) if v["target"] is not None else None
             out = self.eng.tick(n, inp)
@@ -212,9 +217,9 @@ check("probe entry logs cap/mdl/bal", any("-> PROBE (est" in tr and "cap 300+400
 
 s = Sim()
 s.tick(1, pv=60.0, m=1, batt_v=56.4, load=250.0, load_slow=330.0)
-prime(s, 200, 150)                               # est 350: clears 1.2*250=300, not 1.2*330=396
+prime(s, 200, 150)                               # est 350: clears 250/0.9+30+30=338, not 330/0.9+30+30=427
 s.tick(340)
-check("need judged against the slower average too", s.state == "shore" and "need 396W" in s.out.status_text,
+check("need judged against the slower average too", s.state == "shore" and "need 427W" in s.out.status_text,
       s.out.status_text)
 s.tick(35, load_slow=250.0)
 check("...and clears once the slow average drops", s.state == "probe")
@@ -583,6 +588,49 @@ check("#4: restart 1.7 points over selects DISCHARGE", s.oneway == "discharge" a
 s = Sim()
 s.tick(1, soc=64.6, target=65, batt_v=56.6)
 check("#4: within half a point on restart: at target", s.oneway is None and s.out.charge_intent == "release")
+
+# ---- issue #5: the need is the complete DC-bus demand ----
+# E09: 400 W of PV against 300 W AC + 300 W DC passed the old 360 W need
+s = Sim()
+s.tick(400, soc=60, pv=400.0, m=2, load=300.0, dc_load=300.0, batt_v=56.4)
+check("#5 E09: 400 W PV does not clear 300 W AC + 300 W DC",
+      s.state == "shore" and "need 693W" in s.out.status_text, s.out.status_text)
+check("#5 E09: the need is published", s.out.need_w is not None and abs(s.out.need_w - 693.3) < 1, str(s.out.need_w))
+s = Sim()
+s.tick(400, soc=60, pv=400.0, m=2, load=300.0, dc_load=50.0, batt_v=56.4)
+check("#5 E16: 300 W AC + the 50 W DC baseline needs 443 W, not 360",
+      s.state == "shore" and "need 443W" in s.out.status_text, s.out.status_text)
+s.tick(400, pv=450.0)
+check("#5 E16: 450 W of PV clears it", s.state != "shore", s.state)
+# the same need for the probe and the one-way charge direct entry
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(400, pv=400.0, m=2, load=300.0, dc_load=300.0)
+check("#5: one-way charge direct entry uses the complete demand too", s.state == "shore", s.state)
+s = Sim(ONEWAY_SKIP_PROBE=0)
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(400, pv=400.0, m=2, load=300.0, dc_load=300.0)
+check("#5: the probe path too", s.state == "shore" and "probe" not in s.states, s.state)
+# missing demand: no elective departure, but one-way discharge still leaves
+s = Sim()
+s.tick(1, soc=60, batt_v=56.4)
+for _ in range(400):
+    s.tick(1, pv=1400.0, m=2)
+    s.inp.demand_avg = s.inp.demand_slow = s.inp.demand_margin = None
+    s.now += 1
+    s.out = s.eng.tick(s.now, s.inp)
+check("#5: no demand, no departure even in full sun", s.out.state == "shore" and "[no demand]" in s.out.status_text
+      and "need ?W" in s.out.status_text and s.out.need_w is None, s.out.status_text)
+s = Sim()
+s.tick(1, soc=60, target=40, batt_v=56.4)
+for _ in range(400):
+    s.tick(1, pv=0.0, m=0, voc=10.0)
+    s.inp.demand_avg = s.inp.demand_slow = s.inp.demand_margin = None
+    s.now += 1
+    s.out = s.eng.tick(s.now, s.inp)
+    if s.out.cmd is not None:
+        s.cmd = s.out.cmd
+check("#5: one-way discharge leaves without any demand figure", s.out.state == "solar", s.out.state)
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:

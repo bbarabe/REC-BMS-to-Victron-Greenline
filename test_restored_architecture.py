@@ -303,6 +303,39 @@ class RestoredPlantTests(unittest.TestCase):
             self.assertLess(sim.plant.energy.shore_charge_wh, 150)
             self.assertLess(sim.plant.soc, 62.5)
 
+    def test_solar_admission_needs_the_complete_dc_bus_demand(self):
+        # E09: 400 W of PV left shore against 300 W AC + 300 W DC on a 360 W
+        # need; E16: even the 50 W DC baseline needs 443 W with 300 W AC.
+        for ac, dc, sun, leaves in ((300, 300, [200, 200], False), (300, 50, [200, 200], False),
+                                    (300, 50, [250, 250], True)):
+            with self.subTest(ac=ac, dc=dc, pv=sum(sun)), self.simulation(target=80) as sim:
+                sim.set_load(ac_w=ac, dc_w=dc)
+                sim.set_sun(sun)
+                sim.run(900)
+                self.assertEqual(not sim.plant.connected, leaves)
+                demand = json.loads(sim.rec.batt['/RecBms/Policy/Snapshot'])['demand']
+                need = sim.solar.sw['/SolarPriority/NeedW']
+                self.assertGreater(need, 360)
+                self.assertGreaterEqual(need, demand['admission_w'] - 5)
+                if leaves:
+                    self.assertIn('vs need', sim.solar.sw['/SolarPriority/LastTransition'])
+
+    def test_missing_dc_demand_admits_no_elective_departure(self):
+        from solar_priority_plant import SYSTEM
+        with self.simulation(target=80) as sim:
+            sim.set_sun([700, 700])
+            sim.bus.invalidate(SYSTEM, '/Dc/System/Power')
+            sim.run(900)
+            self.assertTrue(sim.plant.connected)
+            self.assertIsNone(sim.solar.sw['/SolarPriority/NeedW'])
+            self.assertIn('[no demand]', sim.solar.sw['/SolarPriority/Status'])
+
+    def test_one_way_discharge_leaves_without_pv_covering_the_loads(self):
+        with self.simulation(target=40) as sim:
+            sim.set_sun([0, 0])
+            self.until(sim, lambda: not sim.plant.connected)
+            self.assertEqual(sim.solar.last_request['mode'], 'DISCHARGE')
+
     def test_stopped_consumer_lease_returns_to_shore(self):
         with self.simulation() as sim:
             self.until(sim, lambda: not sim.plant.connected)
