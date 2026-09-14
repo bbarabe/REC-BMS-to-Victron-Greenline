@@ -77,6 +77,22 @@ class RestoredPlantTests(unittest.TestCase):
             sim.run(1)
         self.fail('No required transition: ' + repr(sim.trace[-1]))
 
+    def watch_closure(self, sim):
+        """What the plant had actually applied at the physical AC re-accept."""
+        closure = {}
+        original = sim.plant.update_connection
+        def update_connection(cause='source'):
+            was = sim.plant.connected
+            original(cause)
+            if sim.plant.connected and not was and not closure:
+                closure.update(time_s=sim.clock.elapsed, quattro_v=sim.plant.dvcc.quattro_v,
+                               ccl_a=sim.plant.ccl_a, voltage=sim.plant.voltage,
+                               ocv=sim.plant.ocv(), pv_a=sum(sim.plant.pv_w) / sim.plant.voltage,
+                               request=dict(sim.solar.last_request or {}),
+                               active_input=sim.vebus['/Ac/ActiveIn/ActiveInput'])
+        sim.plant.update_connection = update_connection
+        return closure
+
     def test_uncertain_history_allows_sunny_departure_and_cloud_return(self):
         with self.simulation() as sim:
             ledger = sim.rec.policy_adapter.ledger
@@ -200,6 +216,7 @@ class RestoredPlantTests(unittest.TestCase):
             sim.run(120)
             self.assertEqual(sim.solar.last_request['requested_limits']['sustain'], 0)
             sim.bus.invalidate(VEBUS, '/Dc/0/Current')
+            closure = self.watch_closure(sim)
             self.until(sim, lambda: sim.plant.connected, timeout=60)
             request = sim.solar.last_request
             self.assertEqual((request['mode'], request['requested_limits']['sustain'],
@@ -209,6 +226,12 @@ class RestoredPlantTests(unittest.TestCase):
             self.assertLessEqual(sim.rec.batt[CCL],
                                  sim.system['/Dc/Pv/Current'] + sim.rec.cfg.sustain_ccl_a + 1)
             self.assertLessEqual(sim.plant.q_w, (sim.rec.cfg.sustain_ccl_a + 2) * sim.plant.voltage)
+            # Stage A: the source-loss return is prepared like any other --
+            # the hold and its cap were applied before the AC input was accepted.
+            self.assertTrue(closure, 'the return never closed the relay')
+            self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
+            self.assertLessEqual(closure['ccl_a'], closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
+            self.assertTrue(json.loads(sim.rec.batt['/RecBms/Policy/Status'])['transfer']['prepared'])
 
     def ignore_offset(self, sim):
         """systemcalc below Superuser: the offset write succeeds, nothing applies it."""
@@ -366,6 +389,82 @@ class RestoredPlantTests(unittest.TestCase):
             self.assertEqual(purpose(), 'solar')
             sim.run(30)
             self.assertEqual(purpose(), 'solar')
+
+    def test_ordinary_return_is_prepared_before_the_relay_closes(self):
+        # Stage A end to end (D02/E03): the engine asks for the floor the tick
+        # it decides to return, REC anchors the hold at the islanded bank and
+        # waits for the exact pair and the current readback, and only then
+        # writes the relay -- so with five-second command propagation the
+        # below-bank Quattro command and the PV + 5 A cap are already applied
+        # when the AC input is accepted. E03 closed at 59.34 V / 200 A.
+        from solar_priority_plant import Latency
+        with self.simulation(target=80, latency=Latency(base_s=5.0, current_s=5.0)) as sim:
+            self.until(sim, lambda: not sim.plant.connected)
+            sim.run(60)
+            self.assertEqual(sim.solar.last_request['requested_limits']['sustain'], 0)
+            closure = self.watch_closure(sim)
+            sim.set_sun([0, 0])
+            decided = []
+            def note():
+                if not decided and sim.solar.sw['/SolarPriority/State'] == 'shore':
+                    decided.append(sim.clock.elapsed)
+                return sim.plant.connected
+            self.until(sim, note, timeout=400)
+            self.assertTrue(closure, 'the return never closed the relay')
+            self.assertIn('deficit', sim.solar.sw['/SolarPriority/LastTransition'])
+            # the floor rode the very request that asked for shore, before any
+            # input was accepted
+            request = closure['request']
+            self.assertEqual(closure['active_input'], 240)
+            self.assertEqual((request['mode'], request['transfer_intent'],
+                              request['requested_limits']['sustain']), ('CHARGE', 'connected', 1))
+            self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
+            self.assertLessEqual(closure['ccl_a'], closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
+            status = json.loads(sim.rec.batt['/RecBms/Policy/Status'])
+            self.assertTrue(status['transfer']['prepared'])
+            self.assertIsNone(status['transfer']['last_fault'])
+            self.assertLessEqual(closure['time_s'] - decided[0],
+                                 sim.rec.policy_adapter.config.return_prepare_s + 5)
+            sim.run(30)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Active'], 1)
+            self.assertLessEqual(sim.plant.q_w, (sim.rec.cfg.sustain_ccl_a + 2) * sim.plant.voltage)
+
+    def test_absent_and_available_shore_give_distinct_outcomes_on_a_suspend(self):
+        # The 2026-09-06 case (a heater-class load on solar, no shore power)
+        # against its mirror image. Absent shore: the engine asks for no floor,
+        # so the MPPTs keep the slider's ceiling, and REC records 'shore
+        # unavailable' with no fault and no lockout. Available shore: the
+        # floor is requested while ActiveInput still reads 240 and the return
+        # arrives prepared.
+        for available in (False, True):
+            with self.subTest(shore_available=available), self.simulation(target=80) as sim:
+                self.until(sim, lambda: not sim.plant.connected)
+                sim.run(30)
+                ceiling = sim.rec.batt['/RecBms/TargetChargeVoltage']
+                sim.plant.shore_available = available
+                closure = self.watch_closure(sim)
+                sim.set_load(ac_w=1500)
+                self.until(sim, lambda: sim.solar.sw['/SolarPriority/State'] == 'suspend', timeout=60)
+                sim.run(45)
+                request = sim.solar.last_request
+                transfer = json.loads(sim.rec.batt['/RecBms/Policy/Status'])['transfer']
+                self.assertEqual(request['transfer_intent'], 'connected')
+                if not available:
+                    self.assertFalse(sim.plant.connected)
+                    self.assertEqual(request['requested_limits']['sustain'], 0)
+                    self.assertEqual(sim.rec.batt['/RecBms/Sustain/Active'], 0)
+                    self.assertEqual(sim.rec.batt['/RecBms/TargetChargeVoltage'], ceiling)
+                    self.assertEqual(transfer['limited_by'], 'shore unavailable')
+                    self.assertFalse(transfer['available'])
+                    self.assertIsNone(transfer['last_fault'])
+                    self.assertEqual(sim.rec.policy_adapter.transfer.durable['fault_until'], 0)
+                else:
+                    self.assertTrue(closure, 'the suspend never reached shore')
+                    self.assertEqual(closure['active_input'], 240)
+                    self.assertEqual(closure['request']['requested_limits']['sustain'], 1)
+                    self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
+                    self.assertTrue(transfer['prepared'])
+                    self.assertEqual(sim.rec.batt['/RecBms/Sustain/Active'], 1)
 
 
 if __name__ == '__main__':

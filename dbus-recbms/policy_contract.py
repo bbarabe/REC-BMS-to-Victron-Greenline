@@ -358,6 +358,14 @@ class TransferSupervisor:
                 # its feedback clock belongs to the supply that just appeared.
                 self.pending = None
                 self.pending_since = None
+            if not ready and self.available is False:
+                # Nothing to prepare for: the command goes out so that the
+                # supply is taken the moment it is back, and the timeout
+                # below records 'shore unavailable' rather than a fault. The
+                # restored supply re-enters this branch through shore_restored
+                # and waits for its preparation like any other return.
+                self.prepared = None
+                return self._issue(0, now, wall)
             if not ready:
                 # A1/D02: an ordinary islanded return waits for the exact
                 # requested pair and a current readback inside the envelope,

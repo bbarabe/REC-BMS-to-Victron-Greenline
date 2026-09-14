@@ -432,25 +432,36 @@ class RecPolicyAdapter:
         # reference; it must not suddenly restore slider charging while returning.
         sustain = limits.get('sustain', self.driver.sustain.get('mode', 0)
                              if self.driver.sustain.get('active') else 0)
-        if not active and not self.driver.sustain.get('active'):
-            previous = self.contract.state.get('policy', {})
-            if previous.get('target_soc') == target:
+        # The REC returning on its own -- a lost lease, or sources it can no
+        # longer judge under a lease that still says 'island' (E02 on the
+        # island: the Quattro's DC current) -- carries the mode's protection
+        # itself rather than the island's release: the engine's floor request
+        # arrives a tick later at best, and never when the fault is one only
+        # the REC can see. `protect` is last tick's verdict; the bounded
+        # preparation wait in tick() covers that tick.
+        rec_returning = not active or bool(getattr(self, 'control', {}).get('protect'))
+        if rec_returning and not (self.driver.sustain.get('active') and sustain):
+            policy = (request.get('mode') if active else
+                      self.contract.state.get('policy', {}).get('mode'))
+            same_target = (active or
+                           self.contract.state.get('policy', {}).get('target_soc') == target)
+            if same_target:
                 feed = self._value('vebus', '/Ac/ActiveIn/ActiveInput', self.clock.monotonic())
                 transfer = getattr(self, 'transfer', None)
                 # SP65/D02: the floor belongs BEFORE the re-accept, not after
-                # it. Reconstruct it as soon as the lease is lost while the
-                # supervisor is heading home from a confirmed island, and keep
-                # it once any input is accepted -- another accepted AC input
-                # is a charger too. A known-absent shore changes nothing that
-                # is already in force but asks for nothing new, so an
-                # attempted return cannot pin solar charging indefinitely.
+                # it. Reconstruct it as soon as the return begins from a
+                # confirmed island, and keep it once any input is accepted --
+                # another accepted AC input is a charger too. A known-absent
+                # shore changes nothing that is already in force but asks for
+                # nothing new, so an attempted return cannot pin solar
+                # charging indefinitely.
                 accepted = feed in (0, 1)
                 returning = (getattr(transfer, 'feedback', None) is False and
                              getattr(transfer, 'available', None) is not False and
                              getattr(transfer, 'limited_by', '') != 'shore unavailable')
-                if previous.get('mode') == 'DISCHARGE':
+                if policy == 'DISCHARGE':
                     sustain = 2
-                elif previous.get('mode') == 'CHARGE' and (accepted or returning):
+                elif policy == 'CHARGE' and (accepted or returning):
                     # The first exact charger readback still gates current.
                     sustain = 1
         self.driver._set_sustain(sustain)
@@ -546,7 +557,8 @@ class RecPolicyAdapter:
             not self.driver.bms.get('modulesBlockingDischarge') and not self.driver.bms.get('modulesOffline'))
         source_valid = bool(raw_valid and selected and connected is not None and
                             actuators['support_coherent'] and demand.get('valid'))
-        safe = bool(source_valid and self.driver._voltage_within_envelope(safe_voltage))
+        envelope_ok = bool(self.driver._voltage_within_envelope(safe_voltage))
+        safe = bool(source_valid and envelope_ok)
         current_limit = finite(self._value('vebus', '/BatteryOperationalLimits/MaxChargeCurrent', now))
         current_envelope = ccl + (demand.get('external_dc_w', 0) / max(voltage, 1)
                                  if demand.get('measured_dc') else 0)
@@ -558,19 +570,44 @@ class RecPolicyAdapter:
         if self.contract.owned:
             intent = request.get('transfer_intent', 'protect') if lease else 'protect'
             protective = not permitted
+            # A1/A3 (D02): every return that can afford it goes through the
+            # bounded preparation wait in TransferSupervisor.step, so the
+            # below-bank pair is verified before the relay closes. A lost
+            # lease, OFF and lost transport sources (E02: the Quattro's DC
+            # current) are not urgent -- the loads are on the bank either
+            # way -- so they return as a 'connected' intent too. Only what
+            # the REC itself can no longer vouch for is urgent and returns
+            # at once: critical REC data lost, discharge prohibited by the
+            # BMS, or a charger outside the safe envelope.
+            urgent = not (raw_valid and discharge_permitted and envelope_ok)
+            if protective and not urgent:
+                intent, protective = 'connected', False
             # Exact command readbacks gate new departures. Once islanded,
             # changed setpoints and missing MPPT telemetry do not fabricate a
             # battery deficit; the engine owns its observed-power decision
             # (SP67), so an island intent still only needs a safe envelope.
-            # An ordinary return is the opposite case (A1/D02): the exact
-            # requested pair must be verified before the relay closes, and
-            # TransferSupervisor.step bounds that wait. Protective returns
-            # never reach here as 'connected' -- they arrive protective.
-            transfer_ready = safe if (connected is False and intent != 'connected') else ready
+            # A return waits for the pair itself -- the REC's own readback of
+            # the requested voltages and the current limit -- not for the
+            # transport sources that a departure needs.
+            # -- and, under a directional policy, for the hold that makes the
+            # pair a protection at all: a CHARGE return is prepared only once
+            # its floor is anchored (the engine's request, or the REC's own
+            # reconstruction above, one tick later), a DISCHARGE return once
+            # its ceiling is.
+            hold = self.driver.sustain
+            hold_mode = hold.get('mode') if hold.get('active') and hold.get('soc') is not None else None
+            protected = ((mode != 'CHARGE' or hold_mode == 1) and
+                         (mode != 'DISCHARGE' or hold_mode == 2))
+            if connected is False and intent == 'island':
+                transfer_ready = safe
+            elif intent == 'connected':
+                transfer_ready = bool(voltage_ready and current_ready and protected)
+            else:
+                transfer_ready = ready
             command = self.transfer.step(intent, now, wall, ready=transfer_ready,
                                          permitted=permitted, protective=protective)
             self._relay(command, now, wall)
-            control['protect'] = protective
+            control['protect'] = not permitted
             control['limited_by'] = ('lease expired' if not lease else
                 'critical sources or REC discharge permission unavailable' if not permitted else
                 self.transfer.limited_by)
@@ -584,7 +621,7 @@ class RecPolicyAdapter:
         ledger = self.ledger.snapshot(compact=True)
         public_ledger = {k: ledger[k] for k in ('total', 'overhead', 'references', 'budget', 'reverse', 'buffer',
                                                'net_wh', 'net_ah', 'gap_count', 'complete_history', 'capacity_version', 'calendar_days', 'recovery')}
-        snapshot = {'version': 2, 'implementation_version': '3.0.0',
+        snapshot = {'version': 2, 'implementation_version': '3.1.0',
                     'configuration_id': self.configuration_id, 'shore_ac_input': self.driver.cfg.policy_ac_input,
                     'wall_s': wall, 'sample_monotonic_s': stamp,
                     'support_coherent': actuators['support_coherent'],
