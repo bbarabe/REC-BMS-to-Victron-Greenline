@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.10"
+ENGINE_VERSION = "4.11"
 
 ENGINE_DEFAULTS = {
     "SOLAR_MARGIN": 1.2, "MIN_EST_W": 100, "READY_MS": 30000, "RAMP_MS": 90000,
@@ -402,6 +402,12 @@ class Engine:
         def enter_burndown(reason, clear_harvest):
             if st["state"] in ("shore", "suspend") and not inp.departure_allowed:
                 status[:] = ["yellow", "SHORE | waiting for transfer readiness"]
+                return
+            if owc:
+                # A burn-down spends the band into the loads: a step backward
+                # while the bank is meant to be charging. The shore-side
+                # entries already exclude it; this is the boundary (issue #2).
+                self.log("ERROR burn-down refused while charging one-way (%s)" % reason)
                 return
             st["state"] = "burndown"
             st["desired"] = 1
@@ -841,8 +847,8 @@ class Engine:
                         st["lastTransition"] = now
                         st["surgeStart"] = 0
                         st["loadExceedStart"] = 0
-                        if (st["suspendPrev"] == "burndown" and battV is not None and cvl is not None
-                                and battV.v > cvl.v - t["BURN_EXIT_DROP_V"]):
+                        if (st["suspendPrev"] == "burndown" and not owc and battV is not None
+                                and cvl is not None and battV.v > cvl.v - t["BURN_EXIT_DROP_V"]):
                             st["state"] = "burndown"
                             st["burnExitStart"] = 0
                             st["burnCalmStart"] = 0
@@ -936,10 +942,13 @@ class Engine:
                     toShore("big load: batt -%.0fW, load %.0fW" % (discharge, loadNow.v))
                     status[0] = "blue"
                 elif (st["loadExceedStart"] and now - st["loadExceedStart"] >= t["LOAD_EXCEED_MS"]
-                      and dayOk and soc.v >= minSoc
+                      and dayOk and soc.v >= minSoc and not owc
                       and battV is not None and cvl is not None
                       and battV.v >= cvl.v - t["STALL_BURN_MIN_V"]):
-                    # Ceiling stall (v4.1): burn the band, no backoff
+                    # Ceiling stall (v4.1): burn the band, no backoff. Never
+                    # while charging one-way (issue #2, E07: CHARGE at 78 %
+                    # for 80 % burned the band at -100 W); that deficit takes
+                    # the ordinary return below and the floor on shore.
                     st["loadExceedStart"] = 0
                     enter_burndown("ceiling stall: batt avg -%.0fW at %.2fV, PV %.0fW" % (
                         dischargeAvg, battV.v, pvNow), True)

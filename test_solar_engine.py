@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 5 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 1 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.10")
+check("engine version bumped", SP.ENGINE_VERSION == "4.11")
 Val = SP.Val
 
 
@@ -503,6 +503,45 @@ check("#1: no SOC keeps the last objective and a '?' in the status",
 s.inp.enabled = False
 out = drop(s, "soc")
 check("#1: a disable still releases during an outage", s.oneway is None and out.charge_intent == "release")
+
+# ---- issue #2: CHARGE never enters a burn-down ----
+# E07: CHARGE on solar at 78 % for 80 %, -100 W, pack 59.47 V on a 59.49 V
+# CVL: the ceiling-stall branch burned the band after 155 s.
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)
+s.tick(95, batt=100.0, cvl=59.49)
+check("#2 stall: CHARGE on solar", s.state == "solar" and s.oneway == "charge")
+s.tick(300, soc=78.0, batt=-100.0, batt_v=59.47, cvl=59.49, pv=200.0)
+check("#2 stall: the deficit takes the ordinary return, never burn-down",
+      s.state == "shore" and "burndown" not in s.states and
+      any(tr.startswith("-> SHORE (deficit: batt avg -") for tr in s.transitions),
+      "state %s %s" % (s.state, s.transitions[-1:]))
+check("#2 stall: still CHARGE, floor back on shore", s.oneway == "charge" and s.sustain == 1)
+# the shore-side entries with CHARGE selected: surplus and harvest
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(400, batt_v=57.0, cvl=56.62, batt=0.0, pv=0.0, m=0, voc=10.0)   # above the CVL, quiet, no sun
+check("#2 surplus: no burn-down while charging one-way", "burndown" not in s.states and s.state == "shore",
+      "%s %s" % (s.state, s.transitions))
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(400, batt_v=56.61, cvl=56.62, batt=0.0, pv=60.0, m=1, load=1000.0)   # band full, need > est
+check("#2 harvest: no burn-down while charging one-way", "burndown" not in s.states and s.state == "shore",
+      "%s %s" % (s.state, s.transitions))
+# the boundary itself, and the suspend resume into a burn-down
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.eng.st.update(state="suspend", suspendPrev="burndown", suspendStart=s.now, suspendBase=300.0,
+                lastTransition=s.now, desired=0)
+s.tick(15, batt_v=59.47, cvl=59.49, load=300.0)
+check("#2 resume: a suspended burn-down resumes to solar under CHARGE",
+      s.state == "solar" and "burndown" not in s.states, "%s %s" % (s.state, s.transitions[-1:]))
+s = Sim()
+s.tick(1, soc=90, target=70, batt_v=60.3, cvl=60.3)
+s.tick(335, pv=0.0, m=0, voc=10.0)
+s.tick(300, batt=-600.0)
+check("#2 discharge: still inverts under no sun", s.state == "solar" and s.oneway == "discharge" and s.cmd == 1)
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:
