@@ -1852,13 +1852,27 @@ class RecBmsDriver:
         return min(lead, max(0.0, target - base)) if verified else 0.0
 
     def _boost_shutdown(self):
-        if hasattr(self, 'policy_adapter'):
-            self.policy_adapter.shutdown()
+        """Protection first, relay second -- and only on an orderly exit.
+
+        D02/A1: this used to hand the relay back to shore BEFORE zeroing the
+        current and lowering the commands, so the Quattro could re-accept AC
+        while still holding the old pair (E03: pack 56.41 V against CVL
+        59.34 V and CCL 200 A at closure). CCL 0 and the safe voltage pair go
+        out first, then the return, then the ledger checkpoint.
+
+        This is best effort on SIGTERM/SIGINT/atexit only. SIGKILL, a crash or
+        power loss skip it entirely, and once this process dies the battery
+        service disappears from D-Bus with every BMS limit DVCC distributes
+        from it, so the chargers fall back to their own settings. Publishing a
+        command here is not evidence that the hardware applied it.
+        """
         if self.boost.get("active"):
             log.info("solar boost released on shutdown")
         self.batt["/Info/MaxChargeCurrent"] = 0.0
         self._apply_voltage_commands(self.cfg.safe_cvl, self.cfg.safe_cvl,
                                      self._safe_voltage(), time.monotonic(), charge_permission=0.0)
+        if hasattr(self, 'policy_adapter'):
+            self.policy_adapter.shutdown()
 
     def _boost_signal(self, signum, frame):
         self._boost_shutdown()

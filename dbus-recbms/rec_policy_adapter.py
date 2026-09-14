@@ -31,7 +31,7 @@ class RecPolicyAdapter:
         self.transfer = TransferSupervisor(self.ledger.controller_state.setdefault('transfer', {}),
             connected_dwell_s=self.config.connected_dwell_s, timeout_s=self.config.transfer_timeout_s,
             hourly_departures=int(self.config.hourly_departures), daily_departures=int(self.config.daily_departures),
-            backoff_s=self.config.failed_probe_backoff_s)
+            backoff_s=self.config.failed_probe_backoff_s, prepare_s=self.config.return_prepare_s)
         self.last_boost_id = None
         self.sources = SourceRegistry(max_age_s=10)
         self.demand_model = DemandModel(self.config.inverter_efficiency, self.config.inverter_idle_w,
@@ -54,6 +54,8 @@ class RecPolicyAdapter:
         self.control = {}
         self.last_snapshot = {}
         self.last_connected = None
+        self.settle_since = None
+        self.settle_last = None
         self.attribution_observation = None
         self.attribution_island_since = None
         self.attribution_last_now = None
@@ -101,8 +103,30 @@ class RecPolicyAdapter:
                 self.contract.rejection = 'policy persistence failed'
                 self.contract.expires = now
                 accepted = False
+        if accepted and (self.contract.request or {}).get(
+                'requested_limits', {}).get('purpose') == 'failed_probe':
+            self._failed_probe(now)
         driver.batt[PREFIX + 'Owned'] = int(self.contract.owned)
         return accepted
+
+    def _failed_probe(self, now):
+        """Feed one evaluated probe failure into the durable backoff, once.
+
+        D16/issue #8: `TransferSupervisor.failed_probe` had no caller, so the
+        protection lived only in the engine and a restart erased it. The
+        consumer repeats the marker until it sees its request id accepted and
+        renumbers requests across its own restarts, so the DEPARTURE the
+        failure belongs to is what is counted -- the physically confirmed one,
+        never a refused or timed-out attempt that never left shore. The ledger
+        is saved immediately so a restart cannot erase the backoff either.
+        """
+        durable = self.transfer.durable
+        departure = durable.get('last_departure_s')
+        if departure is None or durable.get('last_failed_departure') == departure:
+            return
+        durable['last_failed_departure'] = departure
+        self.transfer.failed_probe(self.clock.time(), now)
+        self.ledger.save()
 
     def _poll(self, now):
         if self.last_poll is not None and now - self.last_poll < 1:
@@ -150,7 +174,10 @@ class RecPolicyAdapter:
                 paths = ('/Ac/Consumption/L1/Power', '/Dc/System/Power', '/Dc/System/MeasurementType',
                          '/Dc/Pv/Power', '/Dc/Pv/Current', '/ActiveBatteryService', '/ActiveBmsService',
                          '/Dc/Battery/BatteryService', '/ActiveBmsInstance', '/Control/EffectiveChargeVoltage') if source_role == 'system' else (
-                         '/Connected', '/Ac/ActiveIn/ActiveInput', '/Ac/Out/L1/P', '/Dc/0/Power', '/Dc/0/Current',
+                         '/Connected', '/Ac/ActiveIn/ActiveInput', '/Ac/ActiveIn/Connected',
+                         '/Ac/State/AcIn1Available', '/Ac/State/AcIn2Available',
+                         '/Ac/State/IgnoreAcIn1', '/Ac/State/IgnoreAcIn2',
+                         '/Ac/Out/L1/P', '/Dc/0/Power', '/Dc/0/Current',
                          '/Dc/0/Voltage', '/BatteryOperationalLimits/MaxChargeCurrent',
                          '/BatteryOperationalLimits/MaxChargeVoltage', '/Dc/0/MaxChargeCurrent')
                 if source_role.startswith('solar'):
@@ -311,8 +338,13 @@ class RecPolicyAdapter:
             self.attribution_island_since = None
         island_proven = (inverting and
                          now - self.attribution_island_since >= self.config.current_settle_s)
+        # Command readiness, not the stricter physical settling added in stage
+        # A: attribution already requires an unchanged observation and a
+        # Quattro inside the positive reserve, so demanding current_settle_s
+        # of continuity here as well would only delay credit that the previous
+        # behaviour granted.
         shore_proven = (connected is True and unchanged and
-                        self.control.get('actuator', {}).get('settled', False) and
+                        self.control.get('actuator', {}).get('command_ready', False) and
                         power is not None and power <= self.config.positive_reserve_w + 10)
         if not valid or not (island_proven or shore_proven):
             return None
@@ -353,6 +385,42 @@ class RecPolicyAdapter:
         useful = self.pv_activity.update(now, pv) >= self.config.minimum_useful_pv_w
         return useful, self.load_service.update(now, battery_power_w, useful, False)
 
+    def _actuator_state(self, now, command_ready, connected, actuators):
+        """A3/D04: command readiness is not charger settling.
+
+        ``command_ready`` is the acknowledgment of the exact requested pair and
+        a current readback inside the envelope -- the gate on a transfer.
+        ``settled`` is the physical response: signed Quattro V*I (never the
+        reported /Dc/0/Power, which held a 25-26 W residual at 0.0 A on
+        2026-09-12) continuously inside the positive reserve for
+        current_settle_s while actually on shore. Publishing a command is not
+        evidence that the hardware has applied it.
+        """
+        quiet = bool(connected is True and command_ready and
+                     actuators['quattro_power_w'] is not None and
+                     actuators['quattro_power_w'] <= self.config.positive_reserve_w + 10)
+        continuous = (self.settle_last is not None and
+                      0 <= now - self.settle_last <= self.config.source_gap_s)
+        self.settle_last = now
+        if not quiet or not continuous:
+            self.settle_since = now if quiet else None
+        elif self.settle_since is None:
+            self.settle_since = now
+        settled = bool(quiet and self.settle_since is not None and
+                       now - self.settle_since >= self.config.current_settle_s)
+        transfer = self.transfer
+        if connected is None:
+            state = 'unknown'
+        elif connected is False:
+            state = ('returning' if transfer.pending == 0 else
+                     'preparing' if transfer.state == 'PREPARE_CONNECT' else 'islanded')
+        else:
+            state = 'connected' if settled else 'settling'
+        return {'command_ready': command_ready, 'settled': settled, 'state': state,
+                'command_acknowledged': command_ready,
+                'transition_age_s': (None if transfer.last_edge_at is None else
+                                     max(0.0, now - transfer.last_edge_at))}
+
     def prepare_intents(self, target):
         """Apply only leased engine intents before REC computes this tick's limits."""
         if not self.contract.owned:
@@ -368,11 +436,21 @@ class RecPolicyAdapter:
             previous = self.contract.state.get('policy', {})
             if previous.get('target_soc') == target:
                 feed = self._value('vebus', '/Ac/ActiveIn/ActiveInput', self.clock.monotonic())
+                transfer = getattr(self, 'transfer', None)
+                # SP65/D02: the floor belongs BEFORE the re-accept, not after
+                # it. Reconstruct it as soon as the lease is lost while the
+                # supervisor is heading home from a confirmed island, and keep
+                # it once any input is accepted -- another accepted AC input
+                # is a charger too. A known-absent shore changes nothing that
+                # is already in force but asks for nothing new, so an
+                # attempted return cannot pin solar charging indefinitely.
+                accepted = feed in (0, 1)
+                returning = (getattr(transfer, 'feedback', None) is False and
+                             getattr(transfer, 'available', None) is not False and
+                             getattr(transfer, 'limited_by', '') != 'shore unavailable')
                 if previous.get('mode') == 'DISCHARGE':
                     sustain = 2
-                elif (previous.get('mode') == 'CHARGE' and
-                      feed == self.driver.cfg.policy_ac_input - 1):
-                    # Reconstruct the floor only on freshly confirmed shore.
+                elif previous.get('mode') == 'CHARGE' and (accepted or returning):
                     # The first exact charger readback still gates current.
                     sustain = 1
         self.driver._set_sustain(sustain)
@@ -393,9 +471,21 @@ class RecPolicyAdapter:
             self._value('system', '/ActiveBmsService', now),
             self._value('system', '/Dc/Battery/BatteryService', now),
             self._value('system', '/ActiveBmsInstance', now))
+        shore_input = getattr(self.driver.cfg, 'policy_ac_input', 1)
         feed = self._value('vebus', '/Ac/ActiveIn/ActiveInput', now)
-        connected = None if feed is None else feed == getattr(self.driver.cfg, 'policy_ac_input', 1) - 1
-        self.transfer.observe(connected, now, wall)
+        connected = None if feed is None else feed == shore_input - 1
+        # A2/SP56, read on the boat 2026-09-14 (vebus 276): availability, the
+        # Quattro's acknowledgment of the ignore command and the accepted
+        # input are three separate facts. A missing or stale availability path
+        # stays unknown -- never "absent". ActiveInput 240 means no input is
+        # accepted; 0 and 1 are AC in 1 and AC in 2.
+        available = self._value('vebus', '/Ac/State/AcIn%dAvailable' % shore_input, now)
+        available = True if available == 1 else False if available == 0 else None
+        ignore_state = self._value('vebus', '/Ac/State/IgnoreAcIn%d' % shore_input, now)
+        ignore_state = int(ignore_state) if ignore_state in (0, 1) else None
+        active_input = int(feed) if feed in (0, 1) else None
+        self.transfer.observe(connected, now, wall, available=available,
+                              ignore_state=ignore_state, active_input=active_input)
         array_power = []
         for instance in getattr(self.driver.cfg, 'policy_mppt_instances', (278, 279)):
             role = 'solar%d' % instance
@@ -409,7 +499,9 @@ class RecPolicyAdapter:
             self._value('system', '/Ac/Consumption/L1/Power', now),
             self._value('system', '/Dc/System/Power', now),
             measured_dc=self._value('system', '/Dc/System/MeasurementType', now) == 1,
-            connected=connected is not False,
+            # Any accepted input is a charger: only ActiveInput 240 (or an
+            # unreadable input) leaves the Quattro inverting.
+            connected=active_input is not None or feed is None,
             inverter_dc_w=-inverter_power if inverter_power is not None else None)
         measurement_valid = self.driver._health()['Measurements']['valid']
         stamp = self.driver.bms.get('_received', {}).get('Measurements')
@@ -444,7 +536,7 @@ class RecPolicyAdapter:
         sv = commands.requested_solar
         control = dict(mode=mode, quattro_v=qv, solar_v=sv, ccl_a=ccl,
                        protect=False, limited_by='', overhead_category=None,
-                       actuator={'settled': voltage_ready})
+                       actuator={})
         self.control = control
         actual_load_service, load_service_proven = self._update_load_service(
             now, pv_w, voltage * current,
@@ -462,13 +554,19 @@ class RecPolicyAdapter:
         ready = bool(safe and voltage_ready and current_ready)
         permitted = bool(safe and discharge_permitted and lease and mode != 'OFF')
         departure_allowed = bool(ready and permitted and not self.transfer.departure_reason(now, wall))
+        control['actuator'] = self._actuator_state(now, ready, connected, actuators)
         if self.contract.owned:
             intent = request.get('transfer_intent', 'protect') if lease else 'protect'
             protective = not permitted
             # Exact command readbacks gate new departures. Once islanded,
             # changed setpoints and missing MPPT telemetry do not fabricate a
-            # battery deficit; the engine owns its observed-power decision.
-            transfer_ready = safe if connected is False else ready
+            # battery deficit; the engine owns its observed-power decision
+            # (SP67), so an island intent still only needs a safe envelope.
+            # An ordinary return is the opposite case (A1/D02): the exact
+            # requested pair must be verified before the relay closes, and
+            # TransferSupervisor.step bounds that wait. Protective returns
+            # never reach here as 'connected' -- they arrive protective.
+            transfer_ready = safe if (connected is False and intent != 'connected') else ready
             command = self.transfer.step(intent, now, wall, ready=transfer_ready,
                                          permitted=permitted, protective=protective)
             self._relay(command, now, wall)

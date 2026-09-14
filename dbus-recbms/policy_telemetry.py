@@ -73,6 +73,14 @@ FIELDS = (
     ('Relay/NextDepartureSeconds', 'status', ('transfer', 'next_departure_s')),
     ('Relay/PendingCommand', 'status', ('transfer', 'pending')),
     ('Relay/LimitedBy', 'status', ('transfer', 'limited_by')),
+    # The Quattro's acknowledgment of the ignore command, whether the supply
+    # is there at all, and which input is actually accepted: three facts, not
+    # one (SP56/SP63). 0 = AC in 1, 1 = AC in 2, invalid = none accepted.
+    ('Relay/Acknowledged', 'status', ('transfer', 'acknowledged')),
+    ('Relay/ShoreAvailable', 'status', ('transfer', 'available')),
+    ('Relay/ActiveInput', 'status', ('transfer', 'active_input')),
+    ('Relay/Prepared', 'status', ('transfer', 'prepared')),
+    ('Relay/PrepareAgeSeconds', 'status', ('transfer', 'prepare_age_s')),
     ('Demand/Valid', 'snapshot', ('demand', 'valid')),
     ('Demand/Method', 'snapshot', ('demand', 'method')),
     ('Demand/ExternalMeasured', 'snapshot', ('demand', 'measured_dc')),

@@ -22,6 +22,19 @@ class ControlConfigurationTests(unittest.TestCase):
         self.assertEqual(config.hourly_departures, 3)
         self.assertEqual(config.daily_departures, 12)
         self.assertLessEqual(config.source_alignment_s, config.source_gap_s)
+        # Stage A's bounded preparation wait before an ordinary return.
+        self.assertEqual(config.return_prepare_s, 30)
+        self.assertEqual(ControlConfig({'return_prepare_s': 45}).return_prepare_s, 45)
+
+    def test_shipped_control_section_carries_the_return_preparation_bound(self):
+        import configparser
+        shipped = configparser.ConfigParser(interpolation=None)
+        shipped.read(os.path.join(REPO, 'dbus-recbms', 'config.ini'))
+        values = dict(shipped['control'])
+        self.assertEqual(float(values['return_prepare_s']), 30)
+        self.assertFalse(set(values) - set(ControlConfig.DEFAULTS) -
+                         set(ControlConfig.RETIRED_OPTIONS))
+        self.assertEqual(ControlConfig(values).return_prepare_s, 30)
 
     def test_required_controls_cannot_be_blank_or_nonfinite(self):
         for key in ControlConfig.DEFAULTS:
