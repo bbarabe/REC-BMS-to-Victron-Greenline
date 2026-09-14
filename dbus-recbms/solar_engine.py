@@ -63,7 +63,10 @@ ENGINE_DEFAULTS = {
     # 4.5: a target at or above this is a request for a FULL charge from
     # every charger at its maximum, so one-way charge never engages there
     # (2026-09-06: at 100 % the floor held the Quattro at the present SOC
-    # and only solar could move the bank -- it could never get full). 0 = off.
+    # and only solar could move the bank -- it could never get full). 0 = off
+    # in the engine alone; the consumer refuses 0 and anything above 100 at
+    # startup, since the protocol maps a 100 % target to COMPLETE_FULL,
+    # which must release sustain (issue #7).
     "ONEWAY_FULL_PCT": 100,
     # 4.6: the SOC floor for LEAVING shore and staying on solar while
     # charging one-way. MIN_SOC (40) and SOC_EMERGENCY (30) protect a bank

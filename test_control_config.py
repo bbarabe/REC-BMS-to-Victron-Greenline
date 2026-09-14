@@ -11,6 +11,10 @@ sys.path.insert(0, os.path.join(REPO, 'dbus-recbms'))
 from rec_control_config import ControlConfig
 
 REC = load(os.path.join(REPO, 'dbus-recbms', 'dbus_recbms.py'), 'rec_config_validation')
+# The consumer imports velib's dbusmonitor at module level; only its Config is under test here.
+sys.modules.setdefault('dbusmonitor', type(sys)('dbusmonitor'))
+sys.modules['dbusmonitor'].DbusMonitor = object
+SP = load(os.path.join(REPO, 'dbus-recbms', 'solar_priority.py'), 'solar_config_validation')
 class ControlConfigurationTests(unittest.TestCase):
     def test_default_relay_limits_and_source_alignment(self):
         config = ControlConfig()
@@ -112,6 +116,44 @@ class DriverConfigurationTests(unittest.TestCase):
                          '[fallback]\nlive_timeout_s=150\nalert_timeout_s=120\n'):
             with self.subTest(contents=contents), self.assertRaises(ValueError):
                 self.parse(contents)
+
+
+class ConsumerConfigurationTests(unittest.TestCase):
+    def parse(self, contents=''):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'solar_priority.ini')
+            with open(path, 'w') as stream:
+                stream.write(contents)
+            return SP.Config(path)
+
+    def test_full_threshold_must_agree_with_the_protocol_full_mode(self):
+        # E12: threshold 0 and target 100 % had the engine ask for a floor
+        # under COMPLETE_FULL, which the contract rejects on every request.
+        self.assertEqual(self.parse().engine['ONEWAY_FULL_PCT'], 100)
+        self.assertEqual(self.parse('[engine]\noneway_full_pct = 100\n').engine['ONEWAY_FULL_PCT'], 100)
+        self.assertEqual(self.parse('[engine]\noneway_full_pct = 95\n').engine['ONEWAY_FULL_PCT'], 95)
+        for value in ('0', '101', '100.5'):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'oneway_full_pct'):
+                self.parse('[engine]\noneway_full_pct = %s\n' % value)
+
+    def test_accepted_full_configuration_never_requests_a_floor_under_complete_full(self):
+        from policy_contract import PolicyContract, VERSION
+        for full in (100, 95):
+            engine = SP.Engine(dict(SP.ENGINE_DEFAULTS, ONEWAY_FULL_PCT=full), 0)
+            inputs = SP.Inputs()
+            inputs.enabled = True
+            for name in ('soc', 'batt', 'load_now', 'load_avg', 'load_slow', 'feed', 'ac_out',
+                         'batt_v', 'cvl', 'quattro_w', 'demand_avg', 'demand_slow', 'demand_margin'):
+                setattr(inputs, name, SP.Val({'soc': 60., 'feed': 0., 'batt_v': 56.4, 'cvl': 56.42}.get(name, 100.), 1000))
+            inputs.target_soc = SP.Val(100., 1000)
+            out = engine.tick(1000, inputs)
+            contract = PolicyContract(generation='g')
+            request = dict(version=VERSION, generation='g', request_id=1, mode='COMPLETE_FULL',
+                           target_soc=100., transfer_intent='connected', lease_s=15.,
+                           requested_limits={'sustain': {'release': 0, 'floor': 1, 'ceiling': 2}[out.charge_intent]})
+            with self.subTest(full=full):
+                self.assertEqual(out.charge_intent, 'release')
+                self.assertTrue(contract.accept(request, 0, 100., consumer_ready=True), contract.rejection)
 
 
 if __name__ == '__main__':

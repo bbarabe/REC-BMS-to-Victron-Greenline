@@ -286,7 +286,8 @@ check("full: back to 100 stands one-way down", s.oneway is None and
       str(s.logs[-1:]))
 s = Sim(ONEWAY_FULL_PCT=0)
 s.tick(1, soc=60, target=100)
-check("full: oneway_full_pct = 0 restores the 4.4 behaviour", s.oneway == "charge")
+check("full: oneway_full_pct = 0 restores the 4.4 behaviour in the engine alone (the consumer refuses it, #7)",
+      s.oneway == "charge")
 
 # ---- 4.5: no floor while the Quattro is not actually on shore ----
 s = Sim()

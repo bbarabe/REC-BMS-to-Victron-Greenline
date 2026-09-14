@@ -24,7 +24,7 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.0.4"
+VERSION = "3.0.5"
 ENGINE_VERSION = "4.13-restored"
 BUSITEM = "com.victronenergy.BusItem"
 
@@ -97,6 +97,16 @@ class Config:
         self.engine = {k: float(e.get(k.lower(), default)) for k, default in ENGINE_DEFAULTS.items()}
         if any(not math.isfinite(v) or v < 0 for v in self.engine.values()):
             raise ValueError('invalid engine threshold')
+        # The protocol maps a target of 100 % to COMPLETE_FULL, which must
+        # release sustain (policy_contract), so the engine must stand one-way
+        # down at 100 % too: a full threshold of 0 (off) or above 100 had it
+        # request a floor there, and every such request was rejected
+        # ("disabled/full mode must release sustain", E12). Refuse the
+        # configuration before operation rather than run without authority.
+        full = self.engine['ONEWAY_FULL_PCT']
+        if not 0 < full <= 100:
+            raise ValueError('oneway_full_pct must be within 1..100 (got %g): the protocol maps a '
+                             '100 %% target to COMPLETE_FULL, which releases sustain' % full)
 
 
 def _bus(private=False):
