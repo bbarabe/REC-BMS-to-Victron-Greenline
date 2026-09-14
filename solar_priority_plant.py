@@ -327,7 +327,14 @@ class DelayedMonitor:
                       for path, value in service.values.items()}
         bus.monitors.append(self)
 
+    def close(self):
+        """Retire subscriptions, including deliveries already in the event queue."""
+        if self in self.bus.monitors:
+            self.bus.monitors.remove(self)
+
     def receive(self, name, path, value):
+        if self not in self.bus.monitors:
+            return
         if name in self.bus.removed or (name, path) in self.bus.invalid and value is not None:
             return
         key = (name, path)
@@ -745,12 +752,14 @@ class CoupledSimulation:
                     sys.modules['dbusmonitor'] = previous_monitor
         self._patches.callback(restore_monitor)
         driver_dir = ROOT / "dbus-recbms"
-        if str(driver_dir) not in sys.path:
-            sys.path.insert(0, str(driver_dir))
-        self.rec_module = stubs.load(str(rec_path or driver_dir / "dbus_recbms.py"),
-                                     "coupled_rec_%s" % id(self))
-        self.solar_module = stubs.load(str(solar_path or driver_dir / "solar_priority.py"),
-                                       "coupled_solar_%s" % id(self))
+        paths = (Path(rec_path or driver_dir / "dbus_recbms.py"),
+                 Path(solar_path or driver_dir / "solar_priority.py"))
+        # Each driver gets its checkout's complete helper graph, even when a
+        # previous simulation (or another test) has imported the same names.
+        helper_names = {path.stem for directory in {driver_dir, *(p.parent for p in paths)}
+                        for path in directory.glob("*.py")}
+        self.rec_module, rec_helpers = self._load_driver(paths[0], 'rec', helper_names)
+        self.solar_module, solar_helpers = self._load_driver(paths[1], 'solar', helper_names)
         for module in (self.rec_module, self.solar_module):
             replacements = {
                 'time': self.clock, 'VeDbusService': PlantService,
@@ -761,15 +770,16 @@ class CoupledSimulation:
                 self._patches.enter_context(patch.object(module, name, value))
         # Imported adapter modules own their clocks too; replacing only the driver
         # module would silently make 600 simulated seconds look like milliseconds.
-        adapter_module = sys.modules.get("rec_policy_adapter")
-        if adapter_module is not None:
-            self._patches.enter_context(patch.object(adapter_module, "time", self.clock))
-        contract_module = sys.modules.get("policy_contract")
-        if contract_module is not None:
-            process_ids = itertools.count(1)
-            self._patches.enter_context(patch.object(contract_module, 'uuid',
-                types.SimpleNamespace(uuid4=lambda: types.SimpleNamespace(
-                    hex="offline-generation-%08d" % next(process_ids)))))
+        process_ids = itertools.count(1)
+        for helpers in (rec_helpers, solar_helpers):
+            adapter_module = helpers.get("rec_policy_adapter")
+            if adapter_module is not None:
+                self._patches.enter_context(patch.object(adapter_module, "time", self.clock))
+            contract_module = helpers.get("policy_contract")
+            if contract_module is not None:
+                self._patches.enter_context(patch.object(contract_module, 'uuid',
+                    types.SimpleNamespace(uuid4=lambda: types.SimpleNamespace(
+                        hex="offline-generation-%08d" % next(process_ids)))))
         self.bus.on_publication = self._actuator_publication
         rec_config_dir = Path(rec_path).parent if rec_path else driver_dir
         solar_config_dir = Path(solar_path).parent if solar_path else driver_dir
@@ -793,6 +803,22 @@ class CoupledSimulation:
         self.solar_bus_calls = self.bus_factory_calls[before_solar:]
         self.publish_measurements()
         self.bus.drain()
+
+    def _load_driver(self, path, role, helper_names):
+        saved_modules = {name: sys.modules[name] for name in helper_names if name in sys.modules}
+        saved_path = sys.path[:]
+        try:
+            for name in helper_names:
+                sys.modules.pop(name, None)
+            sys.path.insert(0, str(path.resolve().parent))
+            module = stubs.load(str(path), "coupled_%s_%s" % (role, id(self)))
+            helpers = {name: sys.modules[name] for name in helper_names if name in sys.modules}
+            return module, helpers
+        finally:
+            for name in helper_names:
+                sys.modules.pop(name, None)
+            sys.modules.update(saved_modules)
+            sys.path[:] = saved_path
 
     def _source(self, name, instance, values, writable=()):
         service = PlantService(name, self.bus)
@@ -1005,6 +1031,7 @@ class CoupledSimulation:
 
     def stop_solar(self, stalled=False):
         self.solar_running = False
+        self.solar.monitor.close()
         if stalled:
             self.bus.unresponsive.add(self.solar.sw.name)
         else:
@@ -1040,7 +1067,7 @@ class CoupledSimulation:
         if planned:
             old._shutdown()
         self.bus.remove(old.sw.name)
-        self.bus.monitors.remove(old.monitor)
+        old.monitor.close()
         self.solar = self.solar_module.SolarPriorityDriver(self.solar_cfg)
         self.bus.restore(self.solar.sw.name)
         self.solar_running = True
