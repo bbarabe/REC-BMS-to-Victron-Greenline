@@ -421,25 +421,49 @@ def main():
             elif uploads or args.start:
                 cb.run(restart_command)
                 print("-- " + restart_command)
-            if (args.install or args.start or (uploads and not args.no_restart)):
+            restarted = bool(args.install or args.start or (uploads and not args.no_restart))
+            if restarted:
                 time.sleep(args.settle)
-            verify(cb, pkg, base)
+            if not verify(cb, pkg, base, expect=local_version(pkg) if restarted else None):
+                # 2026-09-14: one `svc -t` left dbus-solarpriority's old process
+                # running (same pid, old /Mgmt/ProcessVersion) while the
+                # shipped file already read the new VERSION, and verify
+                # printed both without complaint. A running process that
+                # does not report the shipped version is not deployed.
+                print("!! %s still reports the old version; sending svc -t once more" % pkg["service"])
+                cb.run("svc -t /service/%s" % pkg["service"])
+                time.sleep(args.settle)
+                if not verify(cb, pkg, base, expect=local_version(pkg)):
+                    print("!! %s did not come up on the shipped version" % pkg["service"])
+                    rc = 5
     finally:
         cb.close()
     sys.exit(rc)
 
 
-def verify(cb, pkg, base):
+def verify(cb, pkg, base, expect=None):
+    """Print the shipped VERSION, the service state, the log tail and the
+    package's D-Bus reads. With `expect`, the running process must report
+    that version on /Mgmt/ProcessVersion (the shipped file alone proves only
+    that the copy landed, not that the old process let go); returns False
+    when it does not."""
     o, _ = cb.run("grep -m1 '^VERSION' %s/%s; svstat /service/%s 2>&1" % (
         base, pkg["version_file"], pkg["service"]))
     print("verify: " + o.strip().replace("\n", " | "))
     o, _ = cb.run("tail -n 12 /var/log/%s/current 2>/dev/null | tai64nlocal" % pkg["service"])
     print("log:\n" + "\n".join("   " + l for l in o.strip().splitlines()))
+    running = None
     for svc, path in pkg["verify"]:
-        print("   %-42s %s" % (svc.split(".")[-1] + path, cb.dbus_get(svc, path)))
+        value = cb.dbus_get(svc, path)
+        if path == "/Mgmt/ProcessVersion":
+            running = value
+        print("   %-42s %s" % (svc.split(".")[-1] + path, value))
     for cmd in pkg.get("verify_cmds", []):
         o, e = cb.run(cmd, timeout=15)
         print("   $ %s\n     %s" % (cmd, (o or e).strip().replace("\n", "\n     ")))
+    if expect is None:
+        return True
+    return str(running or "").strip("'\"").startswith(expect + " ")
 
 
 if __name__ == "__main__":

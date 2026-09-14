@@ -385,7 +385,7 @@ class RecPolicyAdapter:
         useful = self.pv_activity.update(now, pv) >= self.config.minimum_useful_pv_w
         return useful, self.load_service.update(now, battery_power_w, useful, False)
 
-    def _actuator_state(self, now, command_ready, connected, actuators):
+    def _actuator_state(self, now, command_ready, connected, actuators, dc_load_w=0.0):
         """A3/D04: command readiness is not charger settling.
 
         ``command_ready`` is the acknowledgment of the exact requested pair and
@@ -393,12 +393,16 @@ class RecPolicyAdapter:
         ``settled`` is the physical response: signed Quattro V*I (never the
         reported /Dc/0/Power, which held a 25-26 W residual at 0.0 A on
         2026-09-12) continuously inside the positive reserve for
-        current_settle_s while actually on shore. Publishing a command is not
-        evidence that the hardware has applied it.
+        current_settle_s while actually on shore. On shore the Quattro's DC
+        output also carries the DC loads (about 50 W on this boat, 90 W
+        read 2026-09-14 05:39 UTC under a settled floor), so the reserve is
+        judged over and above the measured DC demand. Publishing a command
+        is not evidence that the hardware has applied it.
         """
+        allowance = self.config.positive_reserve_w + 10 + max(0.0, finite(dc_load_w) or 0.0)
         quiet = bool(connected is True and command_ready and
                      actuators['quattro_power_w'] is not None and
-                     actuators['quattro_power_w'] <= self.config.positive_reserve_w + 10)
+                     actuators['quattro_power_w'] <= allowance)
         continuous = (self.settle_last is not None and
                       0 <= now - self.settle_last <= self.config.source_gap_s)
         self.settle_last = now
@@ -566,7 +570,8 @@ class RecPolicyAdapter:
         ready = bool(safe and voltage_ready and current_ready)
         permitted = bool(safe and discharge_permitted and lease and mode != 'OFF')
         departure_allowed = bool(ready and permitted and not self.transfer.departure_reason(now, wall))
-        control['actuator'] = self._actuator_state(now, ready, connected, actuators)
+        control['actuator'] = self._actuator_state(now, ready, connected, actuators,
+                                                   demand.get('external_dc_w', 0.0))
         if self.contract.owned:
             intent = request.get('transfer_intent', 'protect') if lease else 'protect'
             protective = not permitted
