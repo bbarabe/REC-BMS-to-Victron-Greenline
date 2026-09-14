@@ -580,7 +580,7 @@ or localsettings will not hand 210/211 back.
 
 ## Solar Priority Driver (`dbus-recbms/solar_priority.py`)
 
-The separate `/service/dbus-solarpriority` service owns the restored `shore`, `probe`, `solar`, `burndown` and `suspend` decision states, with one-way charge/discharge and full-target behavior. It keeps switch instance 221 and localsettings enable/rated-PV values; instance 222 remains retired.
+The separate `/service/dbus-solarpriority` service owns the restored `shore`, `probe`, `solar` and `suspend` decision states (the `burndown` state and its harvest-and-burn cycle were removed in engine 4.15), with one-way charge/discharge, a two-sided HOLD and full-target behavior. It keeps switch instance 221 and localsettings enable/rated-PV values; instance 222 remains retired.
 
 The pure engine emits shore, sustain floor/ceiling/release and bounded boost intentions through REC protocol v2. It never writes `IgnoreAcIn` directly. REC checks generation, lease, actual feedback, command safety, connected dwell and relay rate limits. Accounting and historical trials do not select operating phases or veto departures. Fresh measured Quattro V×I replaces inferred net power; observed timestamps distinguish unchanged values from stale data.
 

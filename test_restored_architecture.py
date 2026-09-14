@@ -487,6 +487,108 @@ class RestoredPlantTests(unittest.TestCase):
             self.assertEqual(status['rejection'], '')
             self.assertEqual(status['mode'], 'HOLD')
 
+    def movement_pct(self, sim, capacity_ah=1440.0):
+        energy = sim.plant.energy
+        return 100.0 * (energy.charge_ah + energy.discharge_ah) / capacity_ah
+
+    def test_hold_day_and_night_moves_the_bank_well_under_a_percent(self):
+        # E11 (repair plan section 4): the nominal HOLD day, four hours of sun
+        # then four of darkness at the target. The old release let the band
+        # fill and burn and the Quattro sit 0.15 V under the bank; the hold
+        # curtails PV at the destination and covers the loads at night.
+        from solar_priority_plant import PlantConfig
+        with self.simulation(target=60, plant_config=PlantConfig(initial_soc=60)) as sim:
+            sim.set_load(ac_w=300, dc_w=50)
+            sim.set_sun([700, 700])
+            sim.run(4 * 3600)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 3)
+            self.assertEqual(sim.solar.last_request['mode'], 'HOLD')
+            sim.set_sun([0, 0])
+            sim.run(4 * 3600)
+            movement = self.movement_pct(sim)
+            self.assertLess(movement, 0.6, 'combined movement %.3f %%' % movement)
+            self.assertAlmostEqual(sim.plant.soc, 60.0, delta=0.5)
+            self.assertTrue(sim.plant.connected)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 3)
+
+    def test_hold_on_shore_at_night_does_not_drain(self):
+        # E04: a steady small deficit under the old release cost 1.448 points
+        # in 24 h because nothing regulated the bank against its destination.
+        from solar_priority_plant import PlantConfig
+        with self.simulation(target=60, plant_config=PlantConfig(initial_soc=60)) as sim:
+            sim.set_load(ac_w=300, dc_w=50)
+            sim.set_sun([0, 0])
+            sim.run(3600)
+            lowest = highest = sim.plant.soc
+            before = sim.plant.energy.charge_ah - sim.plant.energy.discharge_ah
+            for _ in range(5):
+                sim.run(3600)
+                lowest, highest = min(lowest, sim.plant.soc), max(highest, sim.plant.soc)
+            net = sim.plant.energy.charge_ah - sim.plant.energy.discharge_ah - before
+            self.assertGreaterEqual(lowest, 59.7)
+            self.assertLessEqual(highest, 60.3)
+            self.assertLess(abs(net), 3.0, 'net %.2f Ah over five hours' % net)
+            self.assertAlmostEqual(sim.rec.batt['/RecBms/Voltage/RequestedQuattro'],
+                                   sim.rec.batt['/RecBms/Sustain/HoldVoltage'], delta=0.011)
+
+    def test_discharge_through_alternating_sun_does_not_refill(self):
+        # E08: 80 % for 60, one hour dark and one hour of 1400 W sun for eight
+        # hours put 17.684 Ah back into the bank (1.228 % reverse) because
+        # the ceiling answered only the inferred Quattro. Positive current
+        # from any source now servos the ceiling down.
+        from solar_priority_plant import PlantConfig
+        with self.simulation(target=60, plant_config=PlantConfig(initial_soc=80)) as sim:
+            sim.set_load(ac_w=300, dc_w=50)
+            sim.set_sun([0, 0])
+            self.until(sim, lambda: not sim.plant.connected)
+            self.assertEqual(sim.solar.last_request['mode'], 'DISCHARGE')
+            for hour in range(8):
+                sim.set_sun([0, 0] if hour % 2 == 0 else [700, 700])
+                sim.run(3600)
+            reverse = sim.plant.energy.charge_ah
+            self.assertLess(reverse, 4.0, 'reverse %.3f Ah' % reverse)
+            self.assertLess(sim.plant.soc, 79.0)
+
+    def test_arrival_from_charge_hands_into_the_hold(self):
+        from solar_priority_plant import PlantConfig
+        with self.simulation(target=60, plant_config=PlantConfig(initial_soc=58.2)) as sim:
+            sim.set_load(ac_w=300, dc_w=50)
+            sim.set_sun([700, 700])
+            sim.run(5)
+            self.assertEqual(sim.solar.last_request['mode'], 'CHARGE')
+            self.until(sim, lambda: sim.solar.last_request['mode'] == 'HOLD', timeout=4 * 3600)
+            self.assertEqual(sim.solar.last_request['requested_limits']['sustain'], 3)
+            arrival = sim.plant.soc
+            self.assertAlmostEqual(arrival, 59.5, delta=0.3)
+            sim.run(2 * 3600)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 3)
+            self.assertEqual(sim.solar.last_request['mode'], 'HOLD')
+            self.assertGreaterEqual(sim.plant.soc, 59.6)
+            self.assertLessEqual(sim.plant.soc, 60.4)
+
+    def test_arrival_from_discharge_returns_prepared_and_holds(self):
+        from solar_priority_plant import PlantConfig
+        with self.simulation(target=60, plant_config=PlantConfig(initial_soc=61.3)) as sim:
+            sim.set_load(ac_w=900, dc_w=50)
+            sim.set_sun([0, 0])
+            sim.run(5)
+            self.assertEqual(sim.solar.last_request['mode'], 'DISCHARGE')
+            self.until(sim, lambda: not sim.plant.connected)
+            closure = self.watch_closure(sim)
+            self.until(sim, lambda: sim.solar.last_request['mode'] == 'HOLD', timeout=4 * 3600)
+            self.assertAlmostEqual(sim.plant.soc, 60.5, delta=0.3)
+            self.until(sim, lambda: sim.plant.connected, timeout=900)
+            self.assertTrue(closure)
+            self.assertEqual(closure['request']['requested_limits']['sustain'], 3)
+            self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
+            self.assertLessEqual(closure['ccl_a'], closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
+            shore_before = sim.plant.energy.shore_charge_wh
+            sim.run(3600)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 3)
+            self.assertGreaterEqual(sim.plant.soc, 59.7)
+            self.assertLessEqual(sim.plant.soc, 60.8)
+            self.assertLess(sim.plant.energy.shore_charge_wh - shore_before, 200)
+
 
 if __name__ == '__main__':
     unittest.main()

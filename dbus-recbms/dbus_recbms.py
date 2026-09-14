@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -241,6 +241,10 @@ class Config:
         # ~0.9 A on this boat), and the hold voltage's feed-forward per
         # percent of held SOC between re-anchors
         self.sustain_drain_a = max(0.0, self._number(su.get("servo_drain_a", 0.3)))
+        # v3.2.0: the hold's current trim (see _service_sustain), a step per
+        # servo period on the destination's charge limit, bounded either way
+        self.sustain_trim_a = max(0.0, self._number(su.get("trim_step_a", 0.5)))
+        self.sustain_trim_max_a = max(0.0, self._number(su.get("trim_max_a", 3.0)))
         # v1.8.4: the dusk snap -- PV current under pv_min_a for this long,
         # after a day of sun, re-anchors the hold to the bank's own voltage
         self.sustain_dusk_s = max(0.0, self._number(su.get("dusk_s", 300)))
@@ -538,6 +542,7 @@ SUSTAIN_OFF = 0        # released: the slider's own curve applies
 SUSTAIN_FLOOR = 1      # held SOC may only rise (solar charges, shore holds)
 SUSTAIN_CEILING = 2    # held SOC may only fall (loads drain, nothing charges)
 SUSTAIN_HOLD = 3       # two-sided: the bank is kept AT the slider's target
+SUSTAIN_HOLD_MIN_A = 0.1  # the least a hold publishes at its destination
 SUSTAIN_NAMES = {SUSTAIN_FLOOR: "floor", SUSTAIN_CEILING: "ceiling",
                  SUSTAIN_HOLD: "hold"}
 
@@ -629,9 +634,18 @@ def sustain_servo(mode, err, charging, deadband, draining=True, filling=False):
             return -1
         return 0
     if mode == SUSTAIN_HOLD:
-        if err < -deadband and draining:
+        # Up whenever the bank sits under its destination, draining or not:
+        # under the hold the Quattro is capped at charge_limit_a below the
+        # target (the floor's brake), so a step up fills gently instead of
+        # winding the command ahead of a 200 A charger (the v1.8.1 case).
+        # Down only when the Quattro is the one filling it above -- the sun
+        # cannot, the current limit sees to that, and a bank the loads
+        # should bring down is not answered by starving every charger of
+        # voltage (a hold servoed under the bank left the MPPTs at 0 W for
+        # four sunny hours in the fixture, 2026-09-14).
+        if err < -deadband:
             return 1
-        if err > deadband:
+        if err > deadband and charging:
             return -1
         return 0
     if mode == SUSTAIN_CEILING and (charging or filling):
@@ -988,6 +1002,7 @@ class RecBmsDriver:
         # the SOC servo's correction included in it
         svc.add_path("/RecBms/Sustain/HoldVoltage", None, gettextcallback=v2)
         svc.add_path("/RecBms/Sustain/Servo", 0.0, gettextcallback=v2)
+        svc.add_path("/RecBms/Sustain/TrimA", 0.0, gettextcallback=fmt("A", 1))
 
         register_service(svc)
         self.batt = svc
@@ -1408,7 +1423,7 @@ class RecBmsDriver:
                 "anchor_v": None, "anchor_soc": None, "servo_v": 0.0,
                 "servo_ts": 0.0, "taper_since": 0.0, "sun_seen": False,
                 "dark_since": 0.0, "logged_soc": None,
-                "logged_servo": 0.0}
+                "logged_servo": 0.0, "trim_a": 0.0}
 
     def _live_soc(self):
         if not self._health()["Soc"]["valid"]:
@@ -1537,11 +1552,11 @@ class RecBmsDriver:
         One helper, because _tick_inner decides the lead in force and
         _service_sustain the charge target out of the same figure and they
         must not disagree. A floor gives the sun band_v while the bank is
-        under the slider. A two-sided hold gives it only while the bank is
-        more than a servo deadband UNDER its destination -- the sun may
-        finish the last bit -- and nothing at or above it, so PV is
-        curtailed at the hold voltage once the loads are covered
-        (SP23/SP28, repair plan B2). A ceiling never has one. The lead is
+        under the slider. A two-sided hold gives it always: PV has to be
+        able to reach the loads at the destination, and the surplus is
+        curtailed by the charge CURRENT limit there (_sustain_ccl), not by
+        starving the MPPTs of voltage (SP23/SP28, repair plan B2). A
+        ceiling never has one. The lead is
         a Solar Priority tool: with none in force there is no way to give
         only the MPPTs headroom, so there is none."""
         su = self.sustain
@@ -1551,8 +1566,10 @@ class RecBmsDriver:
         if su["mode"] == SUSTAIN_FLOOR:
             return max(lead_v, c.sustain_band_v) if (soc is None or soc < slider) else 0.0
         if su["mode"] == SUSTAIN_HOLD:
-            return (c.sustain_band_v if soc is not None
-                    and soc < slider - c.sustain_servo_db else 0.0)
+            # Always: PV must be able to flow to the loads at the
+            # destination, so the MPPTs keep their headroom and the CHARGE
+            # CURRENT limit is what curtails the surplus (_sustain_ccl).
+            return max(lead_v, c.sustain_band_v)
         return 0.0
 
     def _sustain_target(self, band):
@@ -1650,10 +1667,27 @@ class RecBmsDriver:
                 if d:
                     su["servo_v"] = max(-c.sustain_servo_down, min(
                         c.sustain_servo_up, su["servo_v"] + d * c.sustain_servo_v))
+                if hold:
+                    # The current trim: the destination's charge limit is
+                    # the DC support DVCC does not add itself, but the GX
+                    # rounds its allocation (whole amps for the Quattro, a
+                    # ceiling for the MPPTs' inverter compensation), so the
+                    # bank creeps a fraction of an amp either way. A voltage
+                    # step is 0.02 V / 3 mOhm = several amps, far too coarse
+                    # for that; a half-amp trim on the published limit, at
+                    # the servo's own cadence, is not. Down while the bank
+                    # is filling above its destination, up while it drains
+                    # under it; a bank above target that is not being filled
+                    # is left to the loads.
+                    err = soc - held_eff
+                    if err > c.sustain_servo_db and filling:
+                        su["trim_a"] = max(-c.sustain_trim_max_a, su["trim_a"] - c.sustain_trim_a)
+                    elif err < 0 and draining:
+                        su["trim_a"] = min(c.sustain_trim_max_a, su["trim_a"] + c.sustain_trim_a)
         # The solar band (see _sustain_band): under a floor the MPPTs get
         # band_v of headroom above the hold voltage while the bank is under
-        # the slider; under a two-sided hold only while it is a deadband
-        # under its destination, and nothing at or above it. The tick set
+        # the slider; under a two-sided hold always, the current limit
+        # doing the curtailing at the destination. The tick set
         # the lead in force from the same helper, so the Quattro is
         # commanded target - band = the hold voltage itself. The band is
         # asked for even while the offset goes unapplied (issue #3):
@@ -1723,6 +1757,7 @@ class RecBmsDriver:
         s["/RecBms/Sustain/Soc"] = round(held_eff, 1)
         s["/RecBms/Sustain/HoldVoltage"] = round(su["anchor_v"] + su["servo_v"], 2)
         s["/RecBms/Sustain/Servo"] = round(su["servo_v"], 2)
+        s["/RecBms/Sustain/TrimA"] = round(su["trim_a"], 1)
         s["/RecBms/Sustain/SecondsLeft"] = int(c.sustain_hold_s - elapsed)
         return target
 
@@ -1815,7 +1850,7 @@ class RecBmsDriver:
         self.pv_current = (a, time.monotonic())
         return True
 
-    def _sustain_ccl(self, now, held, ccl):
+    def _sustain_ccl(self, now, held, ccl, soc=None, slider=None):
         """The charge current limit to publish while a hold is in force.
 
         DVCC hands the MPPTs the whole BMS limit (plus DC loads) and the
@@ -1831,11 +1866,48 @@ class RecBmsDriver:
         c = self.cfg
         if held is None or c.sustain_ccl_a <= 0 or self.boost["active"]:
             return ccl, None
+        su = self.sustain
+        if (su["mode"] == SUSTAIN_HOLD and soc is not None and slider is not None
+                and soc >= slider - c.sustain_servo_db):
+            # At the destination the surplus is curtailed by CURRENT, not
+            # by voltage (repair plan B2: "curtail excess PV once the loads
+            # are covered"). DVCC hands the chargers this limit plus what it
+            # compensates itself -- the inverter's draw while islanded, and
+            # the DC system only when it is metered -- so the published
+            # figure is the DC load the GX does not add (about 1 A here:
+            # /Dc/System/MeasurementType 0, 58 W read 2026-09-14), or 0 A
+            # when it does. The MPPTs then carry exactly the loads and the
+            # Quattro gets whatever they cannot, into the loads and not the
+            # bank: no fill to burn back, no re-accept surge at all. With
+            # the demand unknown the floor's own cap stands in.
+            support = self._dc_support_a()
+            if support is not None:
+                # Never exactly 0: DVCC adds its DC compensation only to a
+                # positive limit, and 0 would leave the MPPTs unable to
+                # serve even the DC loads (fixture, 2026-09-14). A tenth of
+                # an amp keeps the compensation alive.
+                cap = max(SUSTAIN_HOLD_MIN_A, support + su["trim_a"])
+                return min(ccl, cap), round(cap, 1)
         a = self._fresh_pv(now)
         if a is None:
             return ccl, None
         cap = a + c.sustain_ccl_a
         return min(ccl, cap), round(cap, 1)
+
+    def _dc_support_a(self):
+        """The DC load current DVCC will not add to the chargers' allowance
+        by itself: the policy adapter's demand model says whether the DC
+        system is metered (then DVCC adds it and this is 0) or estimated
+        (then it is the estimate over the pack voltage). None without a
+        valid demand or pack voltage."""
+        adapter = getattr(self, "policy_adapter", None)
+        demand = (getattr(adapter, "last_snapshot", None) or {}).get("demand") or {}
+        volts = self.bms.get("voltage")
+        if not demand.get("valid") or not isinstance(volts, (int, float)) or volts <= 0:
+            return None
+        if demand.get("measured_dc"):
+            return 0.0
+        return max(0.0, float(demand.get("external_dc_w") or 0.0)) / float(volts)
 
     def _regulation_fault(self, now, ready):
         """A voltage pair that stays unapplied is a fault, not a wait.
@@ -2208,7 +2280,7 @@ class RecBmsDriver:
         # ---- resolve outputs ----
         if live:
             ccl, dcl, dvl = v("ccl"), v("dcl"), v("dvl")
-            ccl, applied = self._sustain_ccl(now, held, ccl)
+            ccl, applied = self._sustain_ccl(now, held, ccl, live_soc, slider)
             self._pub["/RecBms/Sustain/ChargeLimit"] = applied
         else:
             ccl, dcl, dvl = fb

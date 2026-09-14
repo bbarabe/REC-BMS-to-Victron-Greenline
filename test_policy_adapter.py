@@ -642,11 +642,14 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertLessEqual(abs(net), .5)
             self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 3)
             self.assertEqual(sim.rec.batt['/RecBms/Sustain/Soc'], 60.0)
-            # B2: the Quattro sits ON the hold, not an ordinary lead under it.
+            # B2: the Quattro sits ON the hold, not an ordinary lead under it;
+            # the MPPTs keep their band (PV must reach the loads) and the
+            # charge limit is what keeps the bank from filling.
             hold_v = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
-            self.assertEqual(sim.rec.lead_v, 0.0)
-            self.assertAlmostEqual(sim.plant.dvcc.quattro_v, hold_v, places=2)
-            self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v, places=2)
+            self.assertEqual(sim.rec.lead_v, sim.rec.cfg.sustain_band_v)
+            self.assertAlmostEqual(sim.plant.dvcc.quattro_v, hold_v, delta=.03)
+            self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v + sim.rec.cfg.sustain_band_v, delta=.03)
+            self.assertLessEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_trim_max_a)
 
     def test_a_hold_at_its_target_curtails_surplus_pv_instead_of_filling(self):
         # SP15/SP23/SP28 and plan B2: at the destination the band closes and
@@ -665,10 +668,13 @@ class AdapterBoundaryTests(unittest.TestCase):
                           **self.request_hold(sim))
             self.assertLess(max(socs), 60.6)
             self.assertGreater(sim.plant.energy.pv_curtailed_wh, curtailed + 500)
+            # curtailed by CURRENT, with the MPPT band intact so PV still
+            # carries the DC loads on shore
             hold_v = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
-            self.assertEqual(sim.rec.lead_v, 0.0)
-            self.assertAlmostEqual(sim.plant.solar_v, hold_v, places=2)
-            self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v, places=2)
+            self.assertEqual(sim.rec.lead_v, sim.rec.cfg.sustain_band_v)
+            self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v + sim.rec.cfg.sustain_band_v, delta=.03)
+            self.assertLessEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_trim_max_a)
+            self.assertGreater(sum(sim.plant.pv_w), 20)
 
     def test_a_hold_below_target_opens_the_band_and_closes_it_on_arrival(self):
         # The sun may finish the last bit: band_v of MPPT headroom over the
@@ -683,19 +689,19 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.hold_for(sim, 600, **self.request_hold(sim))
             hold_v = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
             self.assertEqual(sim.rec.lead_v, sim.rec.cfg.sustain_band_v)
-            self.assertAlmostEqual(sim.plant.base_v, hold_v, places=2)
+            self.assertAlmostEqual(sim.plant.base_v, hold_v, delta=.03)
             self.assertAlmostEqual(sim.plant.solar_v,
-                                   hold_v + sim.rec.cfg.sustain_band_v, places=2)
+                                   hold_v + sim.rec.cfg.sustain_band_v, delta=.03)
             self.assertGreater(sum(sim.plant.pv_w), 1000)
+            self.assertGreater(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_ccl_a)
             socs = []
             self.hold_for(sim, 2100, sample=lambda: socs.append(sim.plant.soc),
                           **self.request_hold(sim))
             self.assertGreaterEqual(max(socs), 59.9)
             self.assertLess(max(socs), 60.3)
-            hold_v = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
-            self.assertEqual(sim.rec.lead_v, 0.0)
-            self.assertAlmostEqual(sim.plant.solar_v, hold_v, places=2)
-            self.assertAlmostEqual(sim.plant.base_v, hold_v, places=2)
+            # arrived: the band stays, the charge limit closes
+            self.assertEqual(sim.rec.lead_v, sim.rec.cfg.sustain_band_v)
+            self.assertLessEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_trim_max_a)
 
     def test_a_descent_answers_a_refill_from_any_source(self):
         # E08/D07/SP40: alternating an hour of darkness and an hour of

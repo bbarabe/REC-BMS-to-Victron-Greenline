@@ -272,14 +272,30 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.assertAlmostEqual(batt['/RecBms/TargetChargeVoltage'],
                                hold_v + self.cfg.sustain_band_v, places=2)
         self.assertAlmostEqual(self.plant.base, hold_v, places=2)
-        # At the destination the band closes and the lead with it: every
-        # charger is commanded the hold voltage and surplus PV is curtailed.
+        # At the destination the band stays -- PV must still be able to
+        # reach the loads -- and the surplus is curtailed by current: the
+        # published CCL becomes the DC load DVCC does not compensate itself
+        # (0 A when the DC system is metered), so the Quattro sits on the
+        # hold voltage with nothing to put into the bank.
         self.driver.settings['chargeslider'] = 60
+        self.driver.policy_adapter.last_snapshot = {'demand': {
+            'valid': True, 'measured_dc': False, 'external_dc_w': 56.6}}
         self.tick()
-        self.assertEqual(self.driver.lead_v, 0.0)
-        self.assertAlmostEqual(batt['/RecBms/TargetChargeVoltage'], hold_v, places=2)
+        self.assertAlmostEqual(self.driver.lead_v, self.cfg.sustain_band_v, places=3)
+        self.assertAlmostEqual(batt['/RecBms/TargetChargeVoltage'],
+                               hold_v + self.cfg.sustain_band_v, places=2)
         self.assertAlmostEqual(self.plant.base, hold_v, places=2)
         self.assertEqual(batt['/RecBms/Sustain/Soc'], 60)
+        self.assertAlmostEqual(batt['/RecBms/Sustain/ChargeLimit'], 1.0, places=1)
+        self.assertAlmostEqual(batt['/Info/MaxChargeCurrent'], 56.6 / 56.6, places=1)
+        self.driver.policy_adapter.last_snapshot = {'demand': {
+            'valid': True, 'measured_dc': True, 'external_dc_w': 56.6}}
+        self.tick()
+        self.assertAlmostEqual(batt['/Info/MaxChargeCurrent'], R.SUSTAIN_HOLD_MIN_A, places=3)
+        # Without a valid demand the floor's own cap stands in.
+        self.driver.policy_adapter.last_snapshot = {}
+        self.tick()
+        self.assertGreater(batt['/Info/MaxChargeCurrent'], 1.0)
 
     def test_a_re_asserted_hold_keeps_its_anchor_and_refreshes_expiry(self):
         self.driver.settings['chargeslider'] = 80
@@ -473,19 +489,19 @@ class SustainPrimitiveTests(unittest.TestCase):
         db = .1
         servo = lambda err, charging, draining, filling=False: R.sustain_servo(
             self.HOLD, err, charging, db, draining, filling)
-        # Under the destination and still draining: the Quattro is not
-        # covering the loads -- up, exactly as a floor.
+        # Under the destination: up, draining or not -- the Quattro is
+        # capped at charge_limit_a under a hold, so the step fills gently.
         self.assertEqual(servo(-.5, False, True), 1)
-        # Under it but not draining: solar is raising the bank, which is the
-        # band's job. Never fought (SP15/SP38).
-        self.assertEqual(servo(-.5, False, False), 0)
-        self.assertEqual(servo(-.5, False, False, True), 0)
-        # Above it: down from ANY source -- the sun, the Quattro, or simply
-        # a bank at night the loads should be allowed to bring down (E04).
-        self.assertEqual(servo(.5, False, False), -1)
+        self.assertEqual(servo(-.5, False, False), 1)
+        self.assertEqual(servo(-.5, False, False, True), 1)
+        # Above it: down only when the Quattro is the one filling it. The
+        # sun cannot fill a hold at its destination (the current limit
+        # curtails it) and a bank the loads should bring down is not
+        # answered by starving the MPPTs of voltage.
         self.assertEqual(servo(.5, True, False), -1)
-        self.assertEqual(servo(.5, False, False, True), -1)
-        self.assertEqual(servo(.5, False, True), -1)
+        self.assertEqual(servo(.5, False, False), 0)
+        self.assertEqual(servo(.5, False, False, True), 0)
+        self.assertEqual(servo(.5, False, True), 0)
         # Inside the deadband nothing moves either way.
         self.assertEqual(servo(.05, False, True), 0)
         self.assertEqual(servo(-.05, True, True), 0)
