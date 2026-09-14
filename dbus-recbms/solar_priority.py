@@ -24,7 +24,7 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 ENGINE_VERSION = "4.17-restored"
 BUSITEM = "com.victronenergy.BusItem"
 
@@ -195,6 +195,8 @@ WRITE_PATHS = {
 
 
 class SolarPriorityDriver:
+    REQUEST_FAILURES_TO_SHORE = 3   # consecutive refusals before the engine stands down
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.now0 = time.time()
@@ -221,6 +223,7 @@ class SolarPriorityDriver:
         # backoff, and the first request id that carried it.
         self.failed_probe = False
         self.failed_probe_id = None
+        self.failed_requests = 0
         self.sbus = _bus()
 
         self._init_settings()
@@ -562,7 +565,7 @@ class SolarPriorityDriver:
             except Exception as exc:
                 failed(exc)
 
-    def _write(self, cls, instance, path, value, what, on_error=None):
+    def _write(self, cls, instance, path, value, what, on_error=None, on_ok=None):
         name = self._svc(cls, instance)
         if name is None:
             if on_error:
@@ -575,6 +578,8 @@ class SolarPriorityDriver:
         def replied(code):
             if code != 0:
                 failed('SetValue returned %s' % code)
+            elif on_ok:
+                on_ok()
         try:
             self.monitor.set_value_async(name, path, value, reply_handler=replied,
                                          error_handler=failed)
@@ -608,8 +613,21 @@ class SolarPriorityDriver:
         raise SystemExit(0)
 
     def _request_failed(self, error):
+        # 3.4.1: one refused request is not a reason to abandon the island.
+        # A slider move refuses the next request as "target does not match
+        # REC slider" for the tick or two before /RecBms/TargetSoc catches
+        # up (boat, 2026-09-14 22:18 UTC: 60 -> 50 while islanded forced
+        # the engine to shore and closed the relay on the old pair). REC
+        # itself keeps a revoked lease's island through its grace and
+        # returns prepared on its own if the lease really is gone, so the
+        # engine stands down only after several refusals in a row.
         self.last_limited_by = str(error)
-        self.engine.force_shore(self._ms())
+        self.failed_requests += 1
+        if self.failed_requests >= self.REQUEST_FAILURES_TO_SHORE:
+            self.engine.force_shore(self._ms())
+
+    def _request_accepted(self):
+        self.failed_requests = 0
 
     # ----------------------------------------------------------------- tick
     def _tick(self):
@@ -721,7 +739,7 @@ class SolarPriorityDriver:
                     request['requested_limits']['boost_v'] = out.boost_v
                 self.last_request = request
                 self._write('battery', self.cfg.battery_instance, '/RecBms/Policy/Request',
-                            dumps(request), 'policy', self._request_failed)
+                            dumps(request), 'policy', self._request_failed, self._request_accepted)
             elif self.last_request:
                 self._shutdown()
         except Exception as exc:

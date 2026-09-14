@@ -643,6 +643,15 @@ class RecPolicyAdapter:
                 # envelope is still checked below.
                 protective = False
                 grace = True
+                if intent == 'protect':
+                    # No lease to carry an intent through the grace (a
+                    # slider move revokes it for the tick or two the
+                    # consumer needs to re-request): keep what the bank is
+                    # doing. On the boat, 2026-09-14 22:18 UTC, a target
+                    # change on an island closed the relay on the old pair
+                    # within two seconds because 'protect' bypassed both
+                    # the grace and the prepared wait.
+                    intent = 'island' if connected is False else 'connected'
             else:
                 grace = False
             if protective and not urgent:

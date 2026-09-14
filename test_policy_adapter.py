@@ -756,6 +756,25 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertLessEqual(closure['ccl_a'], closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
             self.assertTrue(self.status(sim)['transfer']['prepared'])
 
+    def test_a_target_change_on_the_island_does_not_move_the_relay(self):
+        # Boat, 2026-09-14 22:18 UTC: the slider moved 60 -> 50 while islanded
+        # in CHARGE. The lease was revoked for the tick the consumer needed
+        # to re-request, and the 'protect' intent bypassed both the grace
+        # and the prepared wait: the relay closed on the old pair within two
+        # seconds (Quattro +820 W). A revoked lease keeps the island through
+        # the grace; the consumer's fresh request then carries on.
+        with self.simulation(target=80) as sim:
+            self.wait_for(sim, lambda: not sim.plant.connected)
+            sim.run(60)
+            edges = len(sim.plant.relay_edges)
+            sim.set_target(70)
+            sim.run(30)
+            self.assertFalse(sim.plant.connected)
+            self.assertEqual(len(sim.plant.relay_edges), edges)
+            self.assertEqual(sim.solar.last_request['target_soc'], 70.0)
+            self.assertTrue(self.status(sim)['lease_valid'])
+            self.assertEqual(self.status(sim)['transfer']['state'], 'ISLANDED')
+
     def test_off_returns_prepared_under_the_hold_and_then_relinquishes(self):
         # Stage C / D13: OFF must carry release in the request, but the
         # relay may not close on the slider CVL; the floor is kept through
