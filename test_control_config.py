@@ -167,23 +167,31 @@ class ConsumerConfigurationTests(unittest.TestCase):
                 self.assertEqual(self.parse(uncommented).engine[key.upper()], float(value))
 
     def test_accepted_full_configuration_never_requests_a_floor_under_complete_full(self):
+        # Issue #7, restated for 4.16 (master D12): toward a full target the
+        # consumer sends CHARGE with the floor; only the arrival maps to
+        # COMPLETE_FULL, and that request must carry release.
         from policy_contract import PolicyContract, VERSION
         for full in (100, 95):
-            engine = SP.Engine(dict(SP.ENGINE_DEFAULTS, ONEWAY_FULL_PCT=full), 0)
-            inputs = SP.Inputs()
-            inputs.enabled = True
-            for name in ('soc', 'batt', 'load_now', 'load_avg', 'load_slow', 'feed', 'ac_out',
-                         'batt_v', 'cvl', 'quattro_w', 'demand_avg', 'demand_slow', 'demand_margin'):
-                setattr(inputs, name, SP.Val({'soc': 60., 'feed': 0., 'batt_v': 56.4, 'cvl': 56.42}.get(name, 100.), 1000))
-            inputs.target_soc = SP.Val(100., 1000)
-            out = engine.tick(1000, inputs)
-            contract = PolicyContract(generation='g')
-            request = dict(version=VERSION, generation='g', request_id=1, mode='COMPLETE_FULL',
-                           target_soc=100., transfer_intent='connected', lease_s=15.,
-                           requested_limits={'sustain': {'release': 0, 'floor': 1, 'ceiling': 2}[out.charge_intent]})
-            with self.subTest(full=full):
-                self.assertEqual(out.charge_intent, 'release')
-                self.assertTrue(contract.accept(request, 0, 100., consumer_ready=True), contract.rejection)
+            for soc, expected_mode, expected_intent in ((60., 'CHARGE', 'floor'),
+                                                        (99.6, 'COMPLETE_FULL', 'release')):
+                engine = SP.Engine(dict(SP.ENGINE_DEFAULTS, ONEWAY_FULL_PCT=full), 0)
+                inputs = SP.Inputs()
+                inputs.enabled = True
+                for name in ('soc', 'batt', 'load_now', 'load_avg', 'load_slow', 'feed', 'ac_out',
+                             'batt_v', 'cvl', 'quattro_w', 'demand_avg', 'demand_slow', 'demand_margin'):
+                    setattr(inputs, name, SP.Val({'soc': soc, 'feed': 0., 'batt_v': 56.4, 'cvl': 56.42}.get(name, 100.), 1000))
+                inputs.target_soc = SP.Val(100., 1000)
+                out = engine.tick(1000, inputs)
+                # the consumer's mapping (solar_priority.py): one-way first, the endgame at arrival
+                mode = ({'charge': 'CHARGE', 'discharge': 'DISCHARGE'}.get(out.oneway) or
+                        ('COMPLETE_FULL' if 100. >= full else 'HOLD'))
+                contract = PolicyContract(generation='g')
+                request = dict(version=VERSION, generation='g', request_id=1, mode=mode,
+                               target_soc=100., transfer_intent='connected', lease_s=15.,
+                               requested_limits={'sustain': {'release': 0, 'floor': 1, 'ceiling': 2, 'hold': 3}[out.charge_intent]})
+                with self.subTest(full=full, soc=soc):
+                    self.assertEqual((mode, out.charge_intent), (expected_mode, expected_intent))
+                    self.assertTrue(contract.accept(request, 0, 100., consumer_ready=True), contract.rejection)
 
 
 if __name__ == '__main__':

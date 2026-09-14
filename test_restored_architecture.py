@@ -181,10 +181,31 @@ class RestoredPlantTests(unittest.TestCase):
             self.assertTrue(sim.plant.connected)
             self.assertEqual(sim.solar.last_request['requested_limits']['sustain'], 1)
 
-    def test_full_target_releases_floor_and_ceiling(self):
-        with self.simulation(target=100) as sim:
+    def test_full_target_is_one_way_charge_until_arrival_then_the_endgame(self):
+        # Owner, 2026-09-14 (master D12): 100 % does NOT mean shore bulk. At
+        # night from 60 % the floor holds and shore only sustains; at 99.7 %
+        # the endgame commands both chargers the true full voltage, no lead.
+        from solar_priority_plant import BASE, PlantConfig
+        with self.simulation(target=100, plant_config=PlantConfig(initial_soc=60)) as sim:
+            sim.set_sun([0, 0])
+            sim.run(1200)
+            request = sim.solar.last_request
+            self.assertEqual((request['mode'], request['requested_limits']['sustain']), ('CHARGE', 1))
+            self.assertLess(sim.plant.energy.shore_charge_wh, 150)
+            self.assertLess(sim.plant.soc, 60.5)
+            self.assertAlmostEqual(sim.rec.batt['/RecBms/TargetChargeVoltage'],
+                                   sim.rec.batt['/RecBms/Sustain/HoldVoltage'] + sim.rec.cfg.sustain_band_v,
+                                   delta=.011)
+        with self.simulation(target=100, plant_config=PlantConfig(initial_soc=99.7)) as sim:
+            sim.set_sun([0, 0])
             sim.run(100)
-            self.assertEqual(sim.solar.last_request['requested_limits']['sustain'], 0)
+            request = sim.solar.last_request
+            self.assertEqual((request['mode'], request['requested_limits']['sustain']), ('COMPLETE_FULL', 0))
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Active'], 0)
+            full = min(sim.rec.cfg.cvl_max, sim.rec._safe_voltage())
+            self.assertAlmostEqual(sim.rec.batt['/RecBms/Voltage/RequestedQuattro'], full, delta=.011)
+            self.assertAlmostEqual(sim.rec.batt['/RecBms/Voltage/RequestedSolar'], full, delta=.011)
+            self.assertEqual(sim.rec.batt['/RecBms/SolarLead'], 0.0)
 
     def test_missing_quattro_current_on_shore_keeps_charge_and_its_floor(self):
         # E02: night CHARGE at 80 %; losing Quattro DC current used to produce a

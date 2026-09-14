@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -555,8 +555,11 @@ def standing_lead(lead_v, slider, full_pct, sp_enabled, needs_sp=True):
     """The solar lead in force this tick (v1.7.0). The lead is a Solar
     Priority tool: it keeps the Quattro under the target so the MPPTs have
     headroom on shore. Without Solar Priority, or with the Max Charge slider
-    at full_pct, the owner wants the bank FULL from whatever is charging,
-    so the Quattro gets the true target and the offset is dropped."""
+    at full_pct, the Quattro gets the true target and the offset is dropped:
+    the owner's endgame is 61.96 V for BOTH chargers, not 61.96 less a lead
+    (2026-09-14). That is the standing lead only; a floor's or hold's band
+    is decided from the mechanism's availability (_sustain_band), so a
+    one-way charge toward a full target still gets its solar band."""
     if lead_v <= 0:
         return 0.0
     if slider >= full_pct:
@@ -1546,7 +1549,7 @@ class RecBmsDriver:
         log.info("sustain %s re-anchored %.2fV -> %.2fV (%s)",
                  name, hold_v, su["anchor_v"], why)
 
-    def _sustain_band(self, lead_v, soc, slider):
+    def _sustain_band(self, available, soc, slider):
         """The MPPTs' headroom over the hold voltage this tick, in volts.
 
         One helper, because _tick_inner decides the lead in force and
@@ -1556,20 +1559,24 @@ class RecBmsDriver:
         able to reach the loads at the destination, and the surplus is
         curtailed by the charge CURRENT limit there (_sustain_ccl), not by
         starving the MPPTs of voltage (SP23/SP28, repair plan B2). A
-        ceiling never has one. The lead is
-        a Solar Priority tool: with none in force there is no way to give
-        only the MPPTs headroom, so there is none."""
+        ceiling never has one. `available` says whether the lead
+        mechanism (systemcalc's solar offset, a Solar Priority tool) can be
+        used at all; with it unavailable there is no way to give only the
+        MPPTs headroom, so there is none. The standing lead's own full-
+        target rule does not apply here: a one-way charge toward 100 %
+        keeps its band, and only the arrival (COMPLETE_FULL, no hold) puts
+        both chargers on the true target (owner, 2026-09-14)."""
         su = self.sustain
         c = self.cfg
-        if not su["active"] or lead_v <= 0:
+        if not su["active"] or not available:
             return 0.0
         if su["mode"] == SUSTAIN_FLOOR:
-            return max(lead_v, c.sustain_band_v) if (soc is None or soc < slider) else 0.0
+            return c.sustain_band_v if (soc is None or soc < slider) else 0.0
         if su["mode"] == SUSTAIN_HOLD:
             # Always: PV must be able to flow to the loads at the
             # destination, so the MPPTs keep their headroom and the CHARGE
             # CURRENT limit is what curtails the surplus (_sustain_ccl).
-            return max(lead_v, c.sustain_band_v)
+            return c.sustain_band_v
         return 0.0
 
     def _sustain_target(self, band):
@@ -1696,7 +1703,7 @@ class RecBmsDriver:
         # get the hold voltage, which is the restrictive outcome, and the
         # fault reports it. A ceiling has no band, but lets the bank charge
         # back up to the slider's own point if it is under it.
-        band = self._sustain_band(self.lead_v, soc, slider)
+        band = self._sustain_band(getattr(self, 'band_available', False), soc, slider)
         target = self._sustain_target(band)
         if not floor and not hold and soc is not None and soc < slider:
             target = max(target, round(self._slider_cvl(slider), 2))
@@ -2241,7 +2248,8 @@ class RecBmsDriver:
         # leaving the standing 0.15 V in force at the destination would put
         # the Quattro that much UNDER the hold -- the very thing repair
         # plan B2 warns about, and what drained 1.448 points in 24 h (E04).
-        band = self._sustain_band(self.lead_v, live_soc, slider)
+        self.band_available = bool(c.solar_lead > 0 and (not c.lead_needs_sp or self.sp_enabled))
+        band = self._sustain_band(self.band_available, live_soc, slider)
         if self.sustain["active"] and self.sustain["mode"] == SUSTAIN_HOLD:
             self.lead_v = band
         else:

@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.15")
+check("engine version bumped", SP.ENGINE_VERSION == "4.16")
 Val = SP.Val
 
 
@@ -307,23 +307,24 @@ s.tick(1, soc=60, target=95, batt_v=56.4)
 s.tick(340, pv=0.0, m=1, batt=250.0, load=178.0)                   # bank +250 W from the Quattro
 check("the Quattro charging still does", s.state == "shore" and "[chg +250W]" in s.out.status_text, s.out.status_text)
 
-# ---- 4.5: 100 % means a full charge from every charger, not one-way ----
+# ---- 4.16: a full target is one-way charge until arrival, then the endgame ----
 s = Sim()
 s.tick(1, soc=60, target=100)
-check("full: 60 -> 100 does not engage one-way", s.oneway is None and s.out.oneway == "")
-check("full: no floor ever asked for", s.sustains == [])
-s.tick(335, batt_v=56.4)
-check("full: the normal engine probes as usual", s.state == "probe")
-s.tick(1, target=90)
-check("full: 90 engages", s.oneway == "charge")
-s.tick(1, target=100)
-check("full: back to 100 stands one-way down", s.oneway is None and
-      any("done (target 100% is a full charge: every charger at its maximum)" in l for l in s.logs),
-      str(s.logs[-1:]))
+check("full: 60 -> 100 engages one-way charge (not a shore bulk)", s.oneway == "charge")
+check("full: the floor is asked for on shore", s.sustain == 1)
+s.tick(335, batt_v=56.4, pv=0.0, m=0, voc=10.0)                     # night: nothing to probe
+check("full: shore only sustains while the sun cannot carry the load", s.state == "shore" and s.sustain == 1)
+s.tick(1, soc=99.6, batt_v=61.9, cvl=61.96)
+check("full: arrival within EXIT of 100 is the endgame: no hold", s.oneway is None and s.sustain == 0
+      and s.out.charge_intent == "release" and any("COMPLETE_FULL" in l for l in s.logs), str(s.logs[-1:]))
+s.tick(1, soc=99.2)
+check("full: inside the band the endgame stands", s.oneway is None and s.sustain == 0)
+s.tick(1, soc=98.9)
+check("full: more than a point under, one-way charge again with its floor", s.oneway == "charge" and s.sustain == 1)
 s = Sim(ONEWAY_FULL_PCT=0)
 s.tick(1, soc=60, target=100)
-check("full: oneway_full_pct = 0 restores the 4.4 behaviour in the engine alone (the consumer refuses it, #7)",
-      s.oneway == "charge")
+check("full: oneway_full_pct = 0 makes every target an endgame target in the engine alone (the consumer refuses it, #7)",
+      s.oneway == "charge" and s.sustain == 1)
 
 # ---- 4.5: no floor while the Quattro is not actually on shore ----
 s = Sim()
@@ -406,7 +407,8 @@ check("4.6: without one-way, 30 % still stays on shore", s.state == "shore", s.s
 s = Sim()
 s.tick(1, soc=35.0, target=100, batt_v=54.9, cvl=55.2)
 s.tick(340)
-check("4.6: a full charge (100 %) is not one-way and keeps min_soc", s.state == "shore", s.state)
+check("4.16: a full target is one-way charge, so 35 % may leave shore on the one-way gate",
+      s.oneway == "charge" and s.state != "shore", s.state)
 
 # ---- 4.9: no measurement boost while both arrays are unthrottled ----
 s = Sim()

@@ -24,8 +24,8 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.2.0"
-ENGINE_VERSION = "4.15-restored"
+VERSION = "3.3.0"
+ENGINE_VERSION = "4.16-restored"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -704,9 +704,11 @@ class SolarPriorityDriver:
                     self.failed_probe, self.failed_probe_id = False, None
                 if self.failed_probe and self.failed_probe_id is None:
                     self.failed_probe_id = self.request_id
+                # 3.3.0 (master D12): a full target is one-way CHARGE until the
+                # bank arrives; COMPLETE_FULL is the endgame at arrival only.
                 mode = ('OFF' if not self.inp.enabled else
-                        'COMPLETE_FULL' if target >= 100 else
-                        {'charge': 'CHARGE', 'discharge': 'DISCHARGE'}.get(out.oneway, 'HOLD'))
+                        {'charge': 'CHARGE', 'discharge': 'DISCHARGE'}.get(out.oneway) or
+                        ('COMPLETE_FULL' if target >= self.cfg.engine['ONEWAY_FULL_PCT'] else 'HOLD'))
                 purpose = ('failed_probe' if self.failed_probe else
                            'probe' if out.state == 'probe' else
                            'descent' if out.oneway == 'discharge' else 'solar')

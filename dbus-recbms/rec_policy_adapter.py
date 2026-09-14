@@ -670,7 +670,7 @@ class RecPolicyAdapter:
         ledger = self.ledger.snapshot(compact=True)
         public_ledger = {k: ledger[k] for k in ('total', 'overhead', 'references', 'budget', 'reverse', 'buffer',
                                                'net_wh', 'net_ah', 'gap_count', 'complete_history', 'capacity_version', 'calendar_days', 'recovery')}
-        snapshot = {'version': 2, 'implementation_version': '3.2.0',
+        snapshot = {'version': 2, 'implementation_version': '3.3.0',
                     'configuration_id': self.configuration_id, 'shore_ac_input': self.driver.cfg.policy_ac_input,
                     'wall_s': wall, 'sample_monotonic_s': stamp,
                     'support_coherent': actuators['support_coherent'],

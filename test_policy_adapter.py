@@ -119,7 +119,7 @@ class AdapterBoundaryTests(unittest.TestCase):
                     self.assertLessEqual(max(row['battery_w'] for row in sim.trace[start:]), 1.0)
 
     def test_off_and_full_policy_paths_obey_raw_charge_voltage_guard(self):
-        for enabled, soc, expected_mode in ((False, 60, 'OFF'), (True, 98, 'COMPLETE_FULL'),
+        for enabled, soc, expected_mode in ((False, 60, 'OFF'), (True, 99.7, 'COMPLETE_FULL'),
                                             (True, 100, 'COMPLETE_FULL')):
             with self.subTest(mode=expected_mode), self.simulation(
                     target=100, enabled=enabled, plant_config=PlantConfig(initial_soc=soc)) as sim:

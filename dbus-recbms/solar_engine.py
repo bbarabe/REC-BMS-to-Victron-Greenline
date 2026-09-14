@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.15"
+ENGINE_VERSION = "4.16"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -65,13 +65,16 @@ ENGINE_DEFAULTS = {
     # mean below -50 W reconnects; on shore the floor holds the bank flat
     # and every watt of sun still goes in through the solar band.
     "ONEWAY_DEFICIT_W": 50, "ONEWAY_DEFICIT_MS": 180000,
-    # 4.5: a target at or above this is a request for a FULL charge from
-    # every charger at its maximum, so one-way charge never engages there
+    # 4.5 made a target at or above this a full charge from every charger
     # (2026-09-06: at 100 % the floor held the Quattro at the present SOC
-    # and only solar could move the bank -- it could never get full). 0 = off
-    # in the engine alone; the consumer refuses 0 and anything above 100 at
-    # startup, since the protocol maps a 100 % target to COMPLETE_FULL,
-    # which must release sustain (issue #7).
+    # and, with no solar band at the full slider, only solar could move
+    # the bank -- it could never get full). 4.16 (owner, 2026-09-14): a
+    # full target is NOT a shore bulk charge. One-way charge runs toward it
+    # like toward any target -- the floor now keeps its band at 100 % --
+    # and arrival within ONEWAY_EXIT_PCT of a target at/above this is the
+    # endgame: no hold, the consumer maps it to COMPLETE_FULL, and both
+    # chargers get the true 61.96 V. The consumer refuses 0 and anything
+    # above 100 at startup (issue #7).
     "ONEWAY_FULL_PCT": 100,
     # 4.6: the SOC floor for LEAVING shore and staying on solar while
     # charging one-way. MIN_SOC (40) and SOC_EMERGENCY (30) protect a bank
@@ -527,9 +530,9 @@ class Engine:
         # the charging; or nothing charges and the loads do the draining.
         tgt = inp.target_soc
         oneway = st["oneway"]
-        # 4.5: at (or above) ONEWAY_FULL_PCT the slider asks for a full
-        # charge from everything -- the Quattro at its full CVL too, not a
-        # floor -- so the feature stands aside.
+        # At (or above) ONEWAY_FULL_PCT the arrival is the endgame (4.16):
+        # no hold there, COMPLETE_FULL puts every charger on the true
+        # target. The objective itself is judged like any other.
         full = (tgt is not None and t["ONEWAY_FULL_PCT"] > 0
                 and tgt.v >= t["ONEWAY_FULL_PCT"])
         # The objective is judged on the target and the SOC alone. A missing
@@ -540,7 +543,14 @@ class Engine:
         # charger the full slider under a fresh HOLD/release lease (E02:
         # 56.42 V / 5 A became 59.34 V / 200 A). With no SOC at all the
         # last objective stands as well.
-        if not enabled or tgt is None or full:
+        # 4.16 (owner, 2026-09-14, master D12): a full target is NOT a shore
+        # bulk charge. One-way charge runs toward 100 % like toward any
+        # other target -- solar charges, shore only sustains -- and the
+        # endgame begins at arrival: the consumer maps it to COMPLETE_FULL,
+        # which releases every hold so both chargers get the true 61.96 V
+        # (no lead under it) and the Quattro finishes and keeps it there.
+        # A fast charge from shore is Solar Priority switched off.
+        if not enabled or tgt is None:
             oneway = None
         elif soc is not None:
             oneway = select_objective(oneway, tgt.v, soc.v,
@@ -558,7 +568,7 @@ class Engine:
                 elif tgt is None:
                     why = "no Max Charge target"
                 elif full:
-                    why = "target %.0f%% is a full charge: every charger at its maximum" % tgt.v
+                    why = "SOC %.1f%% at the full target: COMPLETE_FULL, every charger at 61.96 V" % soc.v
                 else:
                     why = "SOC %.1f%% at target %.0f%%" % (soc.v, tgt.v)
                 self.log("ONE-WAY %s done (%s); normal engine resumes" % (st["oneway"], why))
