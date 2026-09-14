@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Physical relay acknowledgments are separate from charger settling."""
+"""Physical relay acknowledgments are separate from charger settling.
+
+Stage A adds the three facts the supervisor used to conflate: availability,
+the Quattro's acknowledgment of the ignore command, and the accepted input.
+"""
 import sys
 from pathlib import Path
 import unittest
@@ -79,6 +83,125 @@ class TransferBoundaryTests(unittest.TestCase):
         supervisor.observe(True, 33, 1033)
         self.assertEqual(supervisor.departure_reason(334, 1334), 'transfer fault lockout')
         self.assertGreater(supervisor.durable['fault_until'], supervisor.durable['logical_s'])
+
+    def test_ordinary_return_waits_for_the_exact_prepared_pair(self):
+        # D02/A1: an islanded ordinary return used to be admitted on general
+        # envelope safety, so the relay could close before the below-pack
+        # command and the current brake were in force (E03).
+        supervisor = self.connected()
+        self.assertEqual(self.step(supervisor, 300), 1)
+        supervisor.observe(False, 302, 1302)
+        self.assertEqual(supervisor.state, 'ISLANDED')
+        self.assertIsNone(self.step(supervisor, 303, 'connected', ready=False))
+        self.assertEqual(supervisor.limited_by, 'preparing shore protection')
+        self.assertIsNone(supervisor.prepared)
+        self.assertEqual(supervisor.snapshot(310, 1310)['prepare_age_s'], 7)
+        self.assertEqual(self.step(supervisor, 311, 'connected', ready=True), 0)
+        self.assertTrue(supervisor.prepared)
+        self.assertIsNone(supervisor.snapshot(311, 1311)['prepare_age_s'])
+        self.assertEqual(supervisor.durable['fault_until'], 0)
+
+    def test_bounded_preparation_returns_unprepared_rather_than_stalling(self):
+        # A3: one bounded wait, then the return happens anyway. Not a fault:
+        # the unverified pair is already reported by dbus-recbms' regulation
+        # fault, and REC's own guards still decide the current.
+        supervisor = self.connected(prepare_s=30.0)
+        self.assertEqual(self.step(supervisor, 300), 1)
+        supervisor.observe(False, 302, 1302)
+        for now in (303, 320, 332):
+            self.assertIsNone(self.step(supervisor, now, 'connected', ready=False))
+            self.assertEqual(supervisor.limited_by, 'preparing shore protection')
+        self.assertEqual(self.step(supervisor, 333, 'connected', ready=False), 0)
+        self.assertIs(supervisor.prepared, False)
+        self.assertEqual(supervisor.limited_by, 'unprepared return after 30s')
+        self.assertEqual(supervisor.durable['fault_until'], 0)
+        self.assertIsNone(supervisor.durable['last_fault'])
+
+    def test_protective_and_island_intents_never_enter_the_preparation_wait(self):
+        for intent, protective in (('protect', False), ('connected', True)):
+            with self.subTest(intent=intent, protective=protective):
+                supervisor = self.connected()
+                self.assertEqual(self.step(supervisor, 300), 1)
+                supervisor.observe(False, 302, 1302)
+                self.assertEqual(supervisor.step(intent, 303, 1303, ready=False,
+                                                 permitted=False, protective=protective), 0)
+                self.assertIsNone(supervisor.prepare_since)
+
+    def test_absent_shore_is_an_observation_not_a_refused_relay_write(self):
+        # E13/D14: a connect command with persistently disconnected feedback
+        # produced a 31 s timeout and a 3600 s lockout; absent shore looks
+        # exactly like that and must not take one.
+        supervisor = self.connected()
+        self.assertEqual(self.step(supervisor, 300), 1)
+        supervisor.observe(False, 302, 1302, available=False, ignore_state=1)
+        self.assertEqual(self.step(supervisor, 303, 'connected'), 0)
+        for now in (304, 320, 333):
+            supervisor.observe(False, now, 1000 + now, available=False, ignore_state=0)
+            self.step(supervisor, now, 'connected')
+        self.assertEqual(supervisor.limited_by, 'shore unavailable')
+        self.assertEqual(supervisor.durable['fault_until'], 0)
+        self.assertIsNone(supervisor.durable['last_fault'])
+        self.assertIs(supervisor.snapshot(333, 1333)['available'], False)
+        # The tick the supply reappears the command is asserted again at once.
+        supervisor.observe(False, 334, 1334, available=True, ignore_state=0)
+        self.assertEqual(self.step(supervisor, 334, 'connected'), 0)
+
+    def test_feedback_timeout_names_the_stage_that_actually_failed(self):
+        # SP63: absent supply, an unacknowledged command and an acknowledged
+        # command whose input never arrives are three different diagnoses.
+        for ignore_state, reason in ((None, 'relay feedback timeout'),
+                                     (0, 'relay command not acknowledged'),
+                                     (1, 'relay command acknowledged, AC input not accepted')):
+            with self.subTest(ignore_state=ignore_state):
+                supervisor = self.connected()
+                self.assertEqual(self.step(supervisor, 300), 1)
+                supervisor.observe(True, 320, 1320, available=True, ignore_state=ignore_state)
+                self.assertEqual(self.step(supervisor, 331), 0)
+                self.assertEqual(supervisor.durable['last_fault']['reason'], reason)
+
+    def test_another_accepted_input_is_not_an_island_and_blocks_departure(self):
+        # SP56: "not AC1" alone is not proof of inverter-only operation.
+        supervisor = self.connected()
+        self.assertEqual(self.step(supervisor, 300), 1)
+        supervisor.observe(False, 302, 1302, available=True, ignore_state=1)
+        self.assertEqual(supervisor.state, 'ISLANDED')
+        supervisor.observe(False, 303, 1303, available=True, ignore_state=1, active_input=1)
+        self.assertNotEqual(supervisor.state, 'ISLANDED')
+        self.assertEqual(supervisor.departure_reason(304, 1304), 'another AC input accepted')
+        self.assertIsNone(self.step(supervisor, 305))
+        snapshot = supervisor.snapshot(305, 1305)
+        self.assertEqual(snapshot['active_input'], 1)
+        self.assertIs(snapshot['connected'], False)
+
+    def test_command_acknowledgment_is_distinct_from_input_acceptance(self):
+        # SP62: the command, its acknowledgment and the physical transfer get
+        # their own timestamps; only the last one proves a transfer happened.
+        supervisor = self.connected()
+        self.assertEqual(self.step(supervisor, 300), 1)
+        supervisor.observe(True, 301, 1301, available=True, ignore_state=0, active_input=0)
+        self.assertFalse(supervisor.snapshot(301, 1301)['acknowledged'])
+        supervisor.observe(True, 302, 1302, available=True, ignore_state=1, active_input=0)
+        snapshot = supervisor.snapshot(302, 1302)
+        self.assertTrue(snapshot['acknowledged'])
+        self.assertEqual(snapshot['acknowledged_at'], 302)
+        self.assertEqual(snapshot['command_at'], 300)
+        self.assertIsNone(snapshot['accepted_at'])
+        self.assertIsNone(snapshot['transition_age_s'])
+        supervisor.observe(False, 303, 1303, available=True, ignore_state=1)
+        snapshot = supervisor.snapshot(304, 1304)
+        self.assertEqual(snapshot['accepted_at'], 303)
+        self.assertEqual(snapshot['transition_age_s'], 1)
+        self.assertEqual(supervisor.durable['last_departure_s'], 303)
+
+    def test_old_state_files_load_without_the_stage_a_keys(self):
+        supervisor = TransferSupervisor({'departures': [10.0], 'edges': [], 'fault_until': 0.0,
+                                         'backoff_until': 0.0, 'failures': 2,
+                                         'external_edges': 1, 'logical_s': 20.0,
+                                         'last_wall_s': 1000.0, 'last_fault': None})
+        self.assertEqual(supervisor.durable['probe_failures'], [])
+        self.assertIsNone(supervisor.durable['last_departure_s'])
+        self.assertIsNone(supervisor.durable['last_failed_departure'])
+        self.assertEqual(supervisor.snapshot(0, 1000)['departures_24h'], 1)
 
     def test_target_change_revokes_request_even_when_policy_mode_is_unchanged(self):
         contract = PolicyContract(generation='test')

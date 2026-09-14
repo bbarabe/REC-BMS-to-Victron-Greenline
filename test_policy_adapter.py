@@ -10,8 +10,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / 'dbus-recbms'))
 import unittest
 
-from solar_priority_plant import CCL, IGNORE, SYSTEM, VEBUS, CoupledSimulation, PlantConfig
+from solar_priority_plant import BASE, CCL, IGNORE, SYSTEM, VEBUS, CoupledSimulation, Latency, PlantConfig
 from control_inputs import SourceRegistry, TimedMean, LoadServiceEvidence, DemandModel
+from energy_accounting import EnergyLedger
+from policy_contract import PolicyContract, TransferSupervisor, VERSION, dumps
 from rec_policy_adapter import RecPolicyAdapter
 from types import SimpleNamespace
 
@@ -344,7 +346,12 @@ class AdapterBoundaryTests(unittest.TestCase):
                 saved = json.loads(Path(adapter.ledger.path).read_text())['controller_state']['transfer']
                 self.assertGreater(saved['fault_until'], saved['logical_s'])
                 self.assertEqual(saved['last_fault']['command'], 1)
-                self.assertIn('refused' if outcome == 'refusal' else 'timeout', saved['last_fault']['reason'])
+                # SP63: a refused write, an unacknowledged command and an
+                # acknowledged command whose input never arrives are distinct
+                # diagnoses. Here the Quattro still reports IgnoreAcIn1 = 0
+                # against a pending departure, so the command was not taken.
+                self.assertIn('refused' if outcome == 'refusal' else 'not acknowledged',
+                              saved['last_fault']['reason'])
 
     def begin_shortfall_probe(self, sim):
         # HOLD clips connected PV to DC demand; this deficit fits the existing
@@ -408,6 +415,351 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertTrue(any(write['path'] == IGNORE and write['value'] == 0
                                 for write in sim.bus.writes))
 
+    # ------------------------------------------------ stage A: prepared return
+    def drive_policy(self, sim, intent='connected', purpose='solar', sustain=1):
+        """Write one leased request directly, with no consumer in the loop.
+
+        The engine agent owns solar_priority.py; these cases have to exercise
+        REC's own transfer sequence against arbitrary protocol requests, so the
+        request is written straight to the writeable protocol path.
+        """
+        status = self.status(sim)
+        self.request_id = max(getattr(self, 'request_id', 0), status['accepted_id']) + 1
+        request = {'version': 2, 'generation': status['generation'],
+                   'request_id': self.request_id, 'mode': 'CHARGE', 'target_soc': 80.0,
+                   'transfer_intent': intent,
+                   'requested_limits': {'sustain': sustain, 'purpose': purpose},
+                   'lease_s': 15}
+        code = sim.bus.write(sim.battery_name, '/RecBms/Policy/Request', json.dumps(request))
+        self.assertEqual(code, 0, status['rejection'])
+
+    @contextlib.contextmanager
+    def dark_island(self, **kwargs):
+        """An established island with the sun gone and the consumer silent."""
+        with self.simulation(latency=Latency(base_s=5.0, current_s=5.0, relay_s=2.0),
+                             **kwargs) as sim:
+            self.wait_for(sim, lambda: not sim.plant.connected)
+            sim.solar_running = False
+            sim.set_sun((0, 0))
+            for _ in range(40):
+                self.drive_policy(sim, intent='island')
+                sim.run(1)
+            self.assertFalse(sim.plant.connected)
+            yield sim
+
+    def watch_closure(self, sim):
+        """Sample what the plant had actually applied at the physical edge."""
+        closure = {}
+        original = sim.plant.update_connection
+        def update_connection(cause='source'):
+            was = sim.plant.connected
+            original(cause)
+            if sim.plant.connected and not was and not closure:
+                closure.update(time_s=sim.clock.elapsed, quattro_v=sim.plant.dvcc.quattro_v,
+                               ccl_a=sim.plant.ccl_a, voltage=sim.plant.voltage,
+                               ocv=sim.plant.ocv(), pv_a=sum(sim.plant.pv_w) / sim.plant.voltage)
+        sim.plant.update_connection = update_connection
+        return closure
+
+    def test_prepared_return_installs_protection_before_the_relay_closes(self):
+        # E03/D02: the ordinary return closed with the pack at 56.41 V against
+        # a Quattro CVL of 59.34 V and CCL 200 A, the reductions arriving about
+        # 3 s and 5 s AFTERWARDS. With five-second command propagation the
+        # prepared pair and the sustain brake must already be applied when the
+        # AC input is accepted. The commanded pair is the hold's own anchor,
+        # so it sits at or below the bank -- under the loaded terminal voltage
+        # once the loads move to shore, at its rested OCV while still islanded.
+        with self.dark_island() as sim:
+            closure = self.watch_closure(sim)
+            started = sim.clock.monotonic()
+            for _ in range(120):
+                self.drive_policy(sim)
+                sim.run(1)
+                if sim.plant.connected:
+                    break
+            self.assertTrue(closure, 'the return never closed the relay')
+            self.assertLessEqual(closure['quattro_v'],
+                                 max(closure['voltage'], closure['ocv']) + .01)
+            self.assertLessEqual(closure['ccl_a'],
+                                 closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
+            self.assertTrue(self.status(sim)['transfer']['prepared'])
+            self.assertLessEqual(closure['time_s'] - started,
+                                 sim.rec.policy_adapter.config.return_prepare_s + 5)
+            self.assertIsNone(self.status(sim)['transfer']['last_fault'])
+
+    def test_unprepared_return_is_bounded_and_takes_no_fault_lockout(self):
+        # A3: failed preparation may not strand an urgent return. The pair is
+        # already reported unapplied by dbus-recbms' regulation fault; the
+        # transfer supervisor does not add a lockout of its own.
+        with self.dark_island() as sim:
+            original_step = sim.rec.voltage_control.step
+            def step(*args, **kwargs):
+                original_step(*args, **kwargs)
+                sim.rec.voltage_control.ready = False
+                return False
+            sim.rec.voltage_control.step = step
+            closure = self.watch_closure(sim)
+            started = sim.clock.monotonic()
+            bound = sim.rec.policy_adapter.config.return_prepare_s
+            waited = []
+            for _ in range(120):
+                self.drive_policy(sim)
+                sim.run(1)
+                waited.append(self.status(sim)['transfer']['limited_by'])
+                if sim.plant.connected:
+                    break
+            self.assertTrue(closure, 'the bounded wait never released the return')
+            self.assertIn('preparing shore protection', waited)
+            self.assertGreaterEqual(closure['time_s'] - started, bound)
+            self.assertLessEqual(closure['time_s'] - started, bound + 5)
+            self.assertFalse(self.status(sim)['transfer']['prepared'])
+            self.assertEqual(sim.rec.policy_adapter.transfer.durable['fault_until'], 0)
+            self.assertIsNone(self.status(sim)['transfer']['last_fault'])
+
+    def test_absent_shore_is_not_a_refused_relay_write(self):
+        # E13/D14: a successful connect command with persistently disconnected
+        # feedback produced a 31 s timeout and a 3600 s lockout, which is
+        # indistinguishable from a shore supply that simply is not there.
+        with self.dark_island() as sim:
+            sim.plant.shore_available = False
+            before = sim.rec.policy_adapter.transfer.durable['fault_until']
+            for _ in range(90):
+                self.drive_policy(sim)
+                sim.run(1)
+            transfer = self.status(sim)['transfer']
+            self.assertFalse(sim.plant.connected)
+            self.assertFalse(transfer['available'])
+            self.assertEqual(transfer['limited_by'], 'shore unavailable')
+            self.assertIsNone(transfer['last_fault'])
+            self.assertEqual(sim.rec.policy_adapter.transfer.durable['fault_until'], before)
+            self.assertTrue(any(write['path'] == IGNORE and write['value'] == 0 and
+                                write.get('code') == 0 for write in sim.bus.writes))
+            sim.plant.shore_available = True
+            for _ in range(10):
+                self.drive_policy(sim)
+                sim.run(1)
+                if sim.plant.connected:
+                    break
+            self.assertTrue(sim.plant.connected)
+
+    def test_another_accepted_ac_input_is_not_an_island(self):
+        # SP56: "not AC1" alone is not proof of inverter-only operation.
+        with self.dark_island() as sim:
+            sim.plant.alternate_available = True
+            writes = len([w for w in sim.bus.writes if w['path'] == IGNORE])
+            for _ in range(20):
+                self.drive_policy(sim, intent='island')
+                sim.run(1)
+            transfer = self.status(sim)['transfer']
+            self.assertTrue(sim.plant.connected)
+            self.assertEqual(sim.vebus['/Ac/ActiveIn/ActiveInput'], 1)
+            self.assertEqual(transfer['active_input'], 1)
+            self.assertFalse(transfer['connected'])
+            self.assertNotEqual(transfer['state'], 'ISLANDED')
+            self.assertEqual(sim.rec.policy_adapter.transfer.departure_reason(
+                sim.clock.monotonic(), sim.clock.time()), 'another AC input accepted')
+            self.assertEqual(len([w for w in sim.bus.writes if w['path'] == IGNORE]), writes)
+
+    def test_shutdown_publishes_protection_before_returning_the_relay(self):
+        # D02/A1: shutdown used to hand the relay back before zeroing the
+        # current and lowering the commands. Publishing first is necessary; it
+        # is still not evidence that the hardware has applied anything.
+        with self.simulation() as sim:
+            self.wait_for(sim, lambda: not sim.plant.connected)
+            events = []
+            publication = sim.bus.on_publication
+            def record(name, path, value):
+                if name == sim.battery_name and path in (CCL, BASE):
+                    events.append(('publish', path))
+                publication(name, path, value)
+            sim.bus.on_publication = record
+            write = sim.bus.write
+            def watched(name, path, value, *args, **kwargs):
+                if path == IGNORE:
+                    events.append(('write', path))
+                return write(name, path, value, *args, **kwargs)
+            sim.bus.write = watched
+            # A nonzero applied current that the shutdown must actually clear.
+            sim.rec.batt.values[CCL] = 100.0
+            sim.rec._boost_shutdown()
+            self.assertIn(('publish', CCL), events)
+            self.assertEqual(events[-1], ('write', IGNORE))
+            self.assertLess(events.index(('publish', CCL)), events.index(('write', IGNORE)))
+            self.assertEqual(sim.rec.batt[CCL], 0)
+            self.assertEqual([w['value'] for w in sim.bus.writes if w['path'] == IGNORE][-1], 0)
+
+class FailedProbeBackoffTests(unittest.TestCase):
+    """Issue #8/D16: actual probe outcomes reach the durable relay backoff.
+
+    `TransferSupervisor.failed_probe` had no caller, so the protection lived
+    only in the engine's memory and any restart erased it. The consumer repeats
+    the marker until it sees its request id accepted, so counting per request
+    would multiply one failure into many.
+    """
+    def adapter(self, state=None, path=None, generation='g'):
+        adapter = RecPolicyAdapter.__new__(RecPolicyAdapter)
+        self.now = getattr(self, 'now', 0.0)
+        adapter.clock = SimpleNamespace(monotonic=lambda: self.now,
+                                        time=lambda: 1_800_000_000.0 + self.now)
+        adapter.ledger = EnergyLedger(path=path)
+        if state is not None:
+            adapter.ledger.controller_state.update(state)
+        adapter.contract = PolicyContract(
+            adapter.ledger.controller_state.setdefault('contract', {'owned': True}),
+            generation=generation)
+        adapter.contract.state['owned'] = True
+        adapter.transfer = TransferSupervisor(
+            adapter.ledger.controller_state.setdefault('transfer', {}), backoff_s=900.0)
+        adapter.driver = SimpleNamespace(settings={'chargeslider': 80.0}, batt={})
+        adapter.last_boost_id = None
+        return adapter
+
+    def reserve(self, adapter, gap=2000):
+        """Spend one departure through the production supervisor."""
+        transfer = adapter.transfer
+        transfer.observe(True, self.now, adapter.clock.time())
+        self.now += gap
+        transfer.observe(True, self.now, adapter.clock.time())
+        command = transfer.step('island', self.now, adapter.clock.time(),
+                                ready=True, permitted=True)
+        self.assertEqual(command, 1, transfer.limited_by)
+
+    def depart(self, adapter, gap=2000):
+        """One PHYSICALLY confirmed island; a reserved attempt is not one."""
+        self.reserve(adapter, gap)
+        self.now += 2
+        adapter.transfer.observe(False, self.now, adapter.clock.time())
+        return adapter.transfer.durable['last_departure_s']
+
+    def request(self, adapter, rid, purpose='failed_probe', intent='connected',
+                generation=None):
+        payload = dumps({'version': VERSION, 'generation': generation or adapter.contract.generation,
+                         'request_id': rid, 'mode': 'CHARGE', 'target_soc': 80.0,
+                         'transfer_intent': intent,
+                         'requested_limits': {'sustain': 1, 'purpose': purpose},
+                         'lease_s': 30.0})
+        return adapter._requested('/RecBms/Policy/Request', payload)
+
+    def test_one_failed_probe_counts_once_however_often_the_marker_repeats(self):
+        adapter = self.adapter()
+        self.depart(adapter)
+        for rid in range(1, 6):
+            self.assertTrue(self.request(adapter, rid))
+        self.assertEqual(adapter.transfer.durable['failures'], 1)
+        self.assertEqual(len(adapter.transfer.durable['probe_failures']), 1)
+        self.assertEqual(adapter.transfer.departure_reason(self.now, adapter.clock.time()),
+                         'failed probe backoff')
+
+    def test_a_second_island_earns_its_own_count_and_the_delay_doubles(self):
+        adapter = self.adapter()
+        self.depart(adapter)
+        self.assertTrue(self.request(adapter, 1))
+        first = adapter.transfer.durable['backoff_until'] - adapter.transfer.durable['logical_s']
+        self.depart(adapter)
+        self.assertTrue(self.request(adapter, 2))
+        second = adapter.transfer.durable['backoff_until'] - adapter.transfer.durable['logical_s']
+        self.assertEqual(adapter.transfer.durable['failures'], 2)
+        self.assertAlmostEqual(first, 900, delta=1)
+        self.assertAlmostEqual(second, 1800, delta=1)
+
+    def test_escalation_decays_with_failures_older_than_a_day(self):
+        # The lifetime counter stays for telemetry; the delay comes from the
+        # failures inside the last 24 h of logical uptime, so a bad afternoon
+        # cannot hold the four-hour backoff for weeks.
+        adapter = self.adapter()
+        for _ in range(5):
+            self.now += 10
+            adapter.transfer.failed_probe(adapter.clock.time(), self.now)
+        self.assertEqual(min(14400, 900 * 2 ** 4),
+                         round(adapter.transfer.durable['backoff_until'] -
+                               adapter.transfer.durable['logical_s']))
+        self.now += 90000
+        self.depart(adapter)
+        self.assertTrue(self.request(adapter, 1))
+        self.assertEqual(adapter.transfer.durable['failures'], 6)
+        self.assertEqual(len(adapter.transfer.durable['probe_failures']), 1)
+        self.assertAlmostEqual(adapter.transfer.durable['backoff_until'] -
+                               adapter.transfer.durable['logical_s'], 900, delta=1)
+
+    def test_consumer_restart_renumbers_requests_without_recounting_or_forgetting(self):
+        adapter = self.adapter()
+        self.depart(adapter)
+        self.assertTrue(self.request(adapter, 7))
+        backoff_until = adapter.transfer.durable['backoff_until']
+        # A restarted consumer keeps the publisher's generation and resumes
+        # its request ids from the accepted one; the marker keeps repeating.
+        self.now += 60
+        for rid in range(8, 12):
+            self.assertTrue(self.request(adapter, rid))
+        self.assertEqual(adapter.transfer.durable['failures'], 1)
+        self.assertEqual(adapter.transfer.durable['backoff_until'], backoff_until)
+        self.assertEqual(adapter.transfer.departure_reason(self.now, adapter.clock.time()),
+                         'failed probe backoff')
+
+    def test_rec_restart_reloads_the_unexpired_backoff_from_the_saved_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'state.json')
+            adapter = self.adapter(path=path)
+            self.depart(adapter)
+            self.assertTrue(self.request(adapter, 1))
+            saved = json.loads(Path(path).read_text())['controller_state']['transfer']
+            self.assertGreater(saved['backoff_until'], saved['logical_s'])
+            self.assertEqual(saved['failures'], 1)
+            restarted = self.adapter(path=path, generation='second')
+            self.assertEqual(restarted.transfer.durable['last_failed_departure'],
+                             saved['last_failed_departure'])
+            self.assertEqual(restarted.transfer.departure_reason(self.now, restarted.clock.time()),
+                             'failed probe backoff')
+            # The reloaded departure is still the counted one: a marker that
+            # survived the restart cannot spend the allowance twice.
+            restarted.contract.state['owned'] = True
+            self.assertTrue(self.request(restarted, 1, generation='second'))
+            self.assertEqual(restarted.transfer.durable['failures'], 1)
+
+    def test_transfers_that_never_left_shore_and_other_purposes_count_nothing(self):
+        for outcome in ('refusal', 'timeout', 'no_departure'):
+            with self.subTest(outcome=outcome):
+                adapter = self.adapter()
+                if outcome == 'no_departure':
+                    adapter.transfer.observe(True, self.now, adapter.clock.time())
+                else:
+                    self.reserve(adapter)
+                    if outcome == 'refusal':
+                        adapter.transfer.command_result(1, 1, self.now, adapter.clock.time())
+                    else:
+                        self.now += 31
+                        adapter.transfer.step('island', self.now, adapter.clock.time(),
+                                              ready=True, permitted=True)
+                self.assertIsNone(adapter.transfer.durable['last_departure_s'])
+                self.assertTrue(self.request(adapter, 1))
+                self.assertEqual(adapter.transfer.durable['failures'], 0)
+                self.assertEqual(adapter.transfer.durable['probe_failures'], [])
+
+    def test_ordinary_returns_and_successful_probes_never_spend_the_backoff(self):
+        for purpose, intent in (('solar', 'connected'), ('probe', 'island'),
+                                ('', 'connected'), ('buffer', 'island')):
+            with self.subTest(purpose=purpose):
+                adapter = self.adapter()
+                self.depart(adapter)
+                self.assertTrue(self.request(adapter, 1, purpose=purpose, intent=intent))
+                self.assertEqual(adapter.transfer.durable['failures'], 0)
+                self.assertEqual(adapter.transfer.departure_reason(
+                    self.now, adapter.clock.time()), 'minimum connected dwell')
+
+    def test_a_rejected_marker_cannot_spend_the_backoff(self):
+        for change in ('generation', 'replay'):
+            with self.subTest(change=change):
+                adapter = self.adapter()
+                self.depart(adapter)
+                self.assertTrue(self.request(adapter, 5, purpose='solar'))
+                if change == 'generation':
+                    self.assertFalse(self.request(adapter, 6, generation='stale'))
+                else:
+                    self.assertFalse(self.request(adapter, 5))
+                self.assertEqual(adapter.transfer.durable['failures'], 0)
+                self.assertEqual(adapter.transfer.durable['backoff_until'], 0)
+
+
 class LoadServicePulseTests(unittest.TestCase):
     def adapter(self):
         adapter = RecPolicyAdapter.__new__(RecPolicyAdapter)
@@ -453,7 +805,10 @@ class SolarAttributionBoundaryTests(unittest.TestCase):
         adapter = RecPolicyAdapter.__new__(RecPolicyAdapter)
         adapter.driver = SimpleNamespace(cfg=SimpleNamespace(policy_mppt_instances=(278,)))
         adapter.config = SimpleNamespace(positive_reserve_w=20, source_alignment_s=2, current_settle_s=30, source_gap_s=10)
-        adapter.control = {'quattro_v': 54, 'solar_v': 55, 'ccl_a': 30, 'actuator': {'settled': True}}
+        # Shore attribution gates on command readiness, not on the stricter
+        # physical settling; both are published, so both are set here.
+        adapter.control = {'quattro_v': 54, 'solar_v': 55, 'ccl_a': 30,
+                           'actuator': {'settled': True, 'command_ready': True}}
         adapter.attribution_observation = None
         adapter.attribution_island_since = None
         adapter.attribution_last_now = None
@@ -509,7 +864,7 @@ class SolarAttributionBoundaryTests(unittest.TestCase):
 
     def test_proven_inverter_earns_actual_solar_credit_during_current_regulation(self):
         adapter, actuators = self.adapter()
-        adapter.control['actuator']['settled'] = False
+        adapter.control['actuator'].update(settled=False, command_ready=False)
         actuators['quattro_power_w'] = -100
         for now in range(11, 42):
             for sample in adapter.sources.samples.values():
@@ -556,7 +911,7 @@ class SolarAttributionBoundaryTests(unittest.TestCase):
                 elif change == 'feedback':
                     connected = False
                 elif change == 'unsettled':
-                    adapter.control['actuator']['settled'] = False
+                    adapter.control['actuator'].update(settled=False, command_ready=False)
                 else:
                     eligible = False
                 self.assertIsNone(adapter._solar_attribution(10, 10, connected, actuators, eligible, 54, 1, 100))

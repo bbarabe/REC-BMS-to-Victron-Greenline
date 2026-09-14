@@ -569,6 +569,10 @@ class ChargerPlant:
         self.base_v, self.offset_v = config.initial_base_v, config.initial_offset_v
         self.pv_voltage_v = self.solar_v
         self.ccl_a, self.connected, self.shore_available = 0.0, True, True
+        # A second AC input the Quattro may accept while AC1 is ignored or
+        # absent: "not AC1" is not proof of inverter-only operation (SP56).
+        self.alternate_available = False
+        self.on_alternate = False
         self.ignore = 0
         self.rec_cvl, self.rec_ccl, self.rec_dcl = 62.7, 200.0, 400.0
         self.energy, self.relay_edges, self.commands = Energy(), [], []
@@ -602,7 +606,10 @@ class ChargerPlant:
                                   'solar_v': self.solar_v, 'rec_cvl_v': self.rec_cvl})
 
     def update_connection(self, cause='source'):
-        connected = not self.ignore and self.shore_available
+        shore = not self.ignore and self.shore_available
+        connected = bool(shore or self.alternate_available)
+        # AC in 2 carries the boat only while AC in 1 cannot.
+        self.on_alternate = connected and not shore
         if connected != self.connected:
             self.connected = connected
             self.relay_edges.append({'time_s': self.clock.elapsed,
@@ -839,9 +846,15 @@ class CoupledSimulation:
             "/ActiveBatteryService": None, "/Dc/Battery/BatteryService": None,
             "/ActiveBmsService": None, "/ActiveBmsInstance": None,
             "/Control/Dvcc": 1}, writable=(OFFSET,))
+        # /Ac/In/1/Connected does NOT exist on this Quattro's firmware; the
+        # availability and acknowledged-ignore state do (read 2026-09-14 on
+        # vebus 276: AcIn1Available 1, AcIn2Available 0, IgnoreAcIn1 0,
+        # IgnoreAcIn2 0, ActiveIn/Connected 1, ActiveInput 0).
         self.vebus = self._source(VEBUS, 276, {IGNORE: 0, "/Connected": 1,
             "/Ac/Control/IgnoreAcIn2": 0, "/Ac/ActiveIn/ActiveInput": 0,
-            "/Ac/ActiveIn/Connected": 1, "/Ac/In/1/Connected": 1,
+            "/Ac/ActiveIn/Connected": 1, "/Ac/NumberOfAcInputs": 2,
+            "/Ac/State/AcIn1Available": 1, "/Ac/State/AcIn2Available": 0,
+            "/Ac/State/IgnoreAcIn1": 0, "/Ac/State/IgnoreAcIn2": 0,
             "/Ac/Out/L1/P": self.plant.ac_w, "/Ac/In/1/CurrentLimit": 32.0,
             "/Dc/0/Voltage": self.plant.voltage, "/Dc/0/Current": 0.0,
             "/Dc/0/Power": 0.0, "/BatteryOperationalLimits/MaxChargeCurrent": 0.0,
@@ -900,6 +913,9 @@ class CoupledSimulation:
 
     def publish_measurements(self):
         p = self.plant
+        # Availability changes reach the Quattro on its own, not only when a
+        # relay command is written.
+        p.update_connection('source')
         for path, value in {"/Control/EffectiveChargeVoltage": p.dvcc.solar_v,
             "/Dc/Pv/Current": sum(p.pv_w) / p.voltage, "/Dc/Pv/Power": sum(p.pv_w),
             "/Ac/Consumption/L1/Power": p.ac_w, "/Dc/Battery/Soc": p.soc,
@@ -913,8 +929,14 @@ class CoupledSimulation:
         # on shore it retains a positive residual (AC-in minus AC-out); while
         # inverting, conversion/idle losses draw extra DC beyond the net figure.
         reported_dc_w = net_dc_w + overhead if p.connected else net_dc_w - overhead
-        for path, value in {"/Ac/ActiveIn/ActiveInput": 0 if p.connected else 240,
-            "/Ac/ActiveIn/Connected": int(p.connected), "/Ac/In/1/Connected": int(p.shore_available),
+        for path, value in {
+            "/Ac/ActiveIn/ActiveInput": (1 if p.on_alternate else 0) if p.connected else 240,
+            "/Ac/ActiveIn/Connected": int(p.connected),
+            "/Ac/State/AcIn1Available": int(p.shore_available),
+            "/Ac/State/AcIn2Available": int(p.alternate_available),
+            # The acknowledged ignore state, which this fixture applies only
+            # after relay_s -- never the value just written.
+            "/Ac/State/IgnoreAcIn1": int(p.ignore), "/Ac/State/IgnoreAcIn2": 0,
             "/Ac/Out/L1/P": p.ac_w, "/Dc/0/Voltage": p.voltage,
             "/Dc/0/Power": reported_dc_w,
             "/Dc/0/Current": net_dc_w / p.voltage,
@@ -1000,6 +1022,9 @@ class CoupledSimulation:
                 self.plant.elapsed_s - self.plant.quattro.started_s),
             "prepared_limits": (dict(self.rec.policy_adapter.prepared_limits)
                 if getattr(getattr(self.rec, 'policy_adapter', None), 'prepared_limits', None) else None),
+            "prepared": status.get("transfer", {}).get("prepared"),
+            "prepare_age_s": status.get("transfer", {}).get("prepare_age_s"),
+            "actuator_state": actuator.get('state'),
             "state": self.solar.sw.values.get("/SolarPriority/State"), "policy": status})
 
     def set_load(self, ac_w=None, dc_w=None):

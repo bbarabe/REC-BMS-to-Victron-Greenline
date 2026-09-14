@@ -34,13 +34,18 @@ class PolicyTelemetryTests(unittest.TestCase):
             'limits': {'quattro_v': 57, 'solar_v': 57.3, 'ccl_a': 2},
             'transfer': {'state': 'ISLANDED', 'connected': False, 'pending': None,
                          'departures_24h': 2, 'actual_edges_24h': 3, 'external_edges': 1,
-                         'next_departure_s': 300, 'limited_by': ''},
+                         'next_departure_s': 300, 'limited_by': '',
+                         'acknowledged': True, 'available': False, 'active_input': None,
+                         'prepared': True, 'prepare_age_s': 12.5},
         }
         self.snapshot = {
             'configuration_id': 'test-configuration', 'valid': True,
             'voltage': 60, 'current': -1, 'soc': 80,
             'control': {'mode': 'HOLD', 'protect': False, 'overhead_category': 'buffer',
                         'buffer_floor_soc': 79, 'buffer_ceiling_soc': 80, 'buffer_remaining_wh': .1,
+                        'actuator': {'command_ready': True, 'settled': False,
+                                     'state': 'islanded', 'command_acknowledged': True,
+                                     'transition_age_s': 42.0},
                         'maintenance': {'status': 'deferred', 'reason': 'balance_uncalibrated'}},
             'demand': DemandModel().estimate(500, 60),
             'ledger': self.ledger,
@@ -76,6 +81,21 @@ class PolicyTelemetryTests(unittest.TestCase):
         self.assertEqual(self.value('LimitedBy'), 'REC current limit')
         self.assertEqual(self.value('Relay/ActualEdges24h'), 3)
         self.assertEqual(self.value('Relay/Departures24h'), 2)
+
+    def test_relay_and_actuator_stages_are_published_as_separate_facts(self):
+        # SP56/SP63/D04: an acknowledged ignore command, an available supply,
+        # an accepted input, a verified command pair and an actually settled
+        # charger are five different observations on five different paths.
+        self.telemetry.publish(self.service, self.status, self.snapshot)
+        self.assertEqual(self.value('Relay/Acknowledged'), 1)
+        self.assertEqual(self.value('Relay/ShoreAvailable'), 0)
+        self.assertIsNone(self.value('Relay/ActiveInput'))
+        self.assertEqual(self.value('Relay/Prepared'), 1)
+        self.assertEqual(self.value('Relay/PrepareAgeSeconds'), 12.5)
+        self.assertEqual(self.value('Actuator/CommandAcknowledged'), 1)
+        self.assertEqual(self.value('Actuator/Settled'), 0)
+        self.assertEqual(self.value('Actuator/State'), 'islanded')
+        self.assertEqual(self.value('Actuator/TransitionAgeSeconds'), 42.0)
 
     def test_demand_uncertainty_and_measured_service_do_not_claim_spare_pv(self):
         evidence = {'observed_w': 420, 'capacity_lower_bound_w': 420,
