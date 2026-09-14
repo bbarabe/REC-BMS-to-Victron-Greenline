@@ -430,7 +430,7 @@ class RestoredPlantTests(unittest.TestCase):
                 if not decided and sim.solar.sw['/SolarPriority/State'] == 'shore':
                     decided.append(sim.clock.elapsed)
                 return sim.plant.connected
-            self.until(sim, note, timeout=400)
+            self.until(sim, note, timeout=1500)              # 75 Wh at ~380 W takes ~12 min
             self.assertTrue(closure, 'the return never closed the relay')
             self.assertIn('deficit', sim.solar.sw['/SolarPriority/LastTransition'])
             # the floor rode the very request that asked for shore, before any
@@ -464,7 +464,7 @@ class RestoredPlantTests(unittest.TestCase):
                 ceiling = sim.rec.batt['/RecBms/TargetChargeVoltage']
                 sim.plant.shore_available = available
                 closure = self.watch_closure(sim)
-                sim.set_load(ac_w=1500)
+                sim.set_load(ac_w=3000)                       # above the 2.5 kW suspend threshold
                 self.until(sim, lambda: sim.solar.sw['/SolarPriority/State'] == 'suspend', timeout=60)
                 sim.run(45)
                 request = sim.solar.last_request

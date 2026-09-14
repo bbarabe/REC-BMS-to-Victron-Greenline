@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.16"
+ENGINE_VERSION = "4.17"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -15,8 +15,8 @@ ENGINE_DEFAULTS = {
     # 400 W of PV against 300 W AC + 300 W DC (E09: need 360 W, actual
     # 693 W). SOLAR_MARGIN now multiplies that complete demand, so 1.0.
     "SOLAR_MARGIN": 1.0, "MIN_EST_W": 100, "READY_MS": 30000, "RAMP_MS": 90000,
-    "EVAL_MS": 15000, "DISCHARGE_TOL_W": 50, "LOAD_EXCEED_MS": 15000,
-    "SOLAR_SETTLE_MS": 90000, "DEFICIT_AVG_MS": 90000, "SURGE_W": 400,
+    "EVAL_MS": 15000, "DISCHARGE_TOL_W": 50,
+    "SOLAR_SETTLE_MS": 90000,
     "SURGE_MS": 3000, "COOLDOWN_MS": 300000, "BACKOFF_MAX_MS": 3600000,
     "STABLE_MS": 1800000, "MIN_SOC": 40, "SOC_EMERGENCY": 30, "SOC_DRIFT_MAX": 2,
     "HB_STALE_MS": 20000, "ASSERT_MS": 30000, "FEEDBACK_GRACE_MS": 90000,
@@ -31,7 +31,23 @@ ENGINE_DEFAULTS = {
     # BURN_CALM_GATE_MS, BURN_REARM_V, HARVEST_ARM_V, REFILL_RESET_V,
     # HARVEST_MIN_EVID and STALL_BURN_MIN_V. Config only reads the keys named
     # here, so any of them left in an old ini is ignored, not rejected.
-    "SUSPEND_LOAD_W": 1000, "SUSPEND_MS": 3000, "SUSPEND_MAX_MS": 1200000,
+    # 4.17 (owner, 2026-09-14): the island's deficit rule is an energy
+    # drawdown, not a rate. Battery power below zero adds to a running
+    # deficit, power above zero pays it back, floored at zero -- so a
+    # sunny morning cannot bankroll an afternoon drain, and a dip broken
+    # by a cloud-edge blip is not forgotten either. At ISLAND_DEFICIT_WH
+    # the engine returns to shore (CHARGE and HOLD; DISCHARGE's deficit is
+    # the plan). The rules it replaces were rate tests -- a 180 s mean
+    # under -50 W, a 90 s mean, a 400 W surge -- which made the water
+    # heater's two-minute 1.7 kW burst a relay event every 75 minutes
+    # while a steady -49 W never tripped them (E04). 75 Wh is 1.3 Ah,
+    # 0.09 % SOC: a burst passes, a slow drain is bounded per island.
+    "ISLAND_DEFICIT_WH": 75,
+    # Suspend is now the fast path for loads big enough to matter within
+    # seconds, above the heater (1.6-1.8 kW, 130 s, every ~75 min on
+    # 2026-09-14): it used to reconnect shore for every such burst, two
+    # relay edges and a five-minute dwell each, twenty times a day.
+    "SUSPEND_LOAD_W": 2500, "SUSPEND_MS": 3000, "SUSPEND_MAX_MS": 1200000,
     "RESUME_DELTA_W": 200, "RESUME_MS": 10000,
     "MDL_A_V": 3.5, "MDL_VOC_IDLE_W": 3, "MDL_VOC_TAU_MS": 600000, "MDL_MIN_W": 10,
     "MDL_CAL_MIN_W": 30, "MDL_KFF_DEF": 0.78, "MDL_KFF_ALPHA": 0.05,
@@ -197,12 +213,12 @@ def fresh_state(now, t):
         "state": "shore", "desired": 0, "lastSent": None, "lastAssert": 0,
         "lastTransition": now, "probeStart": 0, "probeRamp": 0, "probeEst": 0,
         "evalPv": [], "evalBatt": [],
-        "readySince": 0, "loadExceedStart": 0, "surgeStart": 0,
+        "readySince": 0, "surgeStart": 0, "drawdownWh": 0.0, "drawdownTs": 0,
         "backoffMs": t["COOLDOWN_MS"], "backoffUntil": 0,
         "socEntry": 0, "solarSince": 0, "cap6": None, "cap7": None,
         "suspendTrigStart": 0, "suspendStart": 0, "suspendBase": 0,
         "resumeStart": 0, "suspendPrev": None,
-        "battWin": [], "battWinLong": [], "mdl6": None, "mdl7": None, "vocRef": None,
+        "battWinLong": [], "mdl6": None, "mdl7": None, "vocRef": None,
         "lastBoostTs": 0, "lockoutUntil": 0,
         "oneway": None, "sustainSent": 0, "sustainAssert": 0,
     }
@@ -306,8 +322,6 @@ class Engine:
 
         # Elapsed-time means: bursts of callbacks must not outweigh slow
         # observations. Four/59 seconds preserve the old 5/60 1-Hz warmup.
-        battMean = rolling_mean(st["battWin"], now, batt,
-                                t["DEFICIT_AVG_MS"], 4000, t["HB_STALE_MS"])
         battMeanLong = rolling_mean(st["battWinLong"], now, batt,
                                     t["ONEWAY_DEFICIT_MS"], 59000,
                                     t["HB_STALE_MS"])
@@ -427,8 +441,9 @@ class Engine:
             st["state"] = "shore"
             st["lastTransition"] = now
             st["readySince"] = 0
-            st["loadExceedStart"] = 0
             st["surgeStart"] = 0
+            st["drawdownWh"] = 0.0
+            st["drawdownTs"] = 0
             st["probeStart"] = 0
             st["probeRamp"] = 0
             st["evalPv"] = []
@@ -484,8 +499,9 @@ class Engine:
             st["socEntry"] = soc.v
             st["solarSince"] = now
             st["lastTransition"] = now
-            st["loadExceedStart"] = 0
             st["surgeStart"] = 0
+            st["drawdownWh"] = 0.0
+            st["drawdownTs"] = now
             st["backoffMs"] = t["COOLDOWN_MS"]
             st["backoffUntil"] = 0
             transition[0] = "-> SOLAR (" + reason + ")"
@@ -500,7 +516,6 @@ class Engine:
             st["lastTransition"] = now
             st["suspendTrigStart"] = 0
             st["resumeStart"] = 0
-            st["loadExceedStart"] = 0
             st["surgeStart"] = 0
             boostMsg[0] = 0
             transition[0] = "-> SUSPEND (load %.0fW, base %.0fW)" % (loadNow.v, st["suspendBase"])
@@ -578,7 +593,7 @@ class Engine:
         # 4.6: the SOC gate for leaving / staying off shore
         minSoc = t["ONEWAY_MIN_SOC"] if owc else t["MIN_SOC"]
         battMeanAny = battMeanLong if battMeanLong is not None else (
-            battMean if battMean is not None else (batt.v if batt is not None else 0.0))
+            batt.v if batt is not None else 0.0)
         sunCarrying = owc and soc is not None and soc.v >= minSoc and battMeanAny > 0
 
         needW = 0.0
@@ -843,12 +858,13 @@ class Engine:
                         st["desired"] = 1
                         st["lastTransition"] = now
                         st["surgeStart"] = 0
-                        st["loadExceedStart"] = 0
                         # 4.15: a suspend always resumes into solar -- the
                         # burn-down it could come back into is gone (SP26).
                         st["state"] = "solar"
                         st["solarSince"] = now
                         st["socEntry"] = soc.v
+                        st["drawdownWh"] = 0.0
+                        st["drawdownTs"] = now
                         if not owd:
                             st["lastBoostTs"] = now
                             boostMsg[0] = t["BOOST_V"]     # re-ramp assist
@@ -873,25 +889,15 @@ class Engine:
                 draining = battV is not None and effCvl is not None and battV.v > effCvl + 0.01
                 settling = draining or (now - st["solarSince"]) < t["SOLAR_SETTLE_MS"]
 
-                if owc:
-                    # one-way charge: the ten-minute mean against the
-                    # one-way tolerance; a surge alone never ends it
-                    # (heater-class loads still suspend)
-                    tol = t["ONEWAY_DEFICIT_W"]
-                    dischargeAvg = -battMeanLong if battMeanLong is not None else -float(t["ONEWAY_DEFICIT_W"])
-                else:
-                    tol = t["DISCHARGE_TOL_W"]
-                    dischargeAvg = -battMean if battMean is not None else discharge
-                if dischargeAvg > tol and not settling:
-                    if not st["loadExceedStart"]:
-                        st["loadExceedStart"] = now
-                else:
-                    st["loadExceedStart"] = 0
-                if discharge > t["SURGE_W"] and not draining and not owc:
-                    if not st["surgeStart"]:
-                        st["surgeStart"] = now
-                else:
-                    st["surgeStart"] = 0
+                # The drawdown (4.17): what the bank has been drawn below
+                # its best point since the departure, in Wh. Deficit adds,
+                # surplus repays, never below zero.
+                if st["drawdownTs"]:
+                    hours = max(0.0, now - st["drawdownTs"]) / 3600000.0
+                    st["drawdownWh"] = max(0.0, st["drawdownWh"] - batt.v * hours)
+                st["drawdownTs"] = now
+                drawdown = st["drawdownWh"]
+                budget = t["ISLAND_DEFICIT_WH"]
 
                 if loadNow.v >= t["SUSPEND_LOAD_W"]:
                     if not st["suspendTrigStart"]:
@@ -920,11 +926,9 @@ class Engine:
                     toShore("SOC %.1f%% (entry %.1f%%)" % (soc.v, st["socEntry"]))
                     status[0] = "blue"
                 elif owd:
-                    # Discharging one-way: a deficit, a surge or SOC drift is
-                    # the bank doing exactly what was asked. Only the floor,
-                    # a heater-class load (suspend) and a fault end this.
-                    st["loadExceedStart"] = 0
-                    st["surgeStart"] = 0
+                    # Discharging one-way: a deficit or SOC drift is the
+                    # bank doing exactly what was asked. Only the floor, a
+                    # heater-class load (suspend) and a fault end this.
                     status[0] = "green"
                     status[1] = "DRAIN | PV %.0fW batt %s%.0fW load %.0fW SOC %.1f%% -> %.0f%%" % (
                         pvNow, "+" if batt.v >= 0 else "", batt.v, loadNow.v, soc.v, tgt.v)
@@ -932,23 +936,18 @@ class Engine:
                     escalateBackoff()
                     toShore("SOC %.1f%% (entry %.1f%%)" % (soc.v, st["socEntry"]))
                     status[0] = "blue"
-                elif st["surgeStart"] and now - st["surgeStart"] >= t["SURGE_MS"]:
-                    toShore("big load: batt -%.0fW, load %.0fW" % (discharge, loadNow.v))
-                    status[0] = "blue"
-                elif st["loadExceedStart"] and now - st["loadExceedStart"] >= t["LOAD_EXCEED_MS"]:
+                elif drawdown >= budget and not settling:
                     # 4.15 (SP26, E07): a sustained deficit with the band
                     # still full used to roll into a burn-down rather than a
-                    # return. HOLD now holds the bank on shore, so every
-                    # sustained deficit takes this one ordinary exit.
+                    # return; 4.17: the one ordinary exit is the drawdown.
                     escalateBackoff()
-                    toShore("deficit: batt avg -%.0fW (now %.0fW)" % (dischargeAvg, batt.v))
+                    toShore("deficit: %.0f Wh drawn since the last surplus (batt %.0fW, PV %.0fW, load %.0fW)" % (
+                        drawdown, batt.v, pvNow, loadNow.v))
                     status[0] = "blue"
-                elif st["loadExceedStart"] or st["surgeStart"]:
-                    left = (math.ceil((t["SURGE_MS"] - (now - st["surgeStart"])) / 1000) if st["surgeStart"]
-                            else math.ceil((t["LOAD_EXCEED_MS"] - (now - st["loadExceedStart"])) / 1000))
-                    status[0] = "yellow"
-                    status[1] = "SOLAR! batt avg -%.0fW (now %.0fW) PV %.0fW load %.0fW [shore in %ds]" % (
-                        dischargeAvg, batt.v, pvNow, loadNow.v, left)
+                elif drawdown > 0:
+                    status[0] = "yellow" if drawdown >= budget / 2 else "green"
+                    status[1] = "SOLAR | PV %.0fW batt %s%.0fW load %.0fW SOC %.1f%% [drawdown %.0f/%.0f Wh]" % (
+                        pvNow, "+" if batt.v >= 0 else "", batt.v, loadNow.v, soc.v, drawdown, budget)
                 else:
                     status[0] = "green"
                     status[1] = ("SOLAR drain +%.2fV | PV " % (battV.v - effCvl) if draining else "SOLAR | PV ") + \

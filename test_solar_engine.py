@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.16")
+check("engine version bumped", SP.ENGINE_VERSION == "4.17")
 Val = SP.Val
 
 
@@ -142,11 +142,11 @@ s.tick(95, batt=100.0, cvl=59.49)       # hold released: the real target is back
 check("charge: still on solar", s.state == "solar" and s.sustain == 0)
 s.tick(60, soc=68.0)
 check("charge: solar stays while the bank fills", s.state == "solar" and s.oneway == "charge")
-# night: PV gone, the loads draw from the bank -> three-minute deficit exit -> shore + sustain
+# night: PV gone, the loads draw from the bank -> 75 Wh of drawdown -> shore + sustain
 s.tick(200, batt=-40.0, pv=0.0, m=0, voc=10.0)
-check("charge: -40 W is inside the one-way tolerance", s.state == "solar")
-s.tick(240, batt=-100.0)
-check("charge: -100 W three-minute mean -> shore", s.state == "shore" and s.cmd == 0, s.state)
+check("charge: -40 W for 200 s is 2 Wh of drawdown, nowhere near the budget", s.state == "solar")
+s.tick(240, batt=-1200.0)
+check("charge: 75 Wh of drawdown -> shore", s.state == "shore" and s.cmd == 0, s.state)
 # Stage A (A1, E03): the floor now goes out on the SAME tick as the shore
 # command, so it is in force before the Quattro re-accepts, not after it.
 check("charge: floor requested on the same tick as the shore command",
@@ -201,7 +201,7 @@ check("discharge: deficit and surge do not end it", s.state == "solar" and s.cmd
 check("discharge: DRAIN status", "DRAIN | PV 0W batt -600W" in s.out.status_text, s.out.status_text)
 s.tick(30, soc=84.0)
 check("discharge: SOC drift does not end it", s.state == "solar")
-s.tick(5, load=1500.0, batt=-1500.0)
+s.tick(5, load=3000.0, batt=-3000.0)
 check("discharge: heater-class load -> suspend on shore", s.state == "suspend" and s.cmd == 0)
 check("discharge: ceiling kept through suspend", s.sustain == 2)
 s.tick(15, load=300.0, batt=-300.0)
@@ -275,7 +275,9 @@ check("patient: -40 W for 5 min stays on solar", s.state == "solar")
 s.tick(10, batt=-600.0)
 check("patient: a 10 s surge does not end it", s.state == "solar")
 s.tick(300, batt=-100.0)
-check("4.8: -100 W three-minute mean -> shore", any(tr.startswith("-> SHORE (deficit: batt avg -") for tr in s.transitions),
+check("4.17: -100 W for 5 min is 8 Wh, the island stays", s.state == "solar", str(s.transitions[-1:]))
+s.tick(300, batt=-1200.0)
+check("4.17: 75 Wh of drawdown -> shore", any(tr.startswith("-> SHORE (deficit: ") for tr in s.transitions),
       str(s.transitions))
 s = Sim()
 s.tick(1, soc=60, target=95, batt_v=56.4, m=1)
@@ -287,14 +289,14 @@ s = Sim()
 s.tick(1, soc=60, target=95, batt_v=56.4)         # unthrottled: straight in, the deficit exit guards
 s.tick(340)
 check("4.9: straight to solar", s.state == "solar" and "probe" not in s.states)
-s.tick(300, batt=-120.0, cvl=59.49)
+s.tick(300, batt=-1200.0, cvl=59.49)
 check("4.9: a draining stint ends by the deficit exit", s.state == "shore" and
       any("deficit" in tr for tr in s.transitions), str(s.transitions[-1:]))
 s = Sim()
 s.tick(1, soc=60, target=95, batt_v=56.4)
 s.tick(340)
 s.tick(95, batt=100.0, cvl=59.49)
-s.tick(5, load=1500.0, batt=-1500.0)
+s.tick(5, load=3000.0, batt=-3000.0)
 check("patient: heater-class load still suspends", s.state == "suspend")
 
 # ---- solar filling the band is not "the charger charging" ----
@@ -344,12 +346,12 @@ check("09-06: floor while on shore", s.sustain == 1)
 s.tick(335)
 s.tick(95, batt=100.0, cvl=59.49)
 check("09-06: on solar, floor released", s.state == "solar" and s.sustain == 0)
-s.tick(5, load=1500.0, load_avg=300.0, batt=-1500.0, shore=False)   # avg lags: base 300 W
+s.tick(5, load=3000.0, load_avg=300.0, batt=-3000.0, shore=False)   # avg lags: base 300 W
 check("09-06: heater load -> suspend", s.state == "suspend" and s.cmd == 0)
 check("09-06: no AC came: NO floor in suspend", s.sustain == 0, str(s.sustains[-3:]))
 s.tick(200)
 check("09-06: still none 200 s in", s.sustain == 0 and s.state == "suspend")
-s.tick(1300, load=1500.0, batt=-1500.0)
+s.tick(1300, load=3000.0, batt=-3000.0)
 check("09-06: suspend times out to shore, still no floor",
       s.state == "shore" and s.sustain == 0, "state %s sustain %s" % (s.state, s.sustain))
 s.tick(1, shore=True)
@@ -361,7 +363,7 @@ s = Sim()
 s.tick(1, soc=80, target=95, batt_v=56.4)
 s.tick(335)
 s.tick(95, batt=100.0, cvl=59.49)
-s.tick(5, load=1500.0, batt=-1500.0)
+s.tick(5, load=3000.0, batt=-3000.0)
 check("shore present: suspend still gets the floor", s.state == "suspend" and s.sustain == 1)
 
 # ---- a re-appeared battery service gets the hold re-asserted at once ----
@@ -560,10 +562,10 @@ s.tick(1, soc=60, target=80, batt_v=56.4)
 s.tick(340)
 s.tick(95, batt=100.0, cvl=59.49)
 check("#2 stall: CHARGE on solar", s.state == "solar" and s.oneway == "charge")
-s.tick(300, soc=78.0, batt=-100.0, batt_v=59.47, cvl=59.49, pv=200.0)
+s.tick(300, soc=78.0, batt=-1200.0, batt_v=59.47, cvl=59.49, pv=200.0)
 check("#2 stall: the deficit takes the ordinary return, never burn-down",
       s.state == "shore" and "burndown" not in s.states and
-      any(tr.startswith("-> SHORE (deficit: batt avg -") for tr in s.transitions),
+      any(tr.startswith("-> SHORE (deficit: ") for tr in s.transitions),
       "state %s %s" % (s.state, s.transitions[-1:]))
 check("#2 stall: still CHARGE, floor back on shore", s.oneway == "charge" and s.sustain == 1)
 # the shore-side entries with CHARGE selected: surplus and harvest
@@ -615,10 +617,10 @@ check("HOLD: islanded to start with", s.state == "solar", s.state)
 s.tick(1, target=60)
 check("HOLD: the hold is asked for while islanded too",
       s.oneway is None and s.sustain == 3 and s.out.charge_intent == "hold")
-s.tick(300, batt=-100.0, batt_v=56.61, cvl=56.62, pv=200.0)   # the E07 stall, at the target
+s.tick(300, batt=-1200.0, batt_v=56.61, cvl=56.62, pv=200.0)   # the E07 stall, at the target
 check("HOLD: deficit on solar returns to shore, no burn-down",
       s.state == "shore" and "burndown" not in s.states and
-      any(tr.startswith("-> SHORE (deficit: batt avg -") for tr in s.transitions),
+      any(tr.startswith("-> SHORE (deficit: ") for tr in s.transitions),
       "%s %s" % (s.state, s.transitions[-1:]))
 check("HOLD: the hold stands on shore", s.sustain == 3)
 s = Sim()
@@ -724,7 +726,7 @@ s.tick(340)                                        # -> solar
 s.tick(95, batt=100.0, cvl=59.49)
 check("A1: islanded with the floor released", s.state == "solar" and s.sustain == 0)
 for _ in range(400):
-    s.tick(1, batt=-120.0)
+    s.tick(1, batt=-1200.0)
     if s.state == "shore":
         break
 check("A1: the deficit returns it", s.state == "shore" and s.cmd == 0)
@@ -751,7 +753,7 @@ s.tick(340)
 s.tick(95, batt=100.0, cvl=59.49)
 check("A1 unknown: released while islanded", s.state == "solar" and s.sustain == 0)
 for _ in range(400):                               # the deficit returns it; no AC comes back
-    s.tick(1, batt=-120.0, shore=False)
+    s.tick(1, batt=-1200.0, shore=False)
     if s.state == "shore":
         break
 ret = s.eng.st["lastTransition"]
@@ -874,7 +876,7 @@ check("#8: MPPTs that never wake are a failed probe too",
 s = Sim()
 s.tick(1, soc=60, target=80, batt_v=56.4)
 s.tick(340)
-s.tick(300, batt=-120.0, cvl=59.49)
+s.tick(300, batt=-1200.0, cvl=59.49)
 check("#8: an ordinary solar deficit return is not a failed probe",
       s.state == "shore" and any("deficit" in tr for tr in s.transitions) and s.failures == [],
       str(s.failures))
@@ -914,6 +916,54 @@ s = Sim()
 s.tick(340, soc=60, batt_v=56.4)
 check("HOLD: no target at all, nothing written", s.sustains == [] and s.out.charge_intent == "release",
       str(s.sustains))
+
+# ---- 4.17: the island's deficit rule is a drawdown, not a rate ----
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)
+s.tick(95, batt=160.0, cvl=59.49)
+check("4.17: on solar with a surplus", s.state == "solar" and s.eng.st["drawdownWh"] == 0.0)
+s.tick(130, batt=-1100.0, load=1700.0)                   # the water heater: 1.7 kW for 130 s, sun 600 W
+check("4.17: a two-minute heater burst is 40 Wh, the island survives",
+      s.state == "solar" and 38 <= s.eng.st["drawdownWh"] <= 41, "%s %.1f" % (s.state, s.eng.st["drawdownWh"]))
+check("4.17: the status shows the drawdown", "[drawdown 40/75 Wh]" in s.out.status_text, s.out.status_text)
+s.tick(900, batt=160.0, load=300.0)                      # 15 min of 160 W surplus repays it
+check("4.17: surplus repays the drawdown down to zero", s.eng.st["drawdownWh"] == 0.0 and s.state == "solar")
+s.tick(3600, batt=160.0)
+s.tick(130, batt=-1100.0, load=1700.0)
+check("4.17: an hour of surplus does not bankroll the next burst: it is 40 Wh again",
+      38 <= s.eng.st["drawdownWh"] <= 41, "%.1f" % s.eng.st["drawdownWh"])
+for _ in range(4):                                       # bursts separated by 5 s blips of surplus
+    s.tick(5, batt=100.0, load=300.0)
+    s.tick(60, batt=-1100.0, load=1700.0)
+check("4.17: a cloud-edge blip does not wipe the slate: the chain returns",
+      s.state == "shore" and any("deficit:" in tr for tr in s.transitions), str(s.transitions[-1:]))
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)
+s.tick(95, batt=100.0, cvl=59.49)
+s.tick(5600, batt=-49.0)                                 # the E04 drain: 75 Wh after ~92 min
+check("4.17: a steady -49 W is bounded at 75 Wh and returns", s.state == "shore" and
+      any("deficit: 75 Wh" in tr for tr in s.transitions), str(s.transitions[-1:]))
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)
+s.tick(95, batt=100.0, cvl=59.49)
+s.tick(10, load=2000.0, batt=-1400.0)
+check("4.17: 2 kW is under the suspend threshold", s.state == "solar")
+s.tick(200, load=2000.0, batt=-1400.0)                   # 2 kW for 3.5 min: the budget returns it
+check("4.17: 2 kW for three minutes is the budget: return", s.state == "shore")
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)
+s.tick(95, batt=100.0, cvl=59.49)
+s.tick(5, load=2600.0, batt=-2000.0)
+check("4.17: 2.6 kW suspends within seconds", s.state == "suspend")
+s = Sim()
+s.tick(1, soc=90, target=70, batt_v=60.3, cvl=60.3)
+s.tick(335, pv=0.0, m=0, voc=10.0)
+s.tick(3600, batt=-600.0)
+check("4.17: DISCHARGE ignores the drawdown: the deficit is the plan", s.state == "solar" and s.oneway == "discharge")
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:
