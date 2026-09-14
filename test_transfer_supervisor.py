@@ -203,6 +203,28 @@ class TransferBoundaryTests(unittest.TestCase):
         self.assertIsNone(supervisor.durable['last_failed_departure'])
         self.assertEqual(supervisor.snapshot(0, 1000)['departures_24h'], 1)
 
+    def test_withdrawn_return_leaves_an_island_not_a_running_timer(self):
+        # Boat, 2026-09-14 16:06 UTC: a one-tick loss of permission began a
+        # prepared return, permission came back, the island intent resumed,
+        # but the supervisor stayed PREPARE_CONNECT with its preparation
+        # timer running and closed the relay unprepared 33 s later.
+        supervisor = self.connected()
+        self.assertEqual(self.step(supervisor, 300), 1)
+        supervisor.observe(False, 303, 1303)
+        self.assertEqual(supervisor.state, 'ISLANDED')
+        self.assertIsNone(self.step(supervisor, 310, 'connected', ready=False))
+        self.assertEqual(supervisor.state, 'PREPARE_CONNECT')
+        self.assertEqual(supervisor.limited_by, 'preparing shore protection')
+        for now in (312, 330, 345):
+            self.assertIsNone(self.step(supervisor, now, 'island'))
+            self.assertEqual(supervisor.state, 'ISLANDED')
+            self.assertIsNone(supervisor.prepare_since)
+        self.assertIsNone(self.step(supervisor, 346, 'connected', ready=False))
+        self.assertEqual(supervisor.prepare_since, 346)
+        self.assertIsNone(self.step(supervisor, 360, 'connected', ready=False))
+        self.assertEqual(self.step(supervisor, 361, 'connected', ready=True), 0)
+        self.assertTrue(supervisor.prepared)
+
     def test_target_change_revokes_request_even_when_policy_mode_is_unchanged(self):
         contract = PolicyContract(generation='test')
         request = {'version': 2, 'generation': 'test', 'request_id': 1,

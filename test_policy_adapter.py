@@ -728,6 +728,34 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertFalse(sim.plant.connected)
             self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 2)
 
+    def test_a_blinking_source_does_not_move_the_relay_but_a_lost_one_does(self):
+        # Boat, 2026-09-14 16:06 UTC: one invalid demand sample while islanded
+        # began a return; the timer it left running closed the relay
+        # unprepared 33 s later and the Quattro bulked at 700 W. A source
+        # must stay invalid for source_gap_s before the REC returns on its
+        # own, and then the return is prepared like any other.
+        from solar_priority_plant import SYSTEM
+        with self.simulation(target=80) as sim:
+            self.wait_for(sim, lambda: not sim.plant.connected)
+            sim.run(60)
+            edges = len(sim.plant.relay_edges)
+            for _ in range(3):
+                sim.bus.invalidate(SYSTEM, '/Dc/System/Power')
+                sim.run(3)
+                sim.bus.invalid.discard((SYSTEM, '/Dc/System/Power'))
+                sim.run(20)
+            self.assertFalse(sim.plant.connected)
+            self.assertEqual(len(sim.plant.relay_edges), edges)
+            self.assertEqual(self.status(sim)['transfer']['state'], 'ISLANDED')
+            self.assertIsNone(sim.rec.policy_adapter.transfer.prepare_since)
+            closure = self.watch_closure(sim)
+            sim.bus.invalidate(SYSTEM, '/Dc/System/Power')
+            self.wait_for(sim, lambda: sim.plant.connected, timeout_s=90)
+            self.assertTrue(closure)
+            self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
+            self.assertLessEqual(closure['ccl_a'], closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
+            self.assertTrue(self.status(sim)['transfer']['prepared'])
+
     def test_off_returns_prepared_under_the_hold_and_then_relinquishes(self):
         # Stage C / D13: OFF must carry release in the request, but the
         # relay may not close on the slider CVL; the floor is kept through

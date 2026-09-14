@@ -177,8 +177,14 @@ class DemandModel:
         ac_w, external_dc_w = finite(ac_w), finite(external_dc_w)
         if ac_w is None or ac_w < 0:
             return {'valid': False, 'limited_by': 'AC demand unavailable'}
-        if external_dc_w is None or not 0 <= external_dc_w <= self.max_external_w:
+        if external_dc_w is None or external_dc_w > self.max_external_w:
             return {'valid': False, 'limited_by': 'DC demand unavailable or implausible'}
+        # systemcalc's DC-system estimate is battery minus PV minus VE.Bus;
+        # on a sunny bus it dips a few watts under zero between samples.
+        # That is metering skew, not a demand to refuse: on the boat
+        # (2026-09-14 16:06 UTC) every such dip made the REC's permission
+        # flicker and started a return from a healthy island. Clamp it.
+        external_dc_w = max(0.0, external_dc_w)
         direct = finite(inverter_dc_w)
         # Direct VE.Bus DC demand already includes conversion and idle loss.
         if not connected and direct is not None and direct >= 0:

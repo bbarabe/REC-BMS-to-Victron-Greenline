@@ -181,6 +181,18 @@ class InputAndDemandTests(unittest.TestCase):
         self.assertEqual(direct['method'], 'measured inverter DC')
         self.assertEqual(direct['admission_w'], 1560)
 
+    def test_negative_dc_estimate_is_clamped_not_refused(self):
+        # Boat, 2026-09-14 16:06 UTC: systemcalc's DC-system estimate dipped a
+        # few watts under zero on a sunny bus, the demand went invalid for a
+        # tick and the REC's permission flickered a healthy island home.
+        model = DemandModel()
+        dipped = model.estimate(300.0, -30.0)
+        self.assertTrue(dipped['valid'])
+        self.assertEqual(dipped['external_dc_w'], 0.0)
+        self.assertAlmostEqual(dipped['island_w'], 300.0 / 0.9 + 30.0)
+        self.assertFalse(model.estimate(300.0, 6000.0)['valid'])
+        self.assertFalse(model.estimate(300.0, None)['valid'])
+
     def test_measured_dc_compensation_applied_exactly_once(self):
         model = DemandModel()
         for dc in (0, 500, 1000):

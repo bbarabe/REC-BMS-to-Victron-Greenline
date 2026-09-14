@@ -388,8 +388,22 @@ class TransferSupervisor:
                 return self._issue(0, now, wall, urgent=True)
             self.prepared = True
             return self._issue(0, now, wall, urgent=self.shore_restored)
+        if intent != 'connected':
+            # No return is being prepared: a wait started by a transient
+            # 'connected' must not keep counting under an island intent
+            # (boat, 2026-09-14 16:06 UTC: a timer left running through a
+            # permission flicker closed the relay unprepared 33 s later).
+            self.prepare_since = None
+        if (self.feedback is False and self.last_command == 1 and not self.other_input and
+                self.state == 'PREPARE_CONNECT' and ready and permitted):
+            # We departed, a return was begun and withdrawn, and the island
+            # is judged good again: it is an island, not a pending return.
+            self.state = 'ISLANDED'
+            self.prepared = None
+            self.limited_by = ''
         if self.state == 'ISLANDED' and self.feedback is False:
             if ready and permitted:
+                self.limited_by = ''
                 return None
             self.state = 'PREPARE_CONNECT'
             return self._issue(0, now, wall)

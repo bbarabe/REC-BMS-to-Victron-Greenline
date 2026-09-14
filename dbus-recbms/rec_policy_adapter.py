@@ -58,6 +58,7 @@ class RecPolicyAdapter:
         self.last_connected = None
         self.settle_since = None
         self.settle_last = None
+        self.unpermitted_since = None
         self.attribution_observation = None
         self.attribution_island_since = None
         self.attribution_last_now = None
@@ -627,6 +628,23 @@ class RecPolicyAdapter:
             # at once: critical REC data lost, discharge prohibited by the
             # BMS, or a charger outside the safe envelope.
             urgent = not (raw_valid and discharge_permitted and envelope_ok)
+            transient = protective and not urgent and mode != 'OFF'
+            if transient and self.unpermitted_since is None:
+                self.unpermitted_since = now
+            elif not transient:
+                self.unpermitted_since = None
+            if transient and now - self.unpermitted_since < self.config.source_gap_s:
+                # A source that blinks for a tick is not a reason to move
+                # the relay: the engine judges its island on inputs that
+                # tolerate 20 s, and a return here is a relay edge plus a
+                # charge tail. The lease's own intent stands through the
+                # grace; no new departure can start (the island is already
+                # there or the lease is what it is), and the electrical
+                # envelope is still checked below.
+                protective = False
+                grace = True
+            else:
+                grace = False
             if protective and not urgent:
                 intent, protective = 'connected', False
             # Exact command readbacks gate new departures. Once islanded,
@@ -648,13 +666,13 @@ class RecPolicyAdapter:
                          (mode != 'HOLD' or hold_mode == 3) and
                          (mode != 'OFF' or connected is not False or hold_mode is not None))
             if connected is False and intent == 'island':
-                transfer_ready = safe
+                transfer_ready = envelope_ok if grace else safe
             elif intent == 'connected':
                 transfer_ready = bool(voltage_ready and current_ready and protected)
             else:
                 transfer_ready = ready
             command = self.transfer.step(intent, now, wall, ready=transfer_ready,
-                                         permitted=permitted, protective=protective)
+                                         permitted=permitted or grace, protective=protective)
             self._relay(command, now, wall)
             control['protect'] = not permitted
             control['limited_by'] = ('lease expired' if not lease else
