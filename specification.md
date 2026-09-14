@@ -719,7 +719,7 @@ of that with discovery and a single multi-output bank.
 
 ### Solar Priority (`archive/SolarPriority.json`) — RETIRED, historical algorithm
 
-This section records the original policy and its evolution into the driver. Its zero-cycle objective and harvest/maintenance details are superseded as intended behavior by the [2026-09-11 revised design](dbus-recbms/SOLAR_PRIORITY_DESIGN.md); the replacement implementation, installed revision and outstanding acceptance are described in the current driver sections above.
+This section records the original policy and its evolution into the driver. Its zero-cycle objective and harvest/maintenance details are superseded as intended behavior; the restored 3.0 implementation, its deviations from this baseline and its installed revision are recorded in [reviews/solar-engine-baseline-deviations.md](reviews/solar-engine-baseline-deviations.md) and [reviews/solar-priority-restoration-2026-09-13.md](reviews/solar-priority-restoration-2026-09-13.md), and described in the current driver sections above.
 
 Automatically powers AC loads from solar instead of shore power when the panels can carry them. Designed for storage mode: the battery is held at a target SOC by the Max Charge slider and the goal is **zero energy cycled through the battery** — battery power is therefore the primary control signal, not PV-vs-load comparison. Charging in solar mode is allowed (surplus charges the pack until DVCC/CVL caps it at the target).
 

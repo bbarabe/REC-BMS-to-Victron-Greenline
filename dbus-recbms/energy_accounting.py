@@ -480,12 +480,23 @@ class EnergyLedger:
             self.save()
 
     def end_reverse_event(self):
-        """REC calls only after verified sustained recovery, never on a sign tick."""
+        """Close a reverse event after verified sustained recovery.
+
+        No caller in the 3.0 control path: reverse.event_wh accumulates until
+        something closes it, so it is telemetry, not a per-event guarantee.
+        """
         if self._state["reverse"]["event_wh"]:
             self._state["reverse"]["event_wh"] = 0.0
             self.save()
 
     def budget(self):
+        """Reported in the policy snapshot; nothing in the active control path consumes it.
+
+        EFC is (charge Ah + discharge Ah) / (2 x capacity): 0.01 EFC is 28.8 Ah
+        combined at the 1440 Ah basis, i.e. 2 % combined movement; 1 % combined
+        movement is 14.4 Ah (14 Ah at REC's 1400 Ah). The ~1 % daily movement
+        aim is a paper calculation and a monitoring target, not a runtime gate.
+        """
         spent = sum(b["efc"] for b in self._state["buckets"])
         reserved = sum(r["remaining_efc"] for r in self._state["reservations"].values())
         spent_wh = sum(b["charge_wh"] + b["discharge_wh"] for b in self._state["buckets"])
@@ -504,6 +515,7 @@ class EnergyLedger:
 
     def reserve(self, reservation_id, category, discharge_ah, charge_ah,
                 discharge_wh, charge_wh, now_wall_s=None):
+        """Admission reservation: no caller in the 3.0 control path (kept for the schema)."""
         if not isinstance(reservation_id, str) or not reservation_id:
             raise ValueError("reservation_id must be a nonempty string")
         if category not in OVERHEAD_CATEGORIES:

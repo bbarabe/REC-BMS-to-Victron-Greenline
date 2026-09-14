@@ -24,7 +24,7 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.0.5"
+VERSION = "3.0.6"
 ENGINE_VERSION = "4.13-restored"
 BUSITEM = "com.victronenergy.BusItem"
 

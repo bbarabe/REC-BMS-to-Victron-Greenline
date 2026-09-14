@@ -136,6 +136,23 @@ class ConsumerConfigurationTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'oneway_full_pct'):
                 self.parse('[engine]\noneway_full_pct = %s\n' % value)
 
+    def test_shipped_engine_ini_and_uncommented_examples_parse_and_apply(self):
+        # The shipped ini had no [engine] header: uncommenting any example made
+        # ConfigParser reject the file (master review D18).
+        import re
+        path = os.path.join(REPO, 'dbus-recbms', 'solar_priority.ini')
+        text = open(path, encoding='utf-8').read()
+        self.assertEqual(SP.Config(path).engine, {k: float(v) for k, v in SP.ENGINE_DEFAULTS.items()})
+        examples = dict(re.findall(r'^;(\w+) = ([\d.]+)$', text, re.M))
+        self.assertEqual(set(examples), {k.lower() for k in SP.ENGINE_DEFAULTS})
+        for key, default in SP.ENGINE_DEFAULTS.items():
+            self.assertEqual(float(examples[key.lower()]), float(default), key)
+        for key, value in (('oneway_enter_pct', '3'), ('solar_margin', '1.2'), ('cooldown_ms', '600000')):
+            uncommented = text.replace(';%s = %s' % (key, examples[key]), '%s = %s' % (key, value))
+            self.assertNotEqual(uncommented, text)
+            with self.subTest(key=key):
+                self.assertEqual(self.parse(uncommented).engine[key.upper()], float(value))
+
     def test_accepted_full_configuration_never_requests_a_floor_under_complete_full(self):
         from policy_contract import PolicyContract, VERSION
         for full in (100, 95):
