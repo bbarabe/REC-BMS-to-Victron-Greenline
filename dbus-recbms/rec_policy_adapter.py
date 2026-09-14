@@ -1,4 +1,5 @@
 """REC's policy boundary, durable accounting and sole protocol relay writer."""
+import logging
 import os
 import hashlib
 import time
@@ -9,6 +10,7 @@ from policy_contract import PolicyContract, TransferSupervisor, dumps
 from rec_control_config import ControlConfig
 from policy_telemetry import PolicyTelemetry
 
+log = logging.getLogger('dbus-recbms')
 BUSITEM = 'com.victronenergy.BusItem'
 PREFIX = '/RecBms/Policy/'
 
@@ -465,6 +467,12 @@ class RecPolicyAdapter:
                              getattr(transfer, 'limited_by', '') != 'shore unavailable')
                 if policy == 'DISCHARGE':
                     sustain = 2
+                elif policy == 'OFF' and returning and not accepted:
+                    # Switched off while islanded: nothing to hold for, but
+                    # the relay may not close on the slider CVL either. A
+                    # floor at the present bank carries the return; the OFF
+                    # rule below releases it once an input is accepted.
+                    sustain = 1
                 elif policy in ('CHARGE', 'HOLD') and (accepted or returning):
                     # The first exact charger readback still gates current.
                     # A HOLD reconstructs the two-sided hold (3) exactly as
@@ -472,6 +480,36 @@ class RecPolicyAdapter:
                     # curve comes back with the standing lead under it and
                     # the Quattro sits below the bank (E04/D03).
                     sustain = 1 if policy == 'CHARGE' else 3
+        # Stage C (master D13), the operator's side of a lost owner. The
+        # four outcomes, each through this same path and the ordinary
+        # prepared return, never a new override workflow:
+        #  - lease lost: the mode's hold is kept (reconstructed above) at
+        #    the target it was taken for, and the REC returns to shore under
+        #    it for as long as the loss lasts;
+        #  - the target changes during the loss: the retained hold was taken
+        #    for another destination and is stale -- once the bank is back
+        #    on an accepted input it is released and the slider's own curve
+        #    applies, which is what the slider means with no Solar Priority
+        #    running; a return still in progress keeps it until then;
+        #  - OFF: the consumer's OFF request must carry release (the
+        #    contract), but a hold is kept through the protected return so
+        #    the relay does not close on the slider CVL, and released once
+        #    an input is accepted -- Solar Priority relinquishes the bank
+        #    after the return, not during it;
+        #  - recovery: a fresh valid request resumes; nothing is remembered
+        #    from the loss beyond the ledger's references.
+        hold = self.driver.sustain
+        transfer = getattr(self, 'transfer', None)
+        on_ac = getattr(transfer, 'feedback', None) is True
+        stale = (not active and hold.get('active') and
+                 self.contract.state.get('policy', {}).get('target_soc') != target)
+        if stale and on_ac and sustain:
+            log.info('sustain %s released: the target moved to %.0f%% during the lost lease; '
+                     'the slider applies', hold.get('mode'), target)
+            sustain = 0
+        elif (active and request.get('mode') == 'OFF' and hold.get('active') and
+              not on_ac and getattr(transfer, 'feedback', None) is not None):
+            sustain = hold.get('mode', 0)
         self.driver._set_sustain(sustain)
         if not active:
             if self.driver.boost.get('active'):
@@ -607,7 +645,8 @@ class RecPolicyAdapter:
             hold_mode = hold.get('mode') if hold.get('active') and hold.get('soc') is not None else None
             protected = ((mode != 'CHARGE' or hold_mode == 1) and
                          (mode != 'DISCHARGE' or hold_mode == 2) and
-                         (mode != 'HOLD' or hold_mode == 3))
+                         (mode != 'HOLD' or hold_mode == 3) and
+                         (mode != 'OFF' or connected is not False or hold_mode is not None))
             if connected is False and intent == 'island':
                 transfer_ready = safe
             elif intent == 'connected':

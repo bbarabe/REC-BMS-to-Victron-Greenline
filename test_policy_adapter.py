@@ -728,6 +728,43 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertFalse(sim.plant.connected)
             self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 2)
 
+    def test_off_returns_prepared_under_the_hold_and_then_relinquishes(self):
+        # Stage C / D13: OFF must carry release in the request, but the
+        # relay may not close on the slider CVL; the floor is kept through
+        # the protected return and released once shore is accepted.
+        with self.simulation(target=80) as sim:
+            self.wait_for(sim, lambda: not sim.plant.connected)
+            sim.run(60)
+            closure = self.watch_closure(sim)
+            sim.set_enabled(False)
+            self.wait_for(sim, lambda: sim.plant.connected, timeout_s=120)
+            self.assertEqual(sim.solar.last_request['mode'], 'OFF')
+            self.assertTrue(closure)
+            self.assertEqual(closure['hold_mode'], 1)
+            self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
+            self.assertLessEqual(closure['ccl_a'], closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
+            sim.run(10)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Active'], 0)
+            self.assertEqual(sim.rec.policy_adapter.control['mode'], 'OFF')
+
+    def test_target_change_during_a_lost_lease_releases_the_stale_hold(self):
+        # Stage C / D13: the hold retained through the loss was taken for
+        # another destination; once the bank is back on shore the slider's
+        # own curve applies, as it does with no Solar Priority running.
+        with self.simulation(target=80) as sim:
+            self.wait_for(sim, lambda: not sim.plant.connected)
+            sim.run(60)
+            sim.stop_solar(stalled=True)
+            self.wait_for(sim, lambda: sim.plant.connected, timeout_s=120)
+            sim.run(30)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Active'], 1)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 1)
+            sim.set_target(70)
+            sim.run(5)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Active'], 0)
+            self.assertAlmostEqual(sim.rec.batt['/RecBms/TargetChargeVoltage'],
+                                   round(sim.rec._slider_cvl(70), 2), delta=.011)
+
     def test_a_prepared_hold_return_installs_the_two_sided_hold_first(self):
         # A1/B2 together: a HOLD return is prepared only once mode 3 is
         # anchored, so the pair that reaches the relay is the hold's own

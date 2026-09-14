@@ -35,6 +35,48 @@ class IntentLeaseTests(unittest.TestCase):
                 adapter.prepare_intents(target)
                 self.assertEqual(calls, [expected])
 
+    def test_lost_owner_operator_actions(self):
+        # Stage C / master D13: a retained hold is released once the target
+        # moves during the loss and the bank is back on an accepted input; a
+        # return still in progress keeps it. OFF keeps a hold through the
+        # protected return and releases it once accepted.
+        def adapter_with(hold_mode, connected, lease=None):
+            calls = []
+            adapter = object.__new__(RecPolicyAdapter)
+            adapter.driver = SimpleNamespace(sustain={'active': True, 'mode': hold_mode},
+                boost={'active': False}, cfg=SimpleNamespace(policy_ac_input=1),
+                _set_sustain=calls.append, _set_boost=lambda value: None)
+            adapter.clock = SimpleNamespace(monotonic=lambda: 100.)
+            adapter.transfer = SimpleNamespace(feedback=connected, available=True, limited_by='')
+            adapter.contract = PolicyContract({'owned': True,
+                'policy': {'mode': 'CHARGE', 'target_soc': 80.}}, generation='g')
+            if lease:
+                self.assertTrue(adapter.contract.accept(dict(version=VERSION, generation='g',
+                    request_id=1, mode=lease, target_soc=80., transfer_intent='connected',
+                    requested_limits={'sustain': 0, 'purpose': ''}, lease_s=15.), 100., 80.,
+                    consumer_ready=True))
+            adapter._value = lambda *args: 0 if connected else 240
+            return adapter, calls
+        # target moved during the loss, on shore: released
+        adapter, calls = adapter_with(1, True)
+        adapter.prepare_intents(70.)
+        self.assertEqual(calls, [0])
+        # target moved during the loss, still returning: kept
+        adapter, calls = adapter_with(1, False)
+        adapter.prepare_intents(70.)
+        self.assertEqual(calls, [1])
+        # same target during the loss: kept
+        adapter, calls = adapter_with(3, True)
+        adapter.prepare_intents(80.)
+        self.assertEqual(calls, [3])
+        # OFF while returning keeps the hold; OFF on shore releases it
+        adapter, calls = adapter_with(1, False, lease='OFF')
+        adapter.prepare_intents(80.)
+        self.assertEqual(calls, [1])
+        adapter, calls = adapter_with(1, True, lease='OFF')
+        adapter.prepare_intents(80.)
+        self.assertEqual(calls, [0])
+
     def test_heartbeat_does_not_extend_boost_or_reanchor_floor(self):
         now = [100.0]
         calls = []
