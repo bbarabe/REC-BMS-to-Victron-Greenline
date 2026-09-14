@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -651,7 +651,12 @@ class RecBmsDriver:
         self.heartbeat = Heartbeat.from_environment()
         self.cfg = cfg
         self.bms = {}
-        self.start_ts = time.time()
+        # Every duration in this driver -- boost and sustain expiry, servo
+        # spacing, taper and dusk intervals, sample freshness, the
+        # regulation fault -- is measured on the monotonic clock (3.0.2,
+        # issue #6): a -1 h wall-clock step once kept an accepted boost
+        # alive with 3588 s to go (E10). Wall time is for calendar records
+        # (eqlast) and telemetry only.
         self.start_mono = time.monotonic()
         self.phase_name = None          # for change-only logging
         self.extv = None                # (volts, ts) from the Quattro
@@ -1325,7 +1330,7 @@ class RecBmsDriver:
             log.warning("solar boost refused (%.2fV): %s", volts, why)
             self._pub["/RecBms/SolarBoost/Status"] = "refused: " + why
             return False
-        self.boost = {"active": True, "req_ts": time.time(), "volts": volts}
+        self.boost = {"active": True, "req_ts": time.monotonic(), "volts": volts}
         self._pub["/RecBms/SolarBoost/Applied"] = round(volts, 2)
         self._pub["/RecBms/SolarBoost/Active"] = 1
         self._pub["/RecBms/SolarBoost/Status"] = "ramp"
@@ -1406,11 +1411,11 @@ class RecBmsDriver:
         su = self.sustain
         if su["active"] and su["mode"] == mode:
             # the owner re-asserting its hold: keep the anchor, refresh expiry
-            su["req_ts"] = time.time()
+            su["req_ts"] = time.monotonic()
             return True
         soc, volts = self._live_soc(), self._live_volts()
         self.sustain = self._sustain_idle()
-        self.sustain.update(active=True, mode=mode, req_ts=time.time())
+        self.sustain.update(active=True, mode=mode, req_ts=time.monotonic())
         if soc is None or volts is None:
             # No SOC yet (a restart's first second, or a stale BMS): take the
             # request as PENDING and anchor on the first live tick.
@@ -1454,7 +1459,7 @@ class RecBmsDriver:
         su["soc"] = su["logged_soc"] = su["anchor_soc"] = soc
         su["anchor_v"] = round(self._rest_volts(volts, amps), 2)
         su["servo_v"] = su["logged_servo"] = 0.0
-        su["servo_ts"] = time.time()
+        su["servo_ts"] = time.monotonic()
         su["taper_since"] = 0.0
         s = self._pub
         s["/RecBms/Sustain/Active"] = 1
@@ -1713,7 +1718,7 @@ class RecBmsDriver:
                 v = None
         except Exception:
             v = None
-        self.eff_cv = (v, time.time())
+        self.eff_cv = (v, time.monotonic())
         self._pub["/RecBms/DvccEffectiveChargeVoltage"] = v
         # v1.7.0: is Solar Priority on? Its setting; absent (driver not
         # installed) reads as off, and then no lead is applied.
@@ -1731,7 +1736,7 @@ class RecBmsDriver:
                 a = None
         except Exception:
             a = None
-        self.pv_current = (a, time.time())
+        self.pv_current = (a, time.monotonic())
         return True
 
     def _sustain_ccl(self, now, held, ccl):
@@ -1853,7 +1858,7 @@ class RecBmsDriver:
             log.info("solar boost released on shutdown")
         self.batt["/Info/MaxChargeCurrent"] = 0.0
         self._apply_voltage_commands(self.cfg.safe_cvl, self.cfg.safe_cvl,
-                                     self._safe_voltage(), time.time(), charge_permission=0.0)
+                                     self._safe_voltage(), time.monotonic(), charge_permission=0.0)
 
     def _boost_signal(self, signum, frame):
         self._boost_shutdown()
@@ -1918,13 +1923,13 @@ class RecBmsDriver:
                 bmsid = (can_id & socket.CAN_EFF_MASK) & 0x7FF
                 ok = decode_frame(self.bms, bmsid, data)
                 if not ok and bmsid in MIN_LEN and \
-                        time.time() - self._last_short_warn > 60:
+                        time.monotonic() - self._last_short_warn > 60:
                     log.warning("dropped short frame 0x%03X (len %d, need %d)",
                                 bmsid, len(data), MIN_LEN[bmsid])
-                    self._last_short_warn = time.time()
+                    self._last_short_warn = time.monotonic()
                 if ok and not self._first_frame_logged:
                     log.info("first BMS frame decoded %.0fs after start",
-                             time.time() - self.start_ts)
+                             time.monotonic() - self.start_mono)
                     self._first_frame_logged = True
         except BlockingIOError:
             pass
@@ -1945,7 +1950,7 @@ class RecBmsDriver:
                     name, "/Dc/0/Voltage", BUSITEM, "GetValue", "", [], timeout=2)
                 v = float(raw)
                 if 20 <= v <= 80:
-                    self.extv = (v, time.time())
+                    self.extv = (v, time.monotonic())
                 self._vebus_name = name
         except Exception:
             self._vebus_name = None
@@ -2004,7 +2009,7 @@ class RecBmsDriver:
     def _tick_inner(self):
         c = self.cfg
         bms = self.bms
-        now = time.time()
+        now = time.monotonic()      # elapsed-time basis for every primitive below
 
         # Critical receipt clocks are independent. A serial/heartbeat frame
         # cannot keep stale limits, shunt samples or cell protections LIVE.

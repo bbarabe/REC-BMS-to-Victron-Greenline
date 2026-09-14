@@ -216,6 +216,39 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.assertLessEqual(self.driver.batt['/RecBms/SafeChargeVoltage'], 54)
         self.assertIsNone(self.driver.batt['/RecBms/Raw/Current'])
 
+    def test_boost_and_sustain_expire_on_monotonic_time_despite_wall_clock_steps(self):
+        # E10: after an accepted boost a -1 h wall-clock step left it active
+        # at 132 monotonic seconds, reporting 3588 s remaining.
+        wall = [self.now]
+        R.time = types.SimpleNamespace(time=lambda: wall[0], monotonic=lambda: self.now)
+        self.driver.settings['chargeslider'] = 80
+        for _ in range(3):
+            self.tick()
+        self.assertTrue(self.driver._set_boost(.3))
+        self.assertTrue(self.driver._set_sustain(1))
+        self.assertEqual(self.driver.sustain['servo_ts'], self.now)
+        self.assertEqual(self.driver.boost['req_ts'], self.now)
+        start = self.now
+        for step in (-3600, 7200):
+            wall[0] += step
+            for _ in range(59):
+                self.now += 1
+                feed_complete(self.driver.bms, self.now)
+                self.tick()
+                elapsed = self.now - start
+                self.assertEqual(self.driver.batt['/RecBms/SolarBoost/Active'], 1, elapsed)
+                self.assertEqual(self.driver.batt['/RecBms/Sustain/Active'], 1, elapsed)
+                left = self.driver.batt['/RecBms/SolarBoost/SecondsLeft']
+                self.assertTrue(0 <= left <= self.cfg.boost_hold_s - elapsed + 1, (elapsed, left))
+                self.assertLessEqual(self.driver.batt['/RecBms/Sustain/SecondsLeft'], self.cfg.sustain_hold_s - elapsed + 1)
+        self.now += 3
+        feed_complete(self.driver.bms, self.now)
+        self.tick()
+        self.assertEqual(self.driver.batt['/RecBms/SolarBoost/Active'], 0)
+        self.assertIn('expired', self.driver.batt['/RecBms/SolarBoost/Status'])
+        self.assertEqual(self.driver.batt['/RecBms/Sustain/Active'], 0)
+        self.assertIn('expired', self.driver.batt['/RecBms/Sustain/Status'])
+
     def test_raw_current_is_unquantized_and_limits_are_external(self):
         feed_complete(self.driver.bms, self.now, current=.1)
         self.tick()
