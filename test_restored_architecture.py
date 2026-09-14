@@ -170,6 +170,46 @@ class RestoredPlantTests(unittest.TestCase):
             sim.run(100)
             self.assertEqual(sim.solar.last_request['requested_limits']['sustain'], 0)
 
+    def test_missing_quattro_current_on_shore_keeps_charge_and_its_floor(self):
+        # E02: night CHARGE at 80 %; losing Quattro DC current used to produce a
+        # fresh HOLD/release lease, 59.34 V / 200 A and 4.94 kW into the bank.
+        from solar_priority_plant import BASE, CCL, VEBUS
+        with self.simulation(target=80) as sim:
+            sim.set_sun([0, 0])
+            sim.run(100)
+            self.assertEqual(sim.solar.last_request['mode'], 'CHARGE')
+            sim.bus.invalidate(VEBUS, '/Dc/0/Current')
+            start = len(sim.trace)
+            sim.run(60)
+            request = sim.solar.last_request
+            self.assertEqual((request['mode'], request['requested_limits']['sustain'],
+                              request['transfer_intent']), ('CHARGE', 1, 'connected'))
+            self.assertIn('No data: QuattroDC', sim.solar.sw['/SolarPriority/Status'])
+            self.assertLessEqual(sim.rec.batt[CCL], sim.rec.cfg.sustain_ccl_a + 1)
+            self.assertLessEqual(sim.rec.batt[BASE], sim.plant.voltage + .1)
+            self.assertLess(max(row['battery_w'] for row in sim.trace[start:]), 400)
+            sim.bus.invalid.discard((VEBUS, '/Dc/0/Current'))
+            sim.run(10)
+            self.assertNotIn('No data', sim.solar.sw['/SolarPriority/Status'])
+            self.assertEqual(sim.solar.last_request['mode'], 'CHARGE')
+
+    def test_missing_quattro_current_while_islanded_returns_under_the_floor(self):
+        from solar_priority_plant import BASE, CCL, VEBUS
+        with self.simulation(target=80) as sim:
+            self.until(sim, lambda: not sim.plant.connected)
+            sim.run(120)
+            self.assertEqual(sim.solar.last_request['requested_limits']['sustain'], 0)
+            sim.bus.invalidate(VEBUS, '/Dc/0/Current')
+            self.until(sim, lambda: sim.plant.connected, timeout=60)
+            request = sim.solar.last_request
+            self.assertEqual((request['mode'], request['requested_limits']['sustain'],
+                              request['transfer_intent']), ('CHARGE', 1, 'connected'))
+            sim.run(30)
+            self.assertLessEqual(sim.rec.batt[BASE], sim.plant.voltage + .1)
+            self.assertLessEqual(sim.rec.batt[CCL],
+                                 sim.system['/Dc/Pv/Current'] + sim.rec.cfg.sustain_ccl_a + 1)
+            self.assertLessEqual(sim.plant.q_w, (sim.rec.cfg.sustain_ccl_a + 2) * sim.plant.voltage)
+
     def test_stopped_consumer_lease_returns_to_shore(self):
         with self.simulation() as sim:
             self.until(sim, lambda: not sim.plant.connected)

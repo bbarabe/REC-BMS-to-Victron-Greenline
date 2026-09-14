@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 5 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 1 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.9")
+check("engine version bumped", SP.ENGINE_VERSION == "4.10")
 Val = SP.Val
 
 
@@ -446,6 +446,63 @@ for _ in range(35):
     s.now += 1
     s.out = s.eng.tick(s.now, s.inp)
 check("missing MPPT with healthy bank stays solar", s.out.state == "solar" and s.out.transfer_intent == "island")
+
+# ---- issue #1: a missing decision input keeps the objective and its hold ----
+def drop(s, name):
+    """One engine tick with `name` missing (the Sim refreshes every input)."""
+    setattr(s.inp, name, None)
+    s.now += 1
+    s.out = s.eng.tick(s.now, s.inp)
+    if s.out.cmd is not None:
+        s.cmd = s.out.cmd
+    return s.out
+
+REQUIRED = ("soc", "batt", "load_now", "load_avg", "feed", "ac_out", "quattro_w")
+for target, name, hold in ((80, "charge", "floor"), (40, "discharge", "ceiling")):
+    s = Sim()
+    s.tick(1, soc=60, target=target, batt_v=56.4)
+    check("#1 %s: engaged with the %s" % (name, hold), s.oneway == name and s.out.charge_intent == hold)
+    for field in REQUIRED:
+        s.tick(1)
+        out = drop(s, field)
+        check("#1 %s: missing %s keeps the objective" % (name, field),
+              s.oneway == name and out.oneway == name, "oneway %r" % s.oneway)
+        check("#1 %s: missing %s keeps the %s" % (name, field, hold),
+              out.charge_intent == hold, out.charge_intent)
+        check("#1 %s: missing %s stays on shore, no boost" % (name, field),
+              out.transfer_intent == "shore" and out.state == "shore" and out.boost_v is None
+              and "No data" in out.status_text, out.status_text)
+    s.tick(1)
+    check("#1 %s: fresh data resumes without a sticky failure" % name,
+          s.oneway == name and "No data" not in s.out.status_text, s.out.status_text)
+    check("#1 %s: no 'done' logged for the outage" % name,
+          not any("done (no data" in l for l in s.logs), str(s.logs))
+# the same loss on solar: the floor is asked for on the tick of the loss,
+# before the Quattro can report shore (E02 islanded: 59.34 V / 200 A at return)
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)
+s.tick(95, batt=100.0, cvl=59.49)
+check("#1 islanded: on solar with the floor released", s.state == "solar" and s.sustain == 0)
+out = drop(s, "quattro_w")
+check("#1 islanded: loss returns to shore under the floor at once",
+      out.transfer_intent == "shore" and out.cmd == 0 and out.charge_intent == "floor"
+      and out.sustain == 1 and s.oneway == "charge", "%s %s %s" % (out.transfer_intent, out.charge_intent, out.sustain))
+check("#1 islanded: the transition names the loss", out.status_text == "-> SHORE (no data: QuattroDC)" and out.oneway == "charge",
+      out.status_text)
+s.tick(340)
+check("#1 islanded: fresh data leaves for solar again", s.state == "solar" and s.oneway == "charge", s.state)
+s.tick(1, soc=79.5, batt=0.0)
+check("#1: arrival is still judged once the SOC is fresh", s.oneway is None and s.sustain == 0)
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+out = drop(s, "soc")
+check("#1: no SOC keeps the last objective and a '?' in the status",
+      s.oneway == "charge" and out.charge_intent == "floor" and out.status_text.startswith("1-WAY CHARGE ?->80% |"),
+      out.status_text)
+s.inp.enabled = False
+out = drop(s, "soc")
+check("#1: a disable still releases during an outage", s.oneway is None and out.charge_intent == "release")
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:

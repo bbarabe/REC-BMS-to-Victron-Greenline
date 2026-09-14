@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.9"
+ENGINE_VERSION = "4.10"
 
 ENGINE_DEFAULTS = {
     "SOLAR_MARGIN": 1.2, "MIN_EST_W": 100, "READY_MS": 30000, "RAMP_MS": 90000,
@@ -502,9 +502,17 @@ class Engine:
         # floor -- so the feature stands aside.
         full = (tgt is not None and t["ONEWAY_FULL_PCT"] > 0
                 and tgt.v >= t["ONEWAY_FULL_PCT"])
-        if not enabled or missing or tgt is None or full:
+        # The objective is judged on the target and the SOC alone. A missing
+        # transport input (Quattro DC, load, ActiveIn, a heartbeat) sends the
+        # state machine to shore below; it is not arrival, not a disable and
+        # not a new target, so the objective and its hold stand until fresh
+        # data can judge them again. Clearing it here handed the shore
+        # charger the full slider under a fresh HOLD/release lease (E02:
+        # 56.42 V / 5 A became 59.34 V / 200 A). With no SOC at all the
+        # last objective stands as well.
+        if not enabled or tgt is None or full:
             oneway = None
-        else:
+        elif soc is not None:
             delta = tgt.v - soc.v
             if oneway == "charge" and delta <= t["ONEWAY_EXIT_PCT"]:
                 oneway = None
@@ -525,8 +533,6 @@ class Engine:
             elif st["oneway"] is not None:
                 if not enabled:
                     why = "disabled"
-                elif missing:
-                    why = "no data: " + ",".join(missing)
                 elif tgt is None:
                     why = "no Max Charge target"
                 elif full:
@@ -954,8 +960,9 @@ class Engine:
                             pvNow, "+" if batt.v >= 0 else "", batt.v, loadNow.v, soc.v)
 
         if oneway and status[1] and not status[1].startswith("->"):
-            status[1] = "%s %.0f->%.0f%% | %s" % (
-                "1-WAY CHARGE" if owc else "1-WAY DISCHARGE", soc.v, tgt.v, status[1])
+            status[1] = "%s %s->%.0f%% | %s" % (
+                "1-WAY CHARGE" if owc else "1-WAY DISCHARGE",
+                "%.0f" % soc.v if soc is not None else "?", tgt.v, status[1])
 
         # ---- Command emission ----
         if st["lastSent"] != st["desired"] or (enabled and now - st["lastAssert"] >= t["ASSERT_MS"]):
@@ -972,9 +979,13 @@ class Engine:
         # available (2026-09-06: a 1 kW load on solar, no shore power) the
         # Quattro keeps inverting whatever it is told, and a floor then does
         # nothing but pin the CVL at the present SOC and stop solar charging.
+        # With a required input missing the engine is heading for shore on
+        # data it cannot judge: the floor is then wanted regardless of what
+        # the Quattro reports (or fails to report), so that it is in force
+        # before the charger is, not one tick after it (issue #1).
         onShore = feed is not None and feed.v == FEED_SHORE
         if owc:
-            want = (SUSTAIN_FLOOR if st["state"] in ("shore", "suspend") and onShore
+            want = (SUSTAIN_FLOOR if st["state"] in ("shore", "suspend") and (onShore or missing)
                     else SUSTAIN_OFF)
         elif owd:
             want = SUSTAIN_CEILING
