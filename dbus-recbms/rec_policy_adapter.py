@@ -465,9 +465,13 @@ class RecPolicyAdapter:
                              getattr(transfer, 'limited_by', '') != 'shore unavailable')
                 if policy == 'DISCHARGE':
                     sustain = 2
-                elif policy == 'CHARGE' and (accepted or returning):
+                elif policy in ('CHARGE', 'HOLD') and (accepted or returning):
                     # The first exact charger readback still gates current.
-                    sustain = 1
+                    # A HOLD reconstructs the two-sided hold (3) exactly as
+                    # CHARGE reconstructs its floor: without it the slider
+                    # curve comes back with the standing lead under it and
+                    # the Quattro sits below the bank (E04/D03).
+                    sustain = 1 if policy == 'CHARGE' else 3
         self.driver._set_sustain(sustain)
         if not active:
             if self.driver.boost.get('active'):
@@ -594,15 +598,16 @@ class RecPolicyAdapter:
             # A return waits for the pair itself -- the REC's own readback of
             # the requested voltages and the current limit -- not for the
             # transport sources that a departure needs.
-            # -- and, under a directional policy, for the hold that makes the
+            # -- and, under any regulating policy, for the hold that makes the
             # pair a protection at all: a CHARGE return is prepared only once
             # its floor is anchored (the engine's request, or the REC's own
             # reconstruction above, one tick later), a DISCHARGE return once
-            # its ceiling is.
+            # its ceiling is, and a HOLD return once its two-sided hold is.
             hold = self.driver.sustain
             hold_mode = hold.get('mode') if hold.get('active') and hold.get('soc') is not None else None
             protected = ((mode != 'CHARGE' or hold_mode == 1) and
-                         (mode != 'DISCHARGE' or hold_mode == 2))
+                         (mode != 'DISCHARGE' or hold_mode == 2) and
+                         (mode != 'HOLD' or hold_mode == 3))
             if connected is False and intent == 'island':
                 transfer_ready = safe
             elif intent == 'connected':

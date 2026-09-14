@@ -534,8 +534,16 @@ def register_service(svc):
         svc.register()
 
 
+SUSTAIN_OFF = 0        # released: the slider's own curve applies
 SUSTAIN_FLOOR = 1      # held SOC may only rise (solar charges, shore holds)
 SUSTAIN_CEILING = 2    # held SOC may only fall (loads drain, nothing charges)
+SUSTAIN_HOLD = 3       # two-sided: the bank is kept AT the slider's target
+SUSTAIN_NAMES = {SUSTAIN_FLOOR: "floor", SUSTAIN_CEILING: "ceiling",
+                 SUSTAIN_HOLD: "hold"}
+
+
+def sustain_name(mode):
+    return SUSTAIN_NAMES.get(mode, "off")
 
 
 def standing_lead(lead_v, slider, full_pct, sp_enabled, needs_sp=True):
@@ -563,6 +571,12 @@ def sustain_hold(mode, held, soc, charging, sun):
     over the night of 2026-09-09; with it, a rise at night is the Quattro's
     and the servo answers it instead. A ceiling follows the bank downward,
     always: a drain is the plan. No SOC (BMS not live) keeps the hold.
+
+    A two-sided hold (mode 3, v3.2.0) ratchets nowhere: it holds the
+    DESTINATION, not what the bank happens to reach, so the held value
+    comes back unchanged and _service_sustain judges the bank against the
+    slider itself. Moving the slider inside a HOLD simply moves the
+    reference; the engine changes mode when the change is a large one.
     Pure, so it can be tested off the boat.
     """
     if soc is None:
@@ -574,12 +588,13 @@ def sustain_hold(mode, held, soc, charging, sun):
     return held
 
 
-def sustain_servo(mode, err, charging, deadband, draining=True):
+def sustain_servo(mode, err, charging, deadband, draining=True, filling=False):
     """Which way to move the hold voltage this servo period: +1 up, -1
     down, 0 leave it. err is SOC minus the (slider-bounded) held SOC in
     percent; charging says whether the shore charger is pushing current
     into the bank (see shore_charging); draining says whether current is
-    still leaving the bank.
+    still leaving the bank; filling says whether ANY source is putting
+    current into it.
 
     Floor: the bank more than a deadband UNDER the held SOC AND still
     draining is a sag the Quattro is not covering -> up. Once the bank
@@ -588,9 +603,24 @@ def sustain_servo(mode, err, charging, deadband, draining=True):
     on until the bank was back above the line wound the command up 0.5 V
     ahead of the Quattro's slow response on 2026-09-09 and overshot by
     0.25 %.) The Quattro charging it more than a deadband ABOVE -> down.
-    Solar raising it, or a wobble inside the band, is left alone. Ceiling:
-    nothing may charge, so the Quattro charging is always -> down, and a
-    drain is the plan.
+    Solar raising it, or a wobble inside the band, is left alone.
+
+    Ceiling: nothing may charge, so a bank being FILLED is always -> down,
+    and a drain is the plan. Answering only the inferred Quattro (v1.8.x)
+    let the sun put 17.684 Ah back into a descending bank over eight
+    alternating hours, 1.228 % reverse (E08, master D07/SP40): a positive
+    battery current from any source is reverse movement. Zero current --
+    a sunny plateau with PV carrying the loads at the ceiling -- is not
+    filling and is left alone (SP38).
+
+    Hold (mode 3, v3.2.0): two-sided. Under its destination and still
+    draining -> up, exactly as the floor. Above it -> down whatever is
+    responsible: the sun, the Quattro, or simply a bank the loads should
+    be allowed to bring down at night. (The old release left the slider
+    curve with the 0.15 V standing lead under it, the Quattro sat below
+    the bank and a steady -49 W drained 1.448 points in 24 h: E04/D03.)
+    A bank still under its destination that solar is raising is left
+    alone -- finishing the last bit is the band's job.
     """
     if mode == SUSTAIN_FLOOR:
         if err < -deadband and draining:
@@ -598,7 +628,13 @@ def sustain_servo(mode, err, charging, deadband, draining=True):
         if err > deadband and charging:
             return -1
         return 0
-    if mode == SUSTAIN_CEILING and charging:
+    if mode == SUSTAIN_HOLD:
+        if err < -deadband and draining:
+            return 1
+        if err > deadband:
+            return -1
+        return 0
+    if mode == SUSTAIN_CEILING and (charging or filling):
         return -1
     return 0
 
@@ -930,11 +966,13 @@ class RecBmsDriver:
         # hold the bank where it is instead of moving it. Write 1 to hold a
         # floor (the held SOC follows the bank upward only -- solar may raise
         # it, the charger never lowers it), 2 to hold a ceiling (follows
-        # downward only -- loads may lower it, nothing raises it), 0 to
-        # release. Both stay inside the real slider target. It ALWAYS
-        # expires after [sustain] hold_s -- see _service_sustain() -- so a
-        # requester that dies cannot leave the bank pinned. Reads back -1
-        # while a hold is active (see _service_sustain).
+        # downward only -- loads may lower it, nothing raises it), 3 to hold
+        # the slider's own target from both sides (v3.2.0: the held SOC is
+        # the destination, the servo answers a drain and a fill alike and
+        # the MPPT band closes at the target), 0 to release. All stay inside
+        # the real slider target. It ALWAYS expires after [sustain] hold_s
+        # -- see _service_sustain() -- so a requester that dies cannot leave
+        # the bank pinned. Reads back -1 while a hold is active.
         svc.add_path("/RecBms/Sustain/Request", 0, writeable=True,
                      onchangecallback=self._sustain_requested)
         svc.add_path("/RecBms/Sustain/Active", 0)
@@ -946,8 +984,8 @@ class RecBmsDriver:
         # the charge current limit in force for the hold (None: not capped)
         svc.add_path("/RecBms/Sustain/ChargeLimit", None, gettextcallback=a1)
         # v1.8.0: the voltage the hold sits at (the Quattro's command under
-        # a floor, the MPPT ceiling under a ceiling) and the SOC servo's
-        # correction included in it
+        # a floor or a two-sided hold, the MPPT ceiling under a ceiling) and
+        # the SOC servo's correction included in it
         svc.add_path("/RecBms/Sustain/HoldVoltage", None, gettextcallback=v2)
         svc.add_path("/RecBms/Sustain/Servo", 0.0, gettextcallback=v2)
 
@@ -1403,7 +1441,7 @@ class RecBmsDriver:
         if mode == 0:
             self._sustain_clear("released by requester")
             return True
-        if mode not in (SUSTAIN_FLOOR, SUSTAIN_CEILING):
+        if mode not in (SUSTAIN_FLOOR, SUSTAIN_CEILING, SUSTAIN_HOLD):
             return False
         if not self.cfg.sustain_enabled:
             self._pub["/RecBms/Sustain/Status"] = "refused: disabled in config"
@@ -1431,7 +1469,7 @@ class RecBmsDriver:
             s["/RecBms/Sustain/Servo"] = 0.0
             s["/RecBms/Sustain/Status"] = "pending: no SOC yet"
             log.info("sustain %s requested before the BMS is live; pending",
-                     "floor" if mode == SUSTAIN_FLOOR else "ceiling")
+                     sustain_name(mode))
             return True
         self._sustain_anchor(soc, volts, self.bms.get("current"), "requested")
         return True
@@ -1453,9 +1491,11 @@ class RecBmsDriver:
         inside the slider's range, and a hold outside that range clipped
         to the curve's edge held the bank a full 10 % away from where it
         was (2026-09-07). Whatever error remains, the SOC servo takes it
-        out within minutes."""
+        out within minutes. A two-sided hold (mode 3) anchors exactly the
+        same way -- present rest voltage, I x R compensated -- and its
+        servo then works both ways from there."""
         su = self.sustain
-        floor = su["mode"] == SUSTAIN_FLOOR
+        name = sustain_name(su["mode"])
         su["soc"] = su["logged_soc"] = su["anchor_soc"] = soc
         su["anchor_v"] = round(self._rest_volts(volts, amps), 2)
         su["servo_v"] = su["logged_servo"] = 0.0
@@ -1467,26 +1507,53 @@ class RecBmsDriver:
         s["/RecBms/Sustain/Soc"] = round(soc, 1)
         s["/RecBms/Sustain/HoldVoltage"] = su["anchor_v"]
         s["/RecBms/Sustain/Servo"] = 0.0
-        s["/RecBms/Sustain/Status"] = "floor" if floor else "ceiling"
+        s["/RecBms/Sustain/Status"] = name
         log.info("sustain %s at %.1f%% anchored %.2fV (%s; expires in %.0fs "
-                 "unless re-asserted)", "floor" if floor else "ceiling", soc,
+                 "unless re-asserted)", name, soc,
                  su["anchor_v"], why, self.cfg.sustain_hold_s)
 
     def _sustain_reanchor(self, volts, amps, why):
         """The bank moved a full step the hold's way: the hold voltage
         follows it -- a floor up and never down, a ceiling down and never
-        up -- and the servo starts afresh from the new anchor."""
+        up -- and the servo starts afresh from the new anchor. A two-sided
+        hold (mode 3) is never re-anchored: it holds a destination, not
+        wherever the bank got to, and its own servo is the correction."""
         su = self.sustain
-        floor = su["mode"] == SUSTAIN_FLOOR
+        name = sustain_name(su["mode"])
         hold_v = su["anchor_v"] + su["servo_v"]
         volts = self._rest_volts(volts, amps)
-        new = max(hold_v, volts) if floor else min(hold_v, volts)
+        new = (max(hold_v, volts) if su["mode"] == SUSTAIN_FLOOR else
+               min(hold_v, volts) if su["mode"] == SUSTAIN_CEILING else volts)
         su["anchor_v"] = round(new, 2)
         su["anchor_soc"] = su["soc"]
         su["servo_v"] = su["logged_servo"] = 0.0
         su["taper_since"] = 0.0
         log.info("sustain %s re-anchored %.2fV -> %.2fV (%s)",
-                 "floor" if floor else "ceiling", hold_v, su["anchor_v"], why)
+                 name, hold_v, su["anchor_v"], why)
+
+    def _sustain_band(self, lead_v, soc, slider):
+        """The MPPTs' headroom over the hold voltage this tick, in volts.
+
+        One helper, because _tick_inner decides the lead in force and
+        _service_sustain the charge target out of the same figure and they
+        must not disagree. A floor gives the sun band_v while the bank is
+        under the slider. A two-sided hold gives it only while the bank is
+        more than a servo deadband UNDER its destination -- the sun may
+        finish the last bit -- and nothing at or above it, so PV is
+        curtailed at the hold voltage once the loads are covered
+        (SP23/SP28, repair plan B2). A ceiling never has one. The lead is
+        a Solar Priority tool: with none in force there is no way to give
+        only the MPPTs headroom, so there is none."""
+        su = self.sustain
+        c = self.cfg
+        if not su["active"] or lead_v <= 0:
+            return 0.0
+        if su["mode"] == SUSTAIN_FLOOR:
+            return max(lead_v, c.sustain_band_v) if (soc is None or soc < slider) else 0.0
+        if su["mode"] == SUSTAIN_HOLD:
+            return (c.sustain_band_v if soc is not None
+                    and soc < slider - c.sustain_servo_db else 0.0)
+        return 0.0
 
     def _sustain_target(self, band):
         """The charge voltage a hold asks for: the MPPT ceiling. A floor
@@ -1494,7 +1561,9 @@ class RecBmsDriver:
         voltage so the sun can raise the bank; a ceiling puts them at it,
         so nothing charges above where the bank was. The Quattro is
         commanded a lead under the target as always, which lands it ON the
-        hold voltage under a floor and a lead under it under a ceiling."""
+        hold voltage under a floor and a lead under it under a ceiling.
+        Under a two-sided hold the lead in force IS this band (0 or
+        band_v), so the Quattro lands on the hold voltage either way."""
         su = self.sustain
         hold_v = round(su["anchor_v"] + su["servo_v"], 2)
         return round(min(hold_v + band, self.cfg.cvl_max), 2)
@@ -1532,7 +1601,8 @@ class RecBmsDriver:
             self._sustain_clear("expired after %.0fs" % c.sustain_hold_s)
             return None
         floor = su["mode"] == SUSTAIN_FLOOR
-        name = "floor" if floor else "ceiling"
+        hold = su["mode"] == SUSTAIN_HOLD
+        name = sustain_name(su["mode"])
         if su["soc"] is None:
             # pending: nothing to hold until the bank is known
             if soc is None or volts is None:
@@ -1543,56 +1613,59 @@ class RecBmsDriver:
         # already holds (no callback), so a re-assert of the same mode would
         # never refresh the expiry, and a release (0) would be lost if the
         # path read 0. Reading the request back as -1 while active makes
-        # every 0/1/2 write a change; the state lives in /Active and /Mode.
+        # every 0/1/2/3 write a change; the state lives in /Active and /Mode.
         self._pub["/RecBms/Sustain/Request"] = -1
 
         pv_a = self._fresh_pv(now)
         charging = shore_charging(amps, pv_a, c.sustain_q_idle_a)
-        held_eff = su["soc"]
+        # v1.8.3: the DC loads alone drain this bank at ~0.9 A, under the
+        # 1 A "Quattro charging" threshold 1.8.1 reused here, so a whole
+        # night's drain went unseen. Draining has its own bar, and filling
+        # -- current INTO the bank from any source, the sun included
+        # (E08/D07) -- is the same bar the other way.
+        draining = amps is not None and amps < -c.sustain_drain_a
+        filling = amps is not None and amps > c.sustain_drain_a
+        # A two-sided hold holds the DESTINATION: the slider is the
+        # reference every tick, whatever the bank has reached (v3.2.0).
+        held_eff = slider if hold else su["soc"]
         if soc is not None:
             sun = pv_a is not None and pv_a >= c.sustain_pv_min_a
             su["soc"] = sustain_hold(su["mode"], su["soc"], soc, charging, sun)
             # The held SOC has moved a full step the hold's way since the
             # hold voltage was last anchored: the voltage follows it (a
-            # floor only ever rises this way on sun, see sustain_hold).
-            moved = (su["soc"] - su["anchor_soc"]) if floor else (su["anchor_soc"] - su["soc"])
-            if moved >= c.sustain_step and volts is not None:
-                self._sustain_reanchor(volts, amps, "SOC %+.1f%% since the anchor, now %.1f%%"
-                                       % (moved if floor else -moved, su["soc"]))
-            # a floor never holds more than the owner set, a ceiling never
-            # less: the servo judges the bank against the bounded value
-            held_eff = min(su["soc"], slider) if floor else max(su["soc"], slider)
+            # floor only ever rises this way on sun, see sustain_hold). A
+            # two-sided hold ratchets nowhere, so it never re-anchors.
+            if not hold:
+                moved = (su["soc"] - su["anchor_soc"]) if floor else (su["anchor_soc"] - su["soc"])
+                if moved >= c.sustain_step and volts is not None:
+                    self._sustain_reanchor(volts, amps, "SOC %+.1f%% since the anchor, now %.1f%%"
+                                           % (moved if floor else -moved, su["soc"]))
+                # a floor never holds more than the owner set, a ceiling never
+                # less: the servo judges the bank against the bounded value
+                held_eff = min(su["soc"], slider) if floor else max(su["soc"], slider)
             if now - su["servo_ts"] >= c.sustain_servo_s:
                 su["servo_ts"] = now
-                # v1.8.3: the DC loads alone drain this bank at ~0.9 A, under
-                # the 1 A "Quattro charging" threshold 1.8.1 reused here, so
-                # a whole night's drain went unseen. Draining has its own bar.
-                draining = amps is not None and amps < -c.sustain_drain_a
-                d = sustain_servo(su["mode"], soc - held_eff, charging, c.sustain_servo_db, draining)
+                d = sustain_servo(su["mode"], soc - held_eff, charging,
+                                  c.sustain_servo_db, draining, filling)
                 if d:
                     su["servo_v"] = max(-c.sustain_servo_down, min(
                         c.sustain_servo_up, su["servo_v"] + d * c.sustain_servo_v))
-        # The solar band: under a floor the MPPTs get band_v of headroom
-        # above the hold voltage (the tick widened the lead to it), as long
-        # as the bank is under the slider. The lead is a Solar Priority
-        # tool: with none in force there is no way to give only the MPPTs
-        # headroom, so there is none. The band is asked for even while the
-        # offset goes unapplied (issue #3): the Quattro is commanded the
-        # hold voltage less the lead, so dropping the band alone put it a
-        # band UNDER the hold and let the bank drain; with the offset
-        # ignored the chargers simply all get the hold voltage, which is
-        # the restrictive outcome, and the fault reports it. A ceiling has
-        # no band, but lets the bank charge back up to the slider's own
-        # point if it is under it.
-        band = 0.0
-        if floor:
-            if self.lead_v > 0 and (soc is None or soc < slider):
-                band = self.lead_v
-            target = self._sustain_target(band)
-        else:
-            target = self._sustain_target(0.0)
-            if soc is not None and soc < slider:
-                target = max(target, round(self._slider_cvl(slider), 2))
+        # The solar band (see _sustain_band): under a floor the MPPTs get
+        # band_v of headroom above the hold voltage while the bank is under
+        # the slider; under a two-sided hold only while it is a deadband
+        # under its destination, and nothing at or above it. The tick set
+        # the lead in force from the same helper, so the Quattro is
+        # commanded target - band = the hold voltage itself. The band is
+        # asked for even while the offset goes unapplied (issue #3):
+        # dropping it alone put the Quattro a band UNDER the hold and let
+        # the bank drain; with the offset ignored the chargers simply all
+        # get the hold voltage, which is the restrictive outcome, and the
+        # fault reports it. A ceiling has no band, but lets the bank charge
+        # back up to the slider's own point if it is under it.
+        band = self._sustain_band(self.lead_v, soc, slider)
+        target = self._sustain_target(band)
+        if not floor and not hold and soc is not None and soc < slider:
+            target = max(target, round(self._slider_cvl(slider), 2))
         # Dusk snap (v1.8.4). A hold's voltage is only ever set from a
         # measurement: when the hold is taken, on a full SOC step, when the
         # band is absorbed -- and here, when the sun goes. A sunny afternoon
@@ -1602,8 +1675,10 @@ class RecBmsDriver:
         # pv_min_a for dusk_s after a day of sun, the hold snaps to the
         # bank's present voltage (less the drop across the pack): a floor
         # never down, a ceiling never up. One snap per night; the servo
-        # below is only the backstop after it.
-        if soc is not None and volts is not None:
+        # below is only the backstop after it. A two-sided hold has no
+        # snap and no band-absorbed step: those are one-way staircase
+        # mechanisms, and its servo answers both directions already.
+        if not hold and soc is not None and volts is not None:
             sun_now = pv_a is not None and pv_a >= c.sustain_pv_min_a
             if sun_now:
                 su["sun_seen"] = True
@@ -1641,7 +1716,8 @@ class RecBmsDriver:
         if abs(su["servo_v"] - su["logged_servo"]) >= 0.05 - 1e-9:
             log.info("sustain %s servo %+.2fV: bank %.2f%% vs held %.1f%% (%s)",
                      name, su["servo_v"], soc if soc is not None else -1, held_eff,
-                     "Quattro charging" if charging else "draining")
+                     "Quattro charging" if charging else
+                     "filling" if filling else "draining")
             su["logged_servo"] = su["servo_v"]
         s = self._pub
         s["/RecBms/Sustain/Soc"] = round(held_eff, 1)
@@ -2079,17 +2155,25 @@ class RecBmsDriver:
         slider = float(self.settings["chargeslider"] or c.slider_default)
         self.policy_adapter.prepare_intents(slider)
         # The standing solar lead (v1.7.0) is decided first: a sustain hold
-        # uses it as the MPPTs' headroom over the hold voltage.
+        # uses it as the MPPTs' headroom over the hold voltage. Only the
+        # BMS's own SOC judges the band, never the safe substitute.
+        bms_soc = bms.get("socHiRes") if bms.get("socHiRes") is not None else bms.get("soc")
+        live_soc = float(bms_soc) if (live and bms_soc is not None) else None
         self.lead_v = standing_lead(c.solar_lead, slider, c.lead_full_pct,
                                     self.sp_enabled, c.lead_needs_sp)
         # Under a floor the lead IS the MPPTs' solar band over the hold
         # voltage (the Quattro sits on the hold voltage either way), and a
         # band the size of the standing lead throttled the sun most of a
-        # simulated day: widen it to band_v while the floor holds.
-        if self.lead_v > 0 and self.sustain["active"] and \
-                self.sustain["mode"] == SUSTAIN_FLOOR and \
-                (not live or self.sustain["soc"] is None or soc < slider):
-            self.lead_v = max(self.lead_v, c.sustain_band_v)
+        # simulated day: widen it to band_v while the floor holds. Under a
+        # two-sided hold the lead IS the band exactly, band_v or nothing:
+        # leaving the standing 0.15 V in force at the destination would put
+        # the Quattro that much UNDER the hold -- the very thing repair
+        # plan B2 warns about, and what drained 1.448 points in 24 h (E04).
+        band = self._sustain_band(self.lead_v, live_soc, slider)
+        if self.sustain["active"] and self.sustain["mode"] == SUSTAIN_HOLD:
+            self.lead_v = band
+        else:
+            self.lead_v = max(self.lead_v, band)
         if self._lead_logged != self.lead_v:
             log.info("solar lead %.2fV -> %.2fV (Solar Priority %s, "
                      "slider %.0f%%, full at %.0f%%)",
@@ -2104,9 +2188,8 @@ class RecBmsDriver:
         # pending floor anchored on the first live tick after a restart,
         # before the SOC frame had arrived, took the 50 % stand-in as the
         # held SOC (2026-09-10 17:01 UTC, bank at 36 %).
-        bms_soc = bms.get("socHiRes") if bms.get("socHiRes") is not None else bms.get("soc")
         held = self._service_sustain(
-            now, float(bms_soc) if (live and bms_soc is not None) else None, slider,
+            now, live_soc, slider,
             bms["voltage"] if (live and bms.get("voltage") is not None) else None,
             bms["current"] if (live and bms.get("current") is not None) else None)
         slider_cvl = held if held is not None else self._slider_cvl(slider)
