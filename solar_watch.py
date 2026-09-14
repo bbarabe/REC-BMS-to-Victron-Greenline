@@ -93,11 +93,26 @@ def record(args):
             edges.append((time.time(), field, latest.get(field), value))
         latest[field] = value
 
+    received = {'at': time.time()}
+
+    def on_connect(client, userdata, flags, rc):
+        # (Re)subscribe on every connection: a broker restart or a Wi-Fi
+        # drop otherwise leaves a live but deaf client (seen 2026-09-14 06:43
+        # UTC, both recorders silent from the same second).
+        for topic in lookup:
+            client.subscribe(topic)
+        received['at'] = time.time()
+        print('%s connected (rc %s), %d topics' % (time.strftime('%H:%M:%S', time.gmtime()), rc, len(lookup)), flush=True)
+
+    def on_message_wrapped(client, userdata, msg):
+        received['at'] = time.time()
+        on_message(client, userdata, msg)
+
     client = mqtt.Client()
-    client.on_message = on_message
+    client.on_connect = on_connect
+    client.on_message = on_message_wrapped
+    client.reconnect_delay_set(min_delay=1, max_delay=30)
     client.connect(args.host, 1883, 60)
-    for topic in lookup:
-        client.subscribe(topic)
     client.loop_start()
     deadline = time.time() + args.hours * 3600
     last_keepalive = 0.0
@@ -105,8 +120,21 @@ def record(args):
         while time.time() < deadline:
             now = time.time()
             if now - last_keepalive >= 30:
-                client.publish('R/%s/keepalive' % args.portal, '')
+                try:
+                    client.publish('R/%s/keepalive' % args.portal, '')
+                except Exception as exc:  # the loop thread reconnects; keep recording
+                    print('keepalive failed: %s' % exc, flush=True)
                 last_keepalive = now
+            if now - received['at'] > 120:
+                # Nothing for two minutes: the broker publishes on every
+                # keepalive, so the connection is dead however it looks.
+                print('%s no messages for %.0f s; reconnecting' % (
+                    time.strftime('%H:%M:%S', time.gmtime(now)), now - received['at']), flush=True)
+                received['at'] = now
+                try:
+                    client.reconnect()
+                except Exception as exc:
+                    print('reconnect failed: %s' % exc, flush=True)
             row = dict(latest)
             row['t'] = round(now, 1)
             row['iso'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))
