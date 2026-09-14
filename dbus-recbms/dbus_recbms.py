@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -166,7 +166,7 @@ class Config:
         # verify the offset against systemcalc /Control/EffectiveChargeVoltage:
         # a mismatch must persist this long before it counts (DVCC only
         # adjusts every 3 s, so a slider move is briefly inconsistent)
-        self.lead_verify_s = self._number(v.get("lead_verify_s", 10))
+        self.lead_verify_s = self._number(v.get("lead_verify_s", 30))
         self.lead_fault_alarm = \
             str(v.get("lead_fault_alarm", "true")).lower() != "false"
 
@@ -680,18 +680,19 @@ class RecBmsDriver:
         self.sustain = self._sustain_idle()
         self.last_target = None
         self._last_offset_warn = 0.0
-        # Lead verification (v1.4.0): what DVCC actually sends the MPPTs
         self.eff_cv = None                  # (volts or None, ts) from systemcalc
         self.pv_current = None              # (amps or None, ts) from systemcalc
-        self._last_pub_cvl = None           # /Info/MaxChargeVoltage we published
-        self._last_offset = None            # unknown until actual readback
         self.charge_guard_reason = ""
+        self.applied_reason = ""            # why _voltage_applied last said no
         self.voltage_control = VoltageEnvelope(
             self._publish_voltage_base, self._boost_write,
             self._read_solar_offset, self._voltage_applied)
         self.sp_enabled = None              # /Settings/SolarPriority/Enabled, polled
         self.lead_v = 0.0                   # standing lead in force this tick
         self._lead_logged = None
+        # Regulation fault (issue #3): the requested voltage pair has gone
+        # unverified for lead_verify_s. Boosts are refused, the lead reads
+        # 0, /RecBms/LeadFault says why and InternalFailure warns.
         self.lead_fault = {"active": False, "since": 0.0, "msg": "",
                            "mismatch_since": 0.0}
         self._check_access_level()
@@ -1087,7 +1088,6 @@ class RecBmsDriver:
         # Deliberately outside the telemetry batch: offset writes must never
         # overtake a buffered reduction of the battery's base CVL.
         self.batt["/Info/MaxChargeVoltage"] = volts
-        self._last_pub_cvl = volts
 
     def _voltage_applied(self, base, offset):
         """Fresh DVCC and charger setpoints must confirm the safe pair.
@@ -1099,7 +1099,18 @@ class RecBmsDriver:
         effective = self._read_number(self.cfg.boost_service,
                                       "/Control/EffectiveChargeVoltage")
         safe = self._safe_voltage()
-        if effective is None or effective > safe + 1e-8 or abs(effective - (base + offset)) > 0.015:
+        self.applied_reason = ""
+        if effective is None:
+            self.applied_reason = "systemcalc /Control/EffectiveChargeVoltage unavailable (DVCC off or systemcalc down?)"
+            return False
+        if effective > safe + 1e-8 or abs(effective - (base + offset)) > 0.015:
+            if offset > 0.005 and abs(effective - base) <= 0.015:
+                # the base went through and the offset did not: the access
+                # level gate (see _check_access_level)
+                self.applied_reason = ("systemcalc ignores the solar offset: MPPTs get %.2fV, "
+                                       "expected %.2fV" % (effective, base + offset))
+            else:
+                self.applied_reason = "DVCC effective %.2fV, expected %.2fV" % (effective, base + offset)
             return False
         seen = False
         for name in self.sbus.list_names():
@@ -1114,11 +1125,18 @@ class RecBmsDriver:
             if connected == 0:
                 continue
             if connected != 1:
+                self.applied_reason = "%s: /Connected unknown" % name
                 return False
             actual = self._read_number(name, path)
-            if actual is None or actual < 0 or actual > min(ceiling + 0.015, safe + 1e-8):
+            if actual is None:
+                self.applied_reason = "%s: %s readback missing" % (name, path)
+                return False
+            if actual < 0 or actual > min(ceiling + 0.015, safe + 1e-8):
+                self.applied_reason = "%s: %s at %.2fV, above %.2fV" % (name, path, actual, ceiling)
                 return False
             seen = True
+        if not seen:
+            self.applied_reason = "no charger on the bus"
         return seen
 
     def _voltage_within_envelope(self, safe):
@@ -1220,7 +1238,6 @@ class RecBmsDriver:
             self.batt["/Info/MaxChargeCurrent"] = 0.0
         controller = self.voltage_control
         ready = controller.step(quattro, solar, safe)
-        self._last_offset = controller.offset
         s = self._pub
         s["/RecBms/Voltage/RequestedQuattro"] = controller.requested_quattro
         s["/RecBms/Voltage/RequestedSolar"] = controller.requested_solar
@@ -1553,14 +1570,18 @@ class RecBmsDriver:
         # The solar band: under a floor the MPPTs get band_v of headroom
         # above the hold voltage (the tick widened the lead to it), as long
         # as the bank is under the slider. The lead is a Solar Priority
-        # tool: with none in force, or while systemcalc ignores it, there
-        # is no way to give only the MPPTs headroom, so there is none. A
-        # ceiling has no band, but lets the bank charge back up to the
-        # slider's own point if it is under it.
+        # tool: with none in force there is no way to give only the MPPTs
+        # headroom, so there is none. The band is asked for even while the
+        # offset goes unapplied (issue #3): the Quattro is commanded the
+        # hold voltage less the lead, so dropping the band alone put it a
+        # band UNDER the hold and let the bank drain; with the offset
+        # ignored the chargers simply all get the hold voltage, which is
+        # the restrictive outcome, and the fault reports it. A ceiling has
+        # no band, but lets the bank charge back up to the slider's own
+        # point if it is under it.
         band = 0.0
         if floor:
-            if self.lead_v > 0 and not self.lead_fault["active"] and \
-                    (soc is None or soc < slider):
+            if self.lead_v > 0 and (soc is None or soc < slider):
                 band = self.lead_v
             target = self._sustain_target(band)
         else:
@@ -1735,48 +1756,42 @@ class RecBmsDriver:
         cap = a + c.sustain_ccl_a
         return min(ccl, cap), round(cap, 1)
 
-    def _verify_lead(self, now):
-        """Compare what DVCC really sends the MPPTs against what we expect
-        from the CVL we published and the offset we wrote last tick.
-        Returns True while the offset is proven (or cannot be judged),
-        False once a mismatch has persisted lead_verify_s."""
-        c = self.cfg
+    def _regulation_fault(self, now, ready):
+        """A voltage pair that stays unapplied is a fault, not a wait.
+
+        The envelope controller reports readiness every tick, and an ordinary
+        update -- a servo step, a slider move, a boost edge -- is not ready
+        for a few seconds while the base, the offset and the chargers'
+        readbacks catch up (7 s in the offline plant). A mismatch that
+        persists lead_verify_s is raised on the existing surface
+        (/RecBms/LeadFault, InternalFailure warning, boosts refused, lead
+        reported 0) and clears the tick the pair is verified again. The
+        commands themselves are not changed: no full-slider fallback.
+        """
         f = self.lead_fault
-        pub, off = self._last_pub_cvl, self._last_offset
-        if pub is None or off is None or off <= 0.005:
-            return not f["active"]          # nothing to verify this tick
-        v, ts = self.eff_cv if self.eff_cv else (None, 0.0)
-        stale = (now - ts) > 15
-        applied = v is not None and abs(v - (pub + off)) <= 0.015
-        ignored = v is not None and abs(v - pub) <= 0.015
-        if applied:
+        if ready:
             f["mismatch_since"] = 0.0
             if f["active"]:
-                log.info("solar lead: systemcalc offset verified in force "
-                         "again (effective %.2fV); fault cleared", v)
-                f["active"] = False
-                f["msg"] = ""
-            return True
-        if ignored or v is None or stale:
-            if not f["mismatch_since"]:
-                f["mismatch_since"] = now
-            elif now - f["mismatch_since"] >= c.lead_verify_s and not f["active"]:
-                lvl = self._settings_get("/Settings/System/AccessLevel")
-                if v is None or stale:
-                    msg = ("systemcalc /Control/EffectiveChargeVoltage "
-                           "unavailable (DVCC off or systemcalc down?)")
-                else:
-                    msg = ("systemcalc ignores the solar offset: MPPTs get "
-                           "%.2fV, expected %.2fV. GX access level is %s "
-                           "(need 3 = Superuser); after raising it run "
-                           "'svc -t /service/dbus-systemcalc-py'"
-                           % (v, pub + off, lvl))
-                f.update(active=True, since=now, msg=msg)
-                log.error("SOLAR LEAD FAULT: %s -- publishing the full "
-                          "target, boosts refused", msg)
-            return not f["active"]
-        # neither matches: a transient (slider just moved, DVCC mid-cycle)
-        return not f["active"]
+                log.info("voltage commands verified again; regulation fault cleared")
+                f.update(active=False, msg="")
+            return
+        if not f["mismatch_since"]:
+            f["mismatch_since"] = now
+            return
+        if f["active"] or now - f["mismatch_since"] < self.cfg.lead_verify_s:
+            return
+        control = self.voltage_control
+        why = self.applied_reason or control.status
+        if why.startswith("systemcalc ignores the solar offset"):
+            why += (". GX access level is %s (need 3 = Superuser); after raising it "
+                    "run 'svc -t /service/dbus-systemcalc-py'"
+                    % self._settings_get("/Settings/System/AccessLevel"))
+        msg = "unapplied for %.0fs: %s [%s; requested %s/%s V, accepted %s/%s V]" % (
+            now - f["mismatch_since"], why, control.status,
+            control.requested_quattro, control.requested_solar, control.base,
+            None if control.offset is None or control.base is None else round(control.base + control.offset, 2))
+        f.update(active=True, since=now, msg=msg)
+        log.error("REGULATION FAULT: %s -- boosts refused, lead reported 0", msg)
 
     def _service_boost(self, now, target):
         """Runs every tick, after the target CVL for this tick is known.
@@ -1821,9 +1836,15 @@ class RecBmsDriver:
         s["/RecBms/SolarBoost/WindowOpen"] = int(bool(s["/RecBms/SolarBoost/WindowOpen"]) and ready)
         if ready and accepted.offset is not None:
             self._last_verified_voltage = (base, base + accepted.offset)
-        maintained = ready or self._voltage_within_envelope(safe)
-        s["/RecBms/LeadFault"] = "" if maintained else accepted.status
-        return min(lead, max(0.0, target - base)) if maintained else 0.0
+        self._regulation_fault(now, ready)
+        s["/RecBms/LeadFault"] = self.lead_fault["msg"] if self.lead_fault["active"] else ""
+        # The lead in force is the verified one. Through an ordinary update
+        # the last verified pair still stands on the chargers; a pair that
+        # was never verified, or has gone unapplied past the fault, is no
+        # lead at all (E14/E15 reported 0.30 V with an effective offset of 0).
+        verified = ready or (getattr(self, "_last_verified_voltage", None) is not None
+                             and not self.lead_fault["active"])
+        return min(lead, max(0.0, target - base)) if verified else 0.0
 
     def _boost_shutdown(self):
         if hasattr(self, 'policy_adapter'):

@@ -187,10 +187,11 @@ SolarVoltageOffset`, which dvcc.py applies **only while the GX access level is
 Superuser** (Settings → General → Access level), evaluated once per systemcalc
 process — though the boat's current firmware applied it at level 2, so the
 gate is version-dependent. After changing the level run
-`svc -t /service/dbus-systemcalc-py`. dbus-recbms ≥ 1.4.0 detects the offset
-being ignored (`/RecBms/LeadFault`, InternalFailure warning) and falls back to
-the full target — so a lead fault after a settings reset is a symptom to fix,
-not a driver bug.
+`svc -t /service/dbus-systemcalc-py`. dbus-recbms ≥ 3.0.1 reports a voltage
+pair that stays unverified for `lead_verify_s` (`/RecBms/LeadFault` names the
+cause, InternalFailure warning, boosts refused, `/RecBms/SolarLead` reads 0);
+the commands themselves stand, there is no fallback to the full target — so a
+lead fault after a settings reset is a symptom to fix, not a driver bug.
 
 ## Deploy order when one component depends on another's D-Bus path
 

@@ -210,6 +210,86 @@ class RestoredPlantTests(unittest.TestCase):
                                  sim.system['/Dc/Pv/Current'] + sim.rec.cfg.sustain_ccl_a + 1)
             self.assertLessEqual(sim.plant.q_w, (sim.rec.cfg.sustain_ccl_a + 2) * sim.plant.voltage)
 
+    def ignore_offset(self, sim):
+        """systemcalc below Superuser: the offset write succeeds, nothing applies it."""
+        original = sim.plant.apply
+        sim.plant.apply = lambda kind, value: original(kind, 0.0 if kind == 'offset_v' else value)
+        return original
+
+    def test_ignored_solar_offset_from_startup_is_an_actionable_fault(self):
+        # E14: CCL stayed 0 for 180 s with Ready 0, an empty LeadFault, no
+        # alarm, and SolarLead 0.30 V while the effective offset was 0.
+        from solar_priority_plant import CCL
+        with self.simulation(target=80) as sim:
+            sim.set_sun([0, 0])
+            self.ignore_offset(sim)
+            sim.run(20)
+            self.assertEqual(sim.rec.batt['/RecBms/SolarLead'], 0.0)
+            self.assertEqual(sim.rec.batt['/RecBms/LeadFault'], '')
+            sim.run(40)
+            fault = sim.rec.batt['/RecBms/LeadFault']
+            self.assertIn('systemcalc ignores the solar offset', fault)
+            self.assertIn('access level', fault)
+            self.assertEqual(sim.rec.batt['/Alarms/InternalFailure'], 1)
+            self.assertEqual(sim.rec.batt['/RecBms/Voltage/Ready'], 0)
+            self.assertEqual(sim.rec.batt['/RecBms/SolarLead'], 0.0)
+            self.assertEqual(sim.rec.batt[CCL], 0)
+            self.assertAlmostEqual(sim.rec.batt['/RecBms/Voltage/RequestedSolar'] -
+                                   sim.rec.batt['/RecBms/Voltage/RequestedQuattro'], .3, places=6)
+            self.assertFalse(sim.rec._set_boost(.3))
+            self.assertIn('solar lead fault', sim.rec.batt['/RecBms/SolarBoost/Status'])
+            self.assertIn('ignores the solar offset', sim.solar.inp.lead_fault)
+
+    def test_lost_solar_offset_after_verification_is_reported_and_recovers(self):
+        # E15: the safe envelope kept 5 A, but nothing said the band was gone.
+        from solar_priority_plant import CCL, OFFSET
+        with self.simulation(target=80) as sim:
+            sim.set_sun([0, 0])
+            sim.run(180)
+            self.assertEqual(sim.rec.batt['/RecBms/Voltage/Ready'], 1)
+            self.assertEqual(sim.rec.batt['/RecBms/SolarLead'], .3)
+            original = self.ignore_offset(sim)
+            sim.plant.apply('offset_v', .3)
+            sim.run(15)
+            self.assertEqual(sim.rec.batt['/RecBms/LeadFault'], '')
+            self.assertEqual(sim.rec.batt['/RecBms/SolarLead'], .3)
+            sim.run(45)
+            self.assertIn('systemcalc ignores the solar offset', sim.rec.batt['/RecBms/LeadFault'])
+            self.assertEqual(sim.rec.batt['/Alarms/InternalFailure'], 1)
+            self.assertEqual(sim.rec.batt['/RecBms/SolarLead'], 0.0)
+            self.assertEqual(sim.rec.batt['/RecBms/Voltage/Ready'], 0)
+            # the objective and the envelope stand: CHARGE, floor, PV + 5 A,
+            # and the Quattro is still commanded the hold voltage, not a band under it
+            self.assertEqual(sim.solar.last_request['mode'], 'CHARGE')
+            self.assertEqual(sim.rec.batt[CCL], sim.rec.cfg.sustain_ccl_a)
+            hold = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
+            self.assertAlmostEqual(sim.rec.batt['/RecBms/Voltage/RequestedQuattro'], hold, delta=.011)
+            self.assertAlmostEqual(sim.rec.batt['/RecBms/Voltage/RequestedSolar'], hold + .3, delta=.011)
+            # systemcalc restarted at Superuser: the written offset applies
+            sim.plant.apply = original
+            sim.plant.apply('offset_v', sim.system[OFFSET])
+            sim.run(15)
+            self.assertEqual(sim.rec.batt['/RecBms/LeadFault'], '')
+            self.assertEqual(sim.rec.batt['/Alarms/InternalFailure'], 0)
+            self.assertEqual(sim.rec.batt['/RecBms/Voltage/Ready'], 1)
+            self.assertEqual(sim.rec.batt['/RecBms/SolarLead'], .3)
+
+    def test_ordinary_update_delays_are_not_a_fault(self):
+        with self.simulation(target=80) as sim:
+            sim.set_sun([0, 0])
+            unready = 0
+            for second in range(600):
+                sim.run(1)
+                unready = unready + 1 if not sim.rec.batt['/RecBms/Voltage/Ready'] else 0
+                self.assertLess(unready, sim.rec.cfg.lead_verify_s)
+                self.assertEqual(sim.rec.batt['/RecBms/LeadFault'], '')
+                if second == 300:
+                    sim.set_target(85)
+            sim.set_sun([500, 900])
+            self.until(sim, lambda: not sim.plant.connected)
+            sim.run(60)
+            self.assertEqual(sim.rec.batt['/RecBms/LeadFault'], '')
+
     def test_stopped_consumer_lease_returns_to_shore(self):
         with self.simulation() as sim:
             self.until(sim, lambda: not sim.plant.connected)

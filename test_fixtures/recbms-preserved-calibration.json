@@ -41,7 +41,7 @@
     "solar_lead_v": "0.15",
     "lead_needs_solar_priority": "true",
     "lead_full_pct": "100",
-    "lead_verify_s": "10",
+    "lead_verify_s": "30",
     "lead_fault_alarm": "true"
   },
   "fallback": {
