@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.11"
+ENGINE_VERSION = "4.12"
 
 ENGINE_DEFAULTS = {
     "SOLAR_MARGIN": 1.2, "MIN_EST_W": 100, "READY_MS": 30000, "RAMP_MS": 90000,
@@ -30,7 +30,15 @@ ENGINE_DEFAULTS = {
     "BURN_CALM_GATE_MS": 45000, "LOAD_AVG_MS": 60000,
     # one-way charge / discharge (4.3): engage when the Max Charge target is
     # further than ENTER from the SOC, stand down within EXIT of it. 0 = off.
-    "ONEWAY_ENTER_PCT": 5, "ONEWAY_EXIT_PCT": 1,
+    # 4.12 (issue #4): 4.3's ENTER of 5 let a whole slider step (5 points),
+    # a 3-point change and a restart with under 5 points to go all pass as
+    # HOLD, and HOLD lets the shore charger fill the gap (62 -> 65 % at
+    # night: 1.44 kWh from shore in 20 min, E06). One full SOC point is the
+    # step dbus-recbms itself treats as real movement (sustain step_pct);
+    # half a point is five times the servo's 0.1 % deadband and fifty times
+    # the hi-res SOC resolution, well clear of the hundredths the Quattro's
+    # bursts nudge it by. Direction flips only through the whole band.
+    "ONEWAY_ENTER_PCT": 1, "ONEWAY_EXIT_PCT": 0.5,
     # pre-probe checks (4.4), from the evening of 2026-09-01 in Home
     # Assistant: five probes on model estimates of 374-1381 W while every
     # unthrottled reading after 17:42 was 86-296 W; the arrays' balance
@@ -168,6 +176,28 @@ def fresh_state(now, t):
 
 
 SUSTAIN_OFF, SUSTAIN_FLOOR, SUSTAIN_CEILING = 0, 1, 2   # dbus-recbms modes
+
+
+def select_objective(previous, target, soc, enter_pct, exit_pct):
+    """CHARGE, DISCHARGE or neither, from the destination and the SOC alone.
+
+    One rule for a fresh start, a target change and every tick since: engage
+    once the target is more than enter_pct from the SOC, stand down within
+    exit_pct of it, and never flip direction without passing through the
+    band between (a retarget across the SOC does, deliberately, in one
+    tick). enter_pct 0 turns one-way operation off.
+    """
+    delta = target - soc
+    if previous == "charge" and delta <= exit_pct:
+        previous = None
+    elif previous == "discharge" and delta >= -exit_pct:
+        previous = None
+    if enter_pct > 0:
+        if delta > enter_pct:
+            return "charge"
+        if delta < -enter_pct:
+            return "discharge"
+    return previous
 
 
 class Engine:
@@ -519,16 +549,8 @@ class Engine:
         if not enabled or tgt is None or full:
             oneway = None
         elif soc is not None:
-            delta = tgt.v - soc.v
-            if oneway == "charge" and delta <= t["ONEWAY_EXIT_PCT"]:
-                oneway = None
-            elif oneway == "discharge" and delta >= -t["ONEWAY_EXIT_PCT"]:
-                oneway = None
-            if t["ONEWAY_ENTER_PCT"] > 0:
-                if delta > t["ONEWAY_ENTER_PCT"]:
-                    oneway = "charge"
-                elif delta < -t["ONEWAY_ENTER_PCT"]:
-                    oneway = "discharge"
+            oneway = select_objective(oneway, tgt.v, soc.v,
+                                      t["ONEWAY_ENTER_PCT"], t["ONEWAY_EXIT_PCT"])
         if oneway != st["oneway"]:
             if oneway == "charge":
                 self.log("ONE-WAY CHARGE %.1f%% -> %.0f%%: solar charges, shore only sustains"

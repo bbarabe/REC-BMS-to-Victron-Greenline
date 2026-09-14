@@ -14,11 +14,11 @@ def check(name, condition, detail=""):
 # ================================================================ engine 4.3
 print("\n=== solar priority engine: one-way ===")
 scfg = types.SimpleNamespace(engine=SP.ENGINE_DEFAULTS)
-check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 5 and
-      scfg.engine["ONEWAY_EXIT_PCT"] == 1 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
+check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
+      scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.11")
+check("engine version bumped", SP.ENGINE_VERSION == "4.12")
 Val = SP.Val
 
 
@@ -129,12 +129,12 @@ check("charge: done within EXIT of the target", s.oneway is None and s.sustain =
 
 # ---- hysteresis and re-targeting ----
 s = Sim()
-s.tick(1, soc=77, target=80)
-check("77 -> 80 is inside ENTER: normal engine", s.oneway is None)
-s.tick(1, soc=74)
-check("74 -> 80 engages", s.oneway == "charge")
-s.tick(1, soc=78)
-check("78 -> 80 stays engaged (EXIT is 1)", s.oneway == "charge")
+s.tick(1, soc=79.2, target=80)
+check("79.2 -> 80 is inside ENTER: normal engine", s.oneway is None)
+s.tick(1, soc=78.9)
+check("78.9 -> 80 engages", s.oneway == "charge")
+s.tick(1, soc=79.4)
+check("79.4 -> 80 stays engaged (EXIT is 0.5)", s.oneway == "charge")
 s.tick(1, target=50)
 check("slider moved the other way: flips to discharge", s.oneway == "discharge" and s.sustain == 2)
 s.inp.enabled = False
@@ -172,6 +172,8 @@ s.tick(15, load=300.0, batt=-300.0)
 check("discharge: resumes to solar without a boost", s.state == "solar" and s.cmd == 1 and
       s.boosts == [])
 s.tick(1, soc=70.9)
+check("discharge: 70.9 -> 70 still engaged", s.oneway == "discharge")
+s.tick(1, soc=70.4)
 check("discharge: done within EXIT of the target", s.oneway is None and s.sustain == 0)
 s.tick(20)
 check("discharge done: the normal deficit exit takes over", s.state == "shore" and s.cmd == 0)
@@ -542,6 +544,45 @@ s.tick(1, soc=90, target=70, batt_v=60.3, cvl=60.3)
 s.tick(335, pv=0.0, m=0, voc=10.0)
 s.tick(300, batt=-600.0)
 check("#2 discharge: still inverts under no sun", s.state == "solar" and s.oneway == "discharge" and s.cmd == 1)
+
+# ---- issue #4: one slider step selects a direction; restart near the destination ----
+sel = lambda prev, tgt, soc: SP.select_objective(prev, tgt, soc, s.t["ONEWAY_ENTER_PCT"], s.t["ONEWAY_EXIT_PCT"])
+for gap in (3, 5, 6, 1.7):
+    check("#4: +%s selects CHARGE" % gap, sel(None, 60 + gap, 60) == "charge")
+    check("#4: -%s selects DISCHARGE" % gap, sel(None, 60 - gap, 60) == "discharge")
+check("#4: +0.8 is within tolerance: neither", sel(None, 60.8, 60) is None)
+check("#4: exactly one point is the tolerance edge: neither", sel(None, 61, 60) is None)
+check("#4: retarget across the SOC flips in one step", sel("charge", 50, 60) == "discharge")
+check("#4: retarget within tolerance stands down", sel("charge", 60.3, 60) is None)
+# noise near the target: hundredths of a percent never alternate the objective
+prev, seen = "charge", set()
+for i in range(200):
+    prev = sel(prev, 80, 79.48 + 0.04 * ((i % 3) - 1))      # 79.44 .. 79.52
+    seen.add(prev)
+check("#4: noise around the exit band settles to neither and stays", prev is None and seen <= {"charge", None}, str(seen))
+prev, seen = None, set()
+for i in range(200):
+    prev = sel(prev, 80, 78.98 + 0.04 * ((i % 3) - 1))      # 78.94 .. 79.02
+    seen.add(prev)
+check("#4: noise around the entry band keeps CHARGE once entered", prev == "charge" and None not in seen - {None} and "discharge" not in seen, str(seen))
+prev = None
+for i in range(200):
+    prev = sel(prev, 80, 80 + 0.05 * ((i % 3) - 1))
+check("#4: noise at the target never selects either way", prev is None)
+# the engine and the consumer's request follow: a single slider step at night
+s = Sim()
+s.tick(1, soc=62, target=65, batt_v=56.6, cvl=56.62, pv=0.0, m=0, voc=10.0)
+check("#4: 62 -> 65 (one slider step) is CHARGE with the floor",
+      s.oneway == "charge" and s.out.charge_intent == "floor" and s.out.oneway == "charge")
+s = Sim()
+s.tick(1, soc=78.3, target=80, batt_v=56.6)
+check("#4: restart 1.7 points short selects CHARGE", s.oneway == "charge" and s.out.charge_intent == "floor")
+s = Sim()
+s.tick(1, soc=81.7, target=80, batt_v=56.6)
+check("#4: restart 1.7 points over selects DISCHARGE", s.oneway == "discharge" and s.out.charge_intent == "ceiling")
+s = Sim()
+s.tick(1, soc=64.6, target=65, batt_v=56.6)
+check("#4: within half a point on restart: at target", s.oneway is None and s.out.charge_intent == "release")
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:

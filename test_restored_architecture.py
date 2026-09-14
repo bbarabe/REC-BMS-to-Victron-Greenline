@@ -290,6 +290,19 @@ class RestoredPlantTests(unittest.TestCase):
             sim.run(60)
             self.assertEqual(sim.rec.batt['/RecBms/LeadFault'], '')
 
+    def test_one_slider_step_at_night_charges_one_way_not_from_shore(self):
+        # E06: 62 % for 65 %, no sun, 20 min ran as HOLD and put 1.443 kWh
+        # into the bank from shore.
+        from solar_priority_plant import PlantConfig
+        with self.simulation(target=65, plant_config=PlantConfig(initial_soc=62)) as sim:
+            sim.set_sun([0, 0])
+            sim.run(1200)
+            request = sim.solar.last_request
+            self.assertEqual((request['mode'], request['requested_limits']['sustain']), ('CHARGE', 1))
+            self.assertEqual(sim.rec.policy_adapter.control['mode'], 'CHARGE')
+            self.assertLess(sim.plant.energy.shore_charge_wh, 150)
+            self.assertLess(sim.plant.soc, 62.5)
+
     def test_stopped_consumer_lease_returns_to_shore(self):
         with self.simulation() as sim:
             self.until(sim, lambda: not sim.plant.connected)
