@@ -33,7 +33,7 @@ class RestoredBoundaryTests(unittest.TestCase):
     def test_invalid_floor_and_boost_cannot_replace_valid_lease(self):
         contract = PolicyContract(generation='test')
         self.assertTrue(contract.accept(request(contract), 100, 80, consumer_ready=True))
-        for limits in ({'sustain': 3, 'boost_v': 0, 'purpose': ''},
+        for limits in ({'sustain': 4, 'boost_v': 0, 'purpose': ''},
                        {'sustain': 1, 'boost_v': .31, 'purpose': ''}):
             candidate = request(contract, 2)
             candidate['requested_limits'] = limits
@@ -465,6 +465,27 @@ class RestoredPlantTests(unittest.TestCase):
                     self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
                     self.assertTrue(transfer['prepared'])
                     self.assertEqual(sim.rec.batt['/RecBms/Sustain/Active'], 1)
+
+    def test_hold_at_the_target_asks_for_the_two_sided_hold(self):
+        # Stage B (plan B2, master D03/SP23): at the destination the leased
+        # request is HOLD with sustain 3 -- dbus-recbms' two-sided hold --
+        # where 4.9 released sustain and let the slider, the band and the
+        # loads settle it between them (E04: a steady -49 W is 1.448 points
+        # in 24 h). This tree's REC does not implement mode 3 yet:
+        # _set_sustain(3) simply returns False, so only what the consumer
+        # asks for, and that the lease still stands, are asserted here.
+        from solar_priority_plant import PlantConfig
+        with self.simulation(target=60, plant_config=PlantConfig(initial_soc=60)) as sim:
+            sim.run(100)
+            request = sim.solar.last_request
+            self.assertEqual((request['mode'], request['requested_limits']['sustain']),
+                             ('HOLD', 3))
+            self.assertEqual(sim.solar.sw['/SolarPriority/Sustain'], 3)
+            self.assertEqual(sim.solar.sw['/SolarPriority/OneWay'], '')
+            status = json.loads(sim.rec.batt['/RecBms/Policy/Status'])
+            self.assertTrue(status['lease_valid'])
+            self.assertEqual(status['rejection'], '')
+            self.assertEqual(status['mode'], 'HOLD')
 
 
 if __name__ == '__main__':

@@ -22,17 +22,22 @@ ENGINE_DEFAULTS = {
     "HB_STALE_MS": 20000, "ASSERT_MS": 30000, "FEEDBACK_GRACE_MS": 90000,
     "CAP_SMOOTH": 0.3, "CAP_FRESH_MS": 900000, "CAP_ZERO_MS": 5400000,
     "VOC_DAY_V": 55, "VOC_EXPLORE_V": 65, "CVL_MARGIN_V": 0.05, "WAKE_MS": 60000,
-    "BURN_EXIT_DROP_V": 0.15, "BURN_EXIT_MS": 30000, "BURN_CALM_MS": 15000,
     "SURPLUS_QUIET_W": 100, "BOOST_V": 0.30, "BOOST_INTERVAL_MS": 900000,
-    "BOOST_RETRY_MS": 180000, "BURN_REARM_V": 0.25, "HARVEST_ARM_V": 0.02,
-    "REFILL_RESET_V": 0.10, "HARVEST_MIN_EVID": 100, "STALL_BURN_MIN_V": 0.05,
+    "BOOST_RETRY_MS": 180000,
+    # 4.15 (Stage B, plan B2; master SP26, D06, E07): HOLD asks dbus-recbms to
+    # hold the bank instead of releasing sustain, so nothing deliberately
+    # fills a band and burns it into the loads any more. The burn-down state
+    # went with it, and with it BURN_EXIT_DROP_V, BURN_EXIT_MS, BURN_CALM_MS,
+    # BURN_CALM_GATE_MS, BURN_REARM_V, HARVEST_ARM_V, REFILL_RESET_V,
+    # HARVEST_MIN_EVID and STALL_BURN_MIN_V. Config only reads the keys named
+    # here, so any of them left in an old ini is ignored, not rejected.
     "SUSPEND_LOAD_W": 1000, "SUSPEND_MS": 3000, "SUSPEND_MAX_MS": 1200000,
     "RESUME_DELTA_W": 200, "RESUME_MS": 10000,
     "MDL_A_V": 3.5, "MDL_VOC_IDLE_W": 3, "MDL_VOC_TAU_MS": 600000, "MDL_MIN_W": 10,
     "MDL_CAL_MIN_W": 30, "MDL_KFF_DEF": 0.78, "MDL_KFF_ALPHA": 0.05,
     "MDL_RATIO_MIN": 0.02, "MDL_RATIO_CONF": 0.3, "MDL_MAX_MULT": 20,
     "MDL_FRESH_MS": 300000, "MDL_SHARE6": 0.35, "MDL_SHARE7": 0.65, "VOC_RISE_V": 1.0,
-    "BURN_CALM_GATE_MS": 45000, "LOAD_AVG_MS": 60000,
+    "LOAD_AVG_MS": 60000,
     # one-way charge / discharge (4.3): engage when the Max Charge target is
     # further than ENTER from the SOC, stand down within EXIT of it. 0 = off.
     # 4.12 (issue #4): 4.3's ENTER of 5 let a whole slider step (5 points),
@@ -170,7 +175,7 @@ class Outputs:
         self.cmd = None          # 0/1 to write to IgnoreAcIn, or None
         self.transition = None   # text, or None
         self.boost = None        # volts to request (0 = release), or None
-        self.sustain = None      # 0/1/2 to write to /RecBms/Sustain/Request, or None
+        self.sustain = None      # 0/1/2/3 to write to /RecBms/Sustain/Request, or None
         self.oneway = ""         # "", "charge" or "discharge"
         self.status_fill = "grey"
         self.status_text = ""
@@ -192,9 +197,6 @@ def fresh_state(now, t):
         "readySince": 0, "loadExceedStart": 0, "surgeStart": 0,
         "backoffMs": t["COOLDOWN_MS"], "backoffUntil": 0,
         "socEntry": 0, "solarSince": 0, "cap6": None, "cap7": None,
-        "burnReadySince": 0, "burnExitStart": 0, "burnCalmStart": 0,
-        "burnDoneCvl": None,
-        "refillReady": None, "refillShoreFed": False, "harvestSince": 0,
         "suspendTrigStart": 0, "suspendStart": 0, "suspendBase": 0,
         "resumeStart": 0, "suspendPrev": None,
         "battWin": [], "battWinLong": [], "mdl6": None, "mdl7": None, "vocRef": None,
@@ -203,7 +205,9 @@ def fresh_state(now, t):
     }
 
 
-SUSTAIN_OFF, SUSTAIN_FLOOR, SUSTAIN_CEILING = 0, 1, 2   # dbus-recbms modes
+# dbus-recbms modes. 4.15 adds HOLD: a two-sided hold at the present rest
+# voltage, which is what "at the target" has always meant (master SP23, D03).
+SUSTAIN_OFF, SUSTAIN_FLOOR, SUSTAIN_CEILING, SUSTAIN_HOLD = 0, 1, 2, 3
 # VE.Bus /Ac/ActiveIn/ActiveInput: 0 = AC in 1, 1 = AC in 2, 240 = nothing
 # accepted (inverting). Any value but 240 is a charger on the AC bus, not
 # only the configured shore input (master D14, SP56).
@@ -284,8 +288,6 @@ class Engine:
         battV, cvl = inp.batt_v, inp.cvl
         boostAct, boostWin, boostEff = inp.boost_active, inp.boost_window, inp.boost_eff
         boosting = boostAct is not None and boostAct.v == 1
-        leadV = inp.lead
-        leadOn = leadV is None or leadV.v > 0.005
         leadFault = inp.lead_fault or ""
         windowOpen = boostWin is not None and boostWin.v == 1
         FEED_SHORE = inp.feed_shore
@@ -413,16 +415,6 @@ class Engine:
         effCvl = boostEff.v if boostEff is not None else (cvl.v if cvl is not None else None)
         aboveCvl = (battV is not None and effCvl is not None) and (battV.v > effCvl + t["CVL_MARGIN_V"])
 
-        # Harvest refill tracker (v4.0)
-        if battV is not None and cvl is not None:
-            if battV.v <= cvl.v - t["REFILL_RESET_V"]:
-                st["refillReady"] = True
-                st["refillShoreFed"] = False
-            elif (st["refillReady"] is True and battV.v < cvl.v - t["HARVEST_ARM_V"]
-                  and batt is not None and batt.v > t["SURPLUS_QUIET_W"]
-                  and pvNow < batt.v * 0.6):
-                st["refillShoreFed"] = True
-
         transition = [None]
         boostMsg = [None]
         status = ["grey", ""]
@@ -438,10 +430,6 @@ class Engine:
             st["probeRamp"] = 0
             st["evalPv"] = []
             st["evalBatt"] = []
-            st["burnReadySince"] = 0
-            st["burnExitStart"] = 0
-            st["burnCalmStart"] = 0
-            st["harvestSince"] = 0
             st["suspendTrigStart"] = 0
             st["resumeStart"] = 0
             boostMsg[0] = 0
@@ -462,31 +450,6 @@ class Engine:
             # user re-enables.
             st["lockoutUntil"] = now + t["BACKOFF_MAX_MS"]
 
-        def enter_burndown(reason, clear_harvest):
-            if st["state"] in ("shore", "suspend") and not inp.departure_allowed:
-                status[:] = ["yellow", "SHORE | waiting for transfer readiness"]
-                return
-            if owc:
-                # A burn-down spends the band into the loads: a step backward
-                # while the bank is meant to be charging. The shore-side
-                # entries already exclude it; this is the boundary (issue #2).
-                self.log("ERROR burn-down refused while charging one-way (%s)" % reason)
-                return
-            st["state"] = "burndown"
-            st["desired"] = 1
-            st["lastTransition"] = now
-            st["readySince"] = 0
-            st["burnReadySince"] = 0
-            st["burnExitStart"] = 0
-            st["burnCalmStart"] = 0
-            st["surgeStart"] = 0
-            st["refillReady"] = False
-            if clear_harvest:
-                st["harvestSince"] = 0
-            transition[0] = "-> BURNDOWN (" + reason + ")"
-            status[0] = "green"
-            status[1] = transition[0]
-
         def enter_probe(reason):
             if st["state"] in ("shore", "suspend") and not inp.departure_allowed:
                 status[:] = ["yellow", "SHORE | waiting for transfer readiness"]
@@ -494,8 +457,7 @@ class Engine:
             st["state"] = "probe"
             st["desired"] = 1
             st["probeStart"] = now
-            # A1/A3: the ramp clock belongs to THIS probe. A burn-down hands
-            # straight over to a probe without passing through toShore.
+            # A1/A3: the ramp clock belongs to THIS probe.
             st["probeRamp"] = 0
             st["probeEst"] = max(est, needW or 0.0)
             st["evalPv"] = []
@@ -503,8 +465,6 @@ class Engine:
             st["lastTransition"] = now
             st["surgeStart"] = 0
             st["readySince"] = 0
-            st["burnExitStart"] = 0
-            st["burnCalmStart"] = 0
             st["lastBoostTs"] = now
             boostMsg[0] = t["BOOST_V"]       # probe assist (v3.5)
             transition[0] = "-> PROBE (" + reason + ")"
@@ -523,8 +483,6 @@ class Engine:
             st["lastTransition"] = now
             st["loadExceedStart"] = 0
             st["surgeStart"] = 0
-            st["burnExitStart"] = 0
-            st["burnCalmStart"] = 0
             st["backoffMs"] = t["COOLDOWN_MS"]
             st["backoffUntil"] = 0
             transition[0] = "-> SOLAR (" + reason + ")"
@@ -669,24 +627,6 @@ class Engine:
                 explore = (needW is not None and dayOk and not vocRising
                            and vocMax >= t["VOC_EXPLORE_V"] and capSum <= 0 and not dim)
 
-                if st["burnDoneCvl"] is not None and cvl is not None:
-                    if (abs(cvl.v - st["burnDoneCvl"]) > 0.02 or
-                            (battV is not None and battV.v > cvl.v + t["BURN_REARM_V"])):
-                        st["burnDoneCvl"] = None
-                latched = st["burnDoneCvl"] is not None
-                # One-way: no burn-downs. A burn-down spends the band above
-                # the CVL into the loads; while charging one-way that is a
-                # step backward, and while discharging the loads drain the
-                # bank anyway (solar state, no deficit exit).
-                surplus = (aboveCvl and soc.v >= minSoc and not shoreMissing
-                           and not latched and batt.v <= t["SURPLUS_QUIET_W"]
-                           and not owc and not owd)
-                if surplus:
-                    if not st["burnReadySince"]:
-                        st["burnReadySince"] = now
-                else:
-                    st["burnReadySince"] = 0
-
                 if owd:
                     # Discharging: leave shore as soon as the charger is quiet
                     # (the sustain ceiling makes it so). Solar need not cover
@@ -707,19 +647,6 @@ class Engine:
                         st["readySince"] = now
                 else:
                     st["readySince"] = 0
-
-                harvestArmed = ((st["refillReady"] is True and not st["refillShoreFed"]) or
-                                (st["refillReady"] is None and evidence >= t["HARVEST_MIN_EVID"]))
-                harvest = (harvestArmed and leadOn and dayOk and not shoreMissing and not aboveCvl
-                           and soc.v >= minSoc and batt.v <= t["SURPLUS_QUIET_W"]
-                           and battV is not None and cvl is not None
-                           and battV.v >= cvl.v - t["HARVEST_ARM_V"]
-                           and not owc and not owd)
-                if harvest:
-                    if not st["harvestSince"]:
-                        st["harvestSince"] = now
-                else:
-                    st["harvestSince"] = 0
 
                 # Measurement boost (not gated on cooldown/backoff). Never
                 # while discharging one-way: a boost charges from solar, and
@@ -747,9 +674,7 @@ class Engine:
                 gateOk = (sinceTrans >= t["COOLDOWN_MS"] and now >= st["backoffUntil"]
                           and now >= st["lockoutUntil"])
 
-                if surplus and sinceTrans >= t["COOLDOWN_MS"] and (now - st["burnReadySince"]) >= t["READY_MS"]:
-                    enter_burndown("batt %.2fV > CVL %.2fV" % (battV.v, cvl.v), False)
-                elif owd and ready and gateOk and (now - st["readySince"]) >= t["READY_MS"]:
+                if owd and ready and gateOk and (now - st["readySince"]) >= t["READY_MS"]:
                     # No probe: nothing to prove, the loads may run the bank
                     # down. The AC-control fault check lives in solar too.
                     enter_solar("one-way discharge %.1f%% -> %.0f%%" % (soc.v, tgt.v))
@@ -770,20 +695,12 @@ class Engine:
                                     me6["w"] if me6 else 0, me7["w"] if me7 else 0, pvNow, vocMax,
                                     int(m6.v) if m6 else "-", int(m7.v) if m7 else "-",
                                     "%.2f" % balance if balance is not None else "-"))
-                elif harvest and sinceTrans >= t["COOLDOWN_MS"] and (now - st["harvestSince"]) >= t["READY_MS"]:
-                    enter_burndown("harvest: band full at %.2fV" % battV.v, True)
-                elif surplus:
-                    status[0] = "blue"
-                    status[1] = "SHORE | SURPLUS batt %.2fV > CVL %.2fV" % (battV.v, cvl.v)
-                    if sinceTrans < t["COOLDOWN_MS"]:
-                        status[1] += " [cd %ds]" % math.ceil((t["COOLDOWN_MS"] - sinceTrans) / 1000)
-                    else:
-                        status[1] += " [burn in %ds]" % math.ceil((t["READY_MS"] - (now - st["burnReadySince"])) / 1000)
                 elif aboveCvl:
+                    # 4.15: a bank above the CVL is reported, never spent. The
+                    # surplus burn-down and its re-arm latch are gone (SP26).
                     status[0] = "blue"
-                    status[1] = "SHORE | batt %.2fV > CVL %.2fV " % (battV.v, cvl.v) + (
-                        "[burned - re-arms on CVL change]" if latched else
-                        ("[charger active +%.0fW]" % batt.v if batt.v > t["SURPLUS_QUIET_W"] else "[SOC/shore gate]"))
+                    status[1] = "SHORE | batt %.2fV > CVL %.2fV" % (battV.v, cvl.v) + (
+                        " [charger active +%.0fW]" % batt.v if batt.v > t["SURPLUS_QUIET_W"] else "")
                 else:
                     status[0] = "red" if shoreMissing else "blue"
                     s = ("NO SHORE? | " if shoreMissing else "SHORE | ") + \
@@ -800,8 +717,6 @@ class Engine:
                         s += " [no demand]"
                     if batt.v > t["SURPLUS_QUIET_W"]:
                         s += " [chg +%.0fW%s]" % (batt.v, "" if quattroW > t["SURPLUS_QUIET_W"] else " solar")
-                    if harvestArmed:
-                        s += " [hv-armed]" if leadOn else " [hv-off: no lead]"
                     if leadFault:
                         s += " [LEAD FAULT]"
                     if balance is not None:
@@ -906,53 +821,6 @@ class Engine:
                             "%.2f" % balance if balance is not None else "-"))
                         status[0] = "blue"
 
-            elif st["state"] == "burndown":
-                if loadNow.v >= t["SUSPEND_LOAD_W"]:
-                    if not st["suspendTrigStart"]:
-                        st["suspendTrigStart"] = now
-                        st["suspendBase"] = loadAvg.v
-                else:
-                    st["suspendTrigStart"] = 0
-
-                if st["suspendTrigStart"] and now - st["suspendTrigStart"] >= t["SUSPEND_MS"]:
-                    enter_suspend("burndown")
-                elif feed.v != FEED_NONE and sinceTrans > t["FEEDBACK_GRACE_MS"]:
-                    self.log("ERROR Quattro re-accepted AC input %d during burn-down"
-                             " - standing down" % int(feed.v))
-                    lockout()
-                    toShore("FAULT: AC re-accepted externally")
-                    status[0] = "red"
-                else:
-                    calmP = battMean if battMean is not None else batt.v
-                    if sinceTrans > t["BURN_CALM_GATE_MS"] and calmP > -t["DISCHARGE_TOL_W"]:
-                        if not st["burnCalmStart"]:
-                            st["burnCalmStart"] = now
-                    else:
-                        st["burnCalmStart"] = 0
-                    burnDone = (battV is not None and cvl is not None
-                                and battV.v <= cvl.v - t["BURN_EXIT_DROP_V"])
-                    if burnDone:
-                        if not st["burnExitStart"]:
-                            st["burnExitStart"] = now
-                    else:
-                        st["burnExitStart"] = 0
-
-                    if st["burnCalmStart"] and now - st["burnCalmStart"] >= t["BURN_CALM_MS"]:
-                        enter_solar("burn-down handover, PV %.0fW" % pvNow)
-                    elif st["burnExitStart"] and now - st["burnExitStart"] >= t["BURN_EXIT_MS"]:
-                        st["burnDoneCvl"] = cvl.v
-                        if covers(est):
-                            enter_probe("after burn-down, est %.0fW" % est)
-                        else:
-                            toShore("burn-down complete (batt %.2fV)" % battV.v)
-                            status[0] = "blue"
-                    else:
-                        status[0] = "green"
-                        status[1] = "BURN | batt %.0fW, %sV -> %sV, PV %.0fW load %.0fW SOC %.1f%%" % (
-                            batt.v, "%.2f" % battV.v if battV is not None else "?",
-                            "%.2f" % (cvl.v - t["BURN_EXIT_DROP_V"]) if cvl is not None else "?",
-                            pvNow, loadNow.v, soc.v)
-
             elif st["state"] == "suspend":
                 if now - st["suspendStart"] >= t["SUSPEND_MAX_MS"]:
                     toShore("suspend timeout after %dmin" % round(t["SUSPEND_MAX_MS"] / 60000))
@@ -966,20 +834,15 @@ class Engine:
                         st["lastTransition"] = now
                         st["surgeStart"] = 0
                         st["loadExceedStart"] = 0
-                        if (st["suspendPrev"] == "burndown" and not owc and battV is not None
-                                and cvl is not None and battV.v > cvl.v - t["BURN_EXIT_DROP_V"]):
-                            st["state"] = "burndown"
-                            st["burnExitStart"] = 0
-                            st["burnCalmStart"] = 0
-                            transition[0] = "-> BURNDOWN (resumed after suspend)"
-                        else:
-                            st["state"] = "solar"
-                            st["solarSince"] = now
-                            st["socEntry"] = soc.v
-                            if not owd:
-                                st["lastBoostTs"] = now
-                                boostMsg[0] = t["BOOST_V"]     # re-ramp assist
-                            transition[0] = "-> SOLAR (resumed after suspend)"
+                        # 4.15: a suspend always resumes into solar -- the
+                        # burn-down it could come back into is gone (SP26).
+                        st["state"] = "solar"
+                        st["solarSince"] = now
+                        st["socEntry"] = soc.v
+                        if not owd:
+                            st["lastBoostTs"] = now
+                            boostMsg[0] = t["BOOST_V"]     # re-ramp assist
+                        transition[0] = "-> SOLAR (resumed after suspend)"
                         status[0] = "green"
                         status[1] = transition[0]
                     else:
@@ -1062,18 +925,11 @@ class Engine:
                 elif st["surgeStart"] and now - st["surgeStart"] >= t["SURGE_MS"]:
                     toShore("big load: batt -%.0fW, load %.0fW" % (discharge, loadNow.v))
                     status[0] = "blue"
-                elif (st["loadExceedStart"] and now - st["loadExceedStart"] >= t["LOAD_EXCEED_MS"]
-                      and dayOk and soc.v >= minSoc and not owc
-                      and battV is not None and cvl is not None
-                      and battV.v >= cvl.v - t["STALL_BURN_MIN_V"]):
-                    # Ceiling stall (v4.1): burn the band, no backoff. Never
-                    # while charging one-way (issue #2, E07: CHARGE at 78 %
-                    # for 80 % burned the band at -100 W); that deficit takes
-                    # the ordinary return below and the floor on shore.
-                    st["loadExceedStart"] = 0
-                    enter_burndown("ceiling stall: batt avg -%.0fW at %.2fV, PV %.0fW" % (
-                        dischargeAvg, battV.v, pvNow), True)
                 elif st["loadExceedStart"] and now - st["loadExceedStart"] >= t["LOAD_EXCEED_MS"]:
+                    # 4.15 (SP26, E07): a sustained deficit with the band
+                    # still full used to roll into a burn-down rather than a
+                    # return. HOLD now holds the bank on shore, so every
+                    # sustained deficit takes this one ordinary exit.
                     escalateBackoff()
                     toShore("deficit: batt avg -%.0fW (now %.0fW)" % (dischargeAvg, batt.v))
                     status[0] = "blue"
@@ -1103,6 +959,7 @@ class Engine:
         # Sustain: charging one-way, the bank is held only while the charger
         # is connected (shore, suspend) -- solar must be free to charge the
         # rest of the time. Discharging, it is a ceiling the whole time.
+        # At the destination it is the two-sided hold, everywhere (4.15).
         # Re-asserted every ASSERT_MS: dbus-recbms expires it on its own.
         # 4.5: "connected" means the Quattro reports an input as its active
         # input, not merely that the engine asked for it. With no AC
@@ -1138,7 +995,21 @@ class Engine:
                 want = SUSTAIN_OFF if shoreGone else SUSTAIN_FLOOR
         elif owd:
             want = SUSTAIN_CEILING
+        elif enabled and tgt is not None and not full:
+            # Stage B (plan B2, master D03/SP23). Neither objective selected
+            # means the bank is AT its destination, which is a job, not the
+            # absence of one: dbus-recbms holds it there from both sides in
+            # every transport state -- shore, islanded, suspended -- so an
+            # arrival from CHARGE or DISCHARGE hands straight into the hold
+            # on the tick select_objective stands down. Releasing sustain
+            # here was what let a steady -49 W walk the bank down 1.448
+            # points in 24 h (E04) and left the band to be filled and burned
+            # for a living (E11, E07).
+            want = SUSTAIN_HOLD
         else:
+            # Disabled, no fresh target, or a full-charge target: nothing to
+            # hold. The protocol maps a 100 % target to COMPLETE_FULL, which
+            # must release sustain (D11, E12).
             want = SUSTAIN_OFF
         if st["sustainSent"] != want or (want and now - st["sustainAssert"] >= t["ASSERT_MS"]):
             st["sustainSent"] = want
@@ -1153,7 +1024,7 @@ class Engine:
         out.need_w = needW
         out.state = st["state"]
         out.transfer_intent = "island" if st["desired"] else "shore"
-        out.charge_intent = {0: "release", 1: "floor", 2: "ceiling"}[want]
+        out.charge_intent = {0: "release", 1: "floor", 2: "ceiling", 3: "hold"}[want]
         # A boost is a bounded edge request, never a continuously renewed
         # desired level. Publisher owns its expiry and reports active state.
         out.boost_v = out.boost

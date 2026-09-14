@@ -154,8 +154,14 @@ check("charge: floor requested on the same tick as the shore command",
       "sustain %s cmd %s" % (s.sustains[-1], s.cmds[-1]))
 check("charge: still engaged at 68 %", s.oneway == "charge")
 s.tick(1, soc=79.5, batt=0.0)
-check("charge: done within EXIT of the target", s.oneway is None and s.sustain == 0 and
+check("charge: done within EXIT of the target", s.oneway is None and
       any("ONE-WAY charge done (SOC 79.5% at target 80%)" in l for l in s.logs))
+# Stage B (plan B2, master D03/SP23): arrival is a handover, not a release.
+check("charge: arrival hands straight into the hold, on the arrival tick",
+      s.out.sustain == 3 and s.out.charge_intent == "hold" and s.out.oneway == "" and
+      s.sustains[-1] == (s.now, 3), "%s %s" % (s.out.charge_intent, s.sustains[-1:]))
+check("charge: the hold is at the same target the charge aimed at",
+      s.inp.target_soc.v == 80 and s.v["target"] == 80)
 
 # ---- hysteresis and re-targeting ----
 s = Sim()
@@ -204,7 +210,12 @@ check("discharge: resumes to solar without a boost", s.state == "solar" and s.cm
 s.tick(1, soc=70.9)
 check("discharge: 70.9 -> 70 still engaged", s.oneway == "discharge")
 s.tick(1, soc=70.4)
-check("discharge: done within EXIT of the target", s.oneway is None and s.sustain == 0)
+check("discharge: done within EXIT of the target", s.oneway is None)
+check("discharge: arrival hands straight into the hold, on the arrival tick",
+      s.out.sustain == 3 and s.out.charge_intent == "hold" and s.out.oneway == "" and
+      s.sustains[-1] == (s.now, 3), "%s %s" % (s.out.charge_intent, s.sustains[-1:]))
+check("discharge: the hold is at the same target the descent aimed at",
+      s.inp.target_soc.v == 70 and s.v["target"] == 70)
 s.tick(20)
 check("discharge done: the normal deficit exit takes over", s.state == "shore" and s.cmd == 0)
 
@@ -526,7 +537,7 @@ check("#1 islanded: the transition names the loss", out.status_text == "-> SHORE
 s.tick(340)
 check("#1 islanded: fresh data leaves for solar again", s.state == "solar" and s.oneway == "charge", s.state)
 s.tick(1, soc=79.5, batt=0.0)
-check("#1: arrival is still judged once the SOC is fresh", s.oneway is None and s.sustain == 0)
+check("#1: arrival is still judged once the SOC is fresh", s.oneway is None and s.sustain == 3)
 s = Sim()
 s.tick(1, soc=60, target=80, batt_v=56.4)
 out = drop(s, "soc")
@@ -537,9 +548,11 @@ s.inp.enabled = False
 out = drop(s, "soc")
 check("#1: a disable still releases during an outage", s.oneway is None and out.charge_intent == "release")
 
-# ---- issue #2: CHARGE never enters a burn-down ----
-# E07: CHARGE on solar at 78 % for 80 %, -100 W, pack 59.47 V on a 59.49 V
-# CVL: the ceiling-stall branch burned the band after 155 s.
+# ---- 4.15 (Stage B, SP26): nothing burns a band down any more ----
+# Issue #2 refused the ceiling-stall burn while charging one-way (E07: CHARGE
+# on solar at 78 % for 80 %, -100 W, pack 59.47 V on a 59.49 V CVL, burned
+# after 155 s). Stage B removes the state itself, so ordinary HOLD takes the
+# same exits CHARGE does instead of filling a band and spending it.
 s = Sim()
 s.tick(1, soc=60, target=80, batt_v=56.4)
 s.tick(340)
@@ -575,6 +588,46 @@ s.tick(1, soc=90, target=70, batt_v=60.3, cvl=60.3)
 s.tick(335, pv=0.0, m=0, voc=10.0)
 s.tick(300, batt=-600.0)
 check("#2 discharge: still inverts under no sun", s.state == "solar" and s.oneway == "discharge" and s.cmd == 1)
+
+# the same paths with the bank AT its target, which is where 4.9 harvested,
+# burned the surplus and rolled a stalled deficit into a burn-down
+s = Sim()
+s.tick(1, soc=60, target=60, batt_v=57.0, cvl=56.62, batt=0.0, pv=0.0, m=0, voc=10.0)
+check("HOLD: at the target, holding, no one-way objective", s.oneway is None and s.sustain == 3)
+s.tick(400)
+check("HOLD: bank above the CVL on shore stays on shore, no burn-down",
+      s.state == "shore" and "burndown" not in s.states and s.sustain == 3,
+      "%s %s" % (s.state, s.transitions))
+check("HOLD: the status reports the bank above the CVL with no burn wording",
+      s.out.status_text == "SHORE | batt 57.00V > CVL 56.62V", s.out.status_text)
+s = Sim()
+s.tick(1, soc=60, target=60, batt_v=56.4)
+s.tick(400, batt_v=56.61, cvl=56.62, batt=0.0, pv=60.0, m=1, load=1000.0)   # band full, need > est
+check("HOLD: a full band on shore no longer harvests",
+      s.state == "shore" and "burndown" not in s.states and s.sustain == 3,
+      "%s %s" % (s.state, s.transitions))
+s = Sim()
+s.tick(1, soc=60, batt_v=56.4)                     # no target yet: the normal engine leaves
+s.tick(435)
+check("HOLD: islanded to start with", s.state == "solar", s.state)
+s.tick(1, target=60)
+check("HOLD: the hold is asked for while islanded too",
+      s.oneway is None and s.sustain == 3 and s.out.charge_intent == "hold")
+s.tick(300, batt=-100.0, batt_v=56.61, cvl=56.62, pv=200.0)   # the E07 stall, at the target
+check("HOLD: deficit on solar returns to shore, no burn-down",
+      s.state == "shore" and "burndown" not in s.states and
+      any(tr.startswith("-> SHORE (deficit: batt avg -") for tr in s.transitions),
+      "%s %s" % (s.state, s.transitions[-1:]))
+check("HOLD: the hold stands on shore", s.sustain == 3)
+s = Sim()
+s.tick(1, soc=60, target=60, batt_v=56.4)
+s.eng.st.update(state="suspend", suspendPrev="burndown", suspendStart=s.now, suspendBase=300.0,
+                lastTransition=s.now, desired=0)
+s.tick(15, batt_v=56.61, cvl=56.62, load=300.0)
+check("HOLD: suspend resumes into solar", s.state == "solar" and "burndown" not in s.states and
+      any(tr == "-> SOLAR (resumed after suspend)" for tr in s.transitions),
+      "%s %s" % (s.state, s.transitions[-1:]))
+check("HOLD: the hold rides through the suspend", s.sustain == 3)
 
 # ---- issue #4: one slider step selects a direction; restart near the destination ----
 sel = lambda prev, tgt, soc: SP.select_objective(prev, tgt, soc, s.t["ONEWAY_ENTER_PCT"], s.t["ONEWAY_EXIT_PCT"])
@@ -613,7 +666,7 @@ s.tick(1, soc=81.7, target=80, batt_v=56.6)
 check("#4: restart 1.7 points over selects DISCHARGE", s.oneway == "discharge" and s.out.charge_intent == "ceiling")
 s = Sim()
 s.tick(1, soc=64.6, target=65, batt_v=56.6)
-check("#4: within half a point on restart: at target", s.oneway is None and s.out.charge_intent == "release")
+check("#4: within half a point on restart: at target", s.oneway is None and s.out.charge_intent == "hold")
 
 # ---- issue #5: the need is the complete DC-bus demand ----
 # E09: 400 W of PV against 300 W AC + 300 W DC passed the old 360 W need
@@ -823,6 +876,42 @@ s.tick(300, batt=-120.0, cvl=59.49)
 check("#8: an ordinary solar deficit return is not a failed probe",
       s.state == "shore" and any("deficit" in tr for tr in s.transitions) and s.failures == [],
       str(s.failures))
+
+# ---- Stage B (plan B2, master D03/SP23): HOLD asks for the hold ----
+# 4.9 released sustain at the destination and let the slider, the band and
+# the loads settle it between them: a steady -49 W is 1.448 points in 24 h
+# (E04). Sustain mode 3 is dbus-recbms' two-sided hold at the rest voltage.
+s = Sim()
+s.tick(1, soc=60, target=60, batt_v=56.6, cvl=56.62)
+check("HOLD: sustain 3 on shore, from the first tick",
+      s.oneway is None and s.out.oneway == "" and s.sustain == 3 and
+      s.out.charge_intent == "hold" and s.sustains == [(s.now, 3)], str(s.sustains))
+n0 = len(s.sustains)
+s.tick(5)
+check("HOLD: no re-assert inside the 30 s cycle", len(s.sustains) == n0)
+s.tick(31)
+check("HOLD: re-asserted every ASSERT_MS like the one-way holds",
+      len(s.sustains) == n0 + 1 and s.sustain == 3)
+s.tick(1, soc=60.4, target=61)
+check("HOLD: a slider nudge inside the band keeps the hold",
+      s.oneway is None and s.sustain == 3 and s.out.charge_intent == "hold")
+s.inp.enabled = False
+s.tick(1)
+check("HOLD: disabled releases", s.sustain == 0 and s.out.charge_intent == "release")
+s.inp.enabled = True
+s.tick(1)
+check("HOLD: re-enabled holds again", s.sustain == 3)
+s.tick(1, target=None)
+check("HOLD: no target releases", s.sustain == 0 and s.out.charge_intent == "release")
+s = Sim()
+s.tick(1, soc=99.6, target=100, batt_v=61.9, cvl=61.96)
+check("HOLD: a full-charge target releases (COMPLETE_FULL must, D11/E12)",
+      s.oneway is None and s.sustain == 0 and s.out.charge_intent == "release" and
+      s.sustains == [], str(s.sustains))
+s = Sim()
+s.tick(340, soc=60, batt_v=56.4)
+check("HOLD: no target at all, nothing written", s.sustains == [] and s.out.charge_intent == "release",
+      str(s.sustains))
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:

@@ -35,6 +35,11 @@ from policy_contract import dumps, VERSION as PROTOCOL_VERSION
 
 log = logging.getLogger("dbus-solarpriority")
 
+# The engine's charge intent as dbus-recbms' sustain mode. Stage B (engine
+# 4.15, master D03/SP23): at the destination HOLD asks for the two-sided
+# hold (3) rather than releasing the bank to the slider.
+SUSTAIN = {'release': 0, 'floor': 1, 'ceiling': 2, 'hold': 3}
+
 
 # ----------------------------------------------------------------------------
 # velib_python (same lookup as dbus_recbms.py)
@@ -708,8 +713,7 @@ class SolarPriorityDriver:
                 request = dict(version=PROTOCOL_VERSION, generation=self.generation,
                     request_id=self.request_id, mode=mode, target_soc=float(target),
                     transfer_intent='island' if out.transfer_intent == 'island' else 'connected',
-                    requested_limits={'sustain': {'release': 0, 'floor': 1, 'ceiling': 2}[out.charge_intent],
-                                      'purpose': purpose},
+                    requested_limits={'sustain': SUSTAIN[out.charge_intent], 'purpose': purpose},
                     lease_s=15)
                 if out.boost_v is not None:
                     request['requested_limits']['boost_v'] = out.boost_v
@@ -743,7 +747,7 @@ class SolarPriorityDriver:
             service['/SolarPriority/NeedW'] = _q(out.need_w, self.cfg.power_step)
             service['/SolarPriority/Desired'] = int(out.transfer_intent == 'island')
             service['/SolarPriority/OneWay'] = out.oneway
-            service['/SolarPriority/Sustain'] = {'release': 0, 'floor': 1, 'ceiling': 2}[out.charge_intent]
+            service['/SolarPriority/Sustain'] = SUSTAIN[out.charge_intent]
             service['/SolarPriority/TargetSoc'] = target
             service['/SolarPriority/Diagnostics'] = dumps({'sources_valid': source_valid,
                 'protocol_ready': protocol_ready, 'status': status, 'engine_state': out.state})
