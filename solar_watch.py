@@ -97,8 +97,9 @@ def record(args):
 
     def on_connect(client, userdata, flags, rc):
         # (Re)subscribe on every connection: a broker restart or a Wi-Fi
-        # drop otherwise leaves a live but deaf client (seen 2026-09-14 06:43
-        # UTC, both recorders silent from the same second).
+        # drop would otherwise leave a live but deaf client. Precautionary:
+        # the 2026-09-14 overnight recorders never actually dropped (they
+        # were stopped by hand at 06:43 UTC and misread as stalled).
         for topic in lookup:
             client.subscribe(topic)
         received['at'] = time.time()
