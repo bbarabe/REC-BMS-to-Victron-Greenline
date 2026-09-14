@@ -160,6 +160,15 @@ INPUT_MAP = {
     ("system", "/Dc/Battery/Voltage"):    ("batt_v", _rng(20, 80)),
     ("system", "/Dc/System/Power"):       ("dc_load", _rng(-5000, 5000)),
     ("vebus", "/Ac/ActiveIn/ActiveInput"): ("feed", lambda v: True),
+    # Stage A (master D14/SP56): availability is not acceptance. This
+    # firmware publishes /Ac/State/AcIn1Available (1 tonight),
+    # /Ac/State/AcIn2Available (0), /Ac/State/IgnoreAcIn1|2 and
+    # /Ac/ActiveIn/Connected; /Ac/In/1/Connected does not exist on it. Both
+    # inputs are monitored so the tree is complete, but only the configured
+    # shore input feeds the engine (_field_for); a firmware without the path
+    # leaves ac_available None -- unknown, never absent.
+    ("vebus", "/Ac/State/AcIn1Available"): ("ac_available", lambda v: v in (0, 1)),
+    ("vebus", "/Ac/State/AcIn2Available"): ("ac_available", lambda v: v in (0, 1)),
     ("vebus", "/Ac/Out/L1/P"):            ("ac_out", _rng(-20000, 20000)),
     ("battery", "/RecBms/TargetChargeVoltage"): ("cvl", _rng(20, 80)),
     ("battery", "/RecBms/SolarBoost/Active"):   ("boost_active", lambda v: True),
@@ -203,6 +212,10 @@ class SolarPriorityDriver:
         self.read_issued = {}
         self.read_applied = {}
         self.last_request = None
+        # issue #8: an evaluated failed probe waiting to reach REC's durable
+        # backoff, and the first request id that carried it.
+        self.failed_probe = False
+        self.failed_probe_id = None
         self.sbus = _bus()
 
         self._init_settings()
@@ -460,6 +473,8 @@ class SolarPriorityDriver:
             return None, None
         elif cls == "battery" and inst != c.battery_instance:
             return None, None
+        if field == "ac_available" and path != "/Ac/State/AcIn%dAvailable" % c.ac_in:
+            return None, None       # the other AC input's availability is not shore's
         return field, valid
 
     def _store(self, service, path, value, now):
@@ -664,20 +679,37 @@ class SolarPriorityDriver:
             self.generation = status.get('generation')
             self.engine = Engine(self.cfg.engine, now * 1000, self._engine_log)
             self.request_id = 0
+            self.failed_probe, self.failed_probe_id = False, None
         try:
             out = self.engine.tick(now * 1000, self.inp)
+            if out.probe_failed:
+                self.failed_probe, self.failed_probe_id = True, None
             self.last_limited_by = '' if protocol_ready else 'REC protocol or fresh data unavailable'
             if protocol_ready:
                 self.request_id = max(self.request_id, status.get('accepted_id', 0)) + 1
+                # issue #8 / master D16: an actual failed probe must reach
+                # REC's durable backoff, which the engine's own cooldown
+                # cannot survive a restart. A single write can be refused, so
+                # the marker rides on every request from the failure tick
+                # until REC acknowledges one that carried it (REC counts one
+                # durable failure per departure). A consumer restart drops
+                # the pending marker; the engine-local backoff still stands.
+                if (self.failed_probe and self.failed_probe_id is not None
+                        and status.get('accepted_id', 0) >= self.failed_probe_id):
+                    self.failed_probe, self.failed_probe_id = False, None
+                if self.failed_probe and self.failed_probe_id is None:
+                    self.failed_probe_id = self.request_id
                 mode = ('OFF' if not self.inp.enabled else
                         'COMPLETE_FULL' if target >= 100 else
                         {'charge': 'CHARGE', 'discharge': 'DISCHARGE'}.get(out.oneway, 'HOLD'))
+                purpose = ('failed_probe' if self.failed_probe else
+                           'probe' if out.state == 'probe' else
+                           'descent' if out.oneway == 'discharge' else 'solar')
                 request = dict(version=PROTOCOL_VERSION, generation=self.generation,
                     request_id=self.request_id, mode=mode, target_soc=float(target),
                     transfer_intent='island' if out.transfer_intent == 'island' else 'connected',
                     requested_limits={'sustain': {'release': 0, 'floor': 1, 'ceiling': 2}[out.charge_intent],
-                                      'purpose': ('probe' if out.state == 'probe' else
-                                                  'descent' if out.oneway == 'discharge' else 'solar')},
+                                      'purpose': purpose},
                     lease_s=15)
                 if out.boost_v is not None:
                     request['requested_limits']['boost_v'] = out.boost_v

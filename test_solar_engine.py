@@ -25,7 +25,15 @@ Val = SP.Val
 class Sim:
     """Drives Engine.tick with a plant that follows the commands: the
     Quattro's ActiveInput reports 240 (none) once IgnoreAcIn is 1, and
-    also whenever there is no shore power at all (shore=False)."""
+    also whenever there is no shore power at all (shore=False).
+
+    Knobs beyond the engine's own inputs:
+      shore          shore power is physically present (default True)
+      ac_available   /Ac/State/AcIn<n>Available; "auto" follows `shore`,
+                     None is a firmware that publishes no such path
+      feed           force ActiveInput (0 = AC in 1, 1 = AC in 2, 240 = none)
+      relay_lag      ticks the transfer switch takes to follow IgnoreAcIn
+    """
 
     def __init__(self, **tun):
         self.t = dict(SP.ENGINE_DEFAULTS)
@@ -37,10 +45,13 @@ class Sim:
         self.inp.enabled = True
         self.inp.feed_shore = 0
         self.v = dict(soc=60.0, batt=0.0, load=300.0, pv=500.0, m=2, voc=60.0,
-                      batt_v=56.6, cvl=56.62, target=None)
+                      batt_v=56.6, cvl=56.62, target=None, ac_available="auto")
         self.cmd, self.sustain = 0, 0
+        self.relay_lag = 0
+        self.cmd_hist = []
         self.cmds, self.sustains, self.boosts = [], [], []
         self.transitions, self.states = [], set()
+        self.failures = []        # ticks on which out.probe_failed was raised
         self.out = None
 
     @property
@@ -61,7 +72,17 @@ class Sim:
             inp.load_now = Val(v["load"], n)
             inp.load_avg = Val(v.get("load_avg", v["load"]), n)
             inp.load_slow = Val(v.get("load_slow", v["load"]), n)
-            inp.feed = Val(240 if (self.cmd == 1 or not v.get("shore", True)) else 0, n)
+            # The transfer switch follows IgnoreAcIn only after relay_lag ticks.
+            self.cmd_hist.append(self.cmd)
+            applied = self.cmd_hist[max(0, len(self.cmd_hist) - 1 - self.relay_lag)]
+            shore = v.get("shore", True)
+            feed = v.get("feed")
+            inp.feed = Val(240 if (applied == 1 or not shore) else 0, n) \
+                if feed is None else Val(feed, n)
+            avail = v.get("ac_available", "auto")
+            if avail == "auto":
+                avail = 1.0 if shore else 0.0
+            inp.ac_available = None if avail is None else Val(float(avail), n)
             inp.ac_out = Val(v["load"], n)
             inp.voc6, inp.y6, inp.m6 = Val(v["voc"], n), Val(v["pv"], n), Val(v["m"], n)
             inp.voc7, inp.y7, inp.m7 = Val(0.0, n), Val(0.0, n), Val(0, n)
@@ -85,6 +106,8 @@ class Sim:
                 self.boosts.append(out.boost)
             if out.transition:
                 self.transitions.append(out.transition)
+            if out.probe_failed:
+                self.failures.append(n)
             self.states.add(out.state)
             self.out = out
         return self.out
@@ -124,8 +147,10 @@ s.tick(200, batt=-40.0, pv=0.0, m=0, voc=10.0)
 check("charge: -40 W is inside the one-way tolerance", s.state == "solar")
 s.tick(240, batt=-100.0)
 check("charge: -100 W three-minute mean -> shore", s.state == "shore" and s.cmd == 0, s.state)
-check("charge: floor requested one tick after the shore command (once the Quattro reports shore)",
-      s.sustain == 1 and s.sustains[-1][0] == s.cmds[-1][0] + 1000,
+# Stage A (A1, E03): the floor now goes out on the SAME tick as the shore
+# command, so it is in force before the Quattro re-accepts, not after it.
+check("charge: floor requested on the same tick as the shore command",
+      s.sustain == 1 and s.sustains[-1][0] == s.cmds[-1][0],
       "sustain %s cmd %s" % (s.sustains[-1], s.cmds[-1]))
 check("charge: still engaged at 68 %", s.oneway == "charge")
 s.tick(1, soc=79.5, batt=0.0)
@@ -632,6 +657,172 @@ for _ in range(400):
     if s.out.cmd is not None:
         s.cmd = s.out.cmd
 check("#5: one-way discharge leaves without any demand figure", s.out.state == "solar", s.out.state)
+
+# ---- Stage A1/A2: the floor is in force before the relay closes ----
+# E03: at an ordinary closure the pack was 56.41 V against a 59.34 V Quattro
+# CVL and 200 A, because the floor waited for ActiveInput to report shore --
+# the last thing that happens at a return.
+s = Sim()
+s.relay_lag = 20                                   # the transfer switch takes 20 s
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)                                        # -> solar
+s.tick(95, batt=100.0, cvl=59.49)
+check("A1: islanded with the floor released", s.state == "solar" and s.sustain == 0)
+for _ in range(400):
+    s.tick(1, batt=-120.0)
+    if s.state == "shore":
+        break
+check("A1: the deficit returns it", s.state == "shore" and s.cmd == 0)
+check("A1: shore available, relay not yet closed: the floor goes out on the same tick",
+      s.sustain == 1 and s.sustains[-1][0] == s.cmds[-1][0] and s.inp.feed.v == 240,
+      "sustain %s cmd %s feed %s" % (s.sustains[-1], s.cmds[-1], s.inp.feed.v))
+
+# availability alone, before ActiveInput moves at all
+s = Sim()
+s.tick(1, soc=80, target=95, shore=False)
+check("A1: shore known absent (available 0): no floor", s.oneway == "charge" and s.sustain == 0)
+s.tick(200)
+check("A1: still none while it is absent", s.sustain == 0 and s.inp.feed.v == 240)
+s.tick(1, ac_available=1)
+check("A1: availability 1 asks for the floor before ActiveInput changes",
+      s.sustain == 1 and s.sustains[-1][0] == s.now and s.inp.feed.v == 240,
+      "sustain %s feed %s" % (s.sustains[-1:], s.inp.feed.v))
+
+# a firmware with no availability path at all: unknown is not absent
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4, ac_available=None)
+check("A1 unknown: an accepted input still gets the floor", s.sustain == 1)
+s.tick(340)
+s.tick(95, batt=100.0, cvl=59.49)
+check("A1 unknown: released while islanded", s.state == "solar" and s.sustain == 0)
+for _ in range(400):                               # the deficit returns it; no AC comes back
+    s.tick(1, batt=-120.0, shore=False)
+    if s.state == "shore":
+        break
+ret = s.eng.st["lastTransition"]
+check("A1 unknown: the return keeps the floor though nothing is accepted",
+      s.state == "shore" and s.sustain == 1 and ret == s.now and s.inp.feed.v == 240,
+      "sustain %s feed %s" % (s.sustain, s.inp.feed.v))
+s.tick(89)
+check("A1 unknown: still held through the 90 s grace",
+      s.now - ret == 89000 and s.sustain == 1, "%d ms, sustain %s" % (s.now - ret, s.sustain))
+s.tick(2)
+check("A1 unknown: released once shore has really stayed absent past the grace",
+      s.sustain == 0 and s.sustains[-1][1] == 0, str(s.sustains[-2:]))
+s.tick(1, ac_available=1)
+check("A1 unknown: shore reappears, the floor is asked for at once", s.sustain == 1)
+
+# ---- Stage A2: an accepted input is a charger, whichever input it is ----
+# ActiveInput 0 = AC in 1, 1 = AC in 2, 240 = nothing accepted. "Not AC1" is
+# not proof of inverter-only operation (master D14, SP56).
+s = Sim()
+s.tick(1, soc=80, target=95, shore=False, ac_available=0, feed=1)
+check("A2: an accepted AC in 2 is a connected charger: floor, though shore reads absent",
+      s.oneway == "charge" and s.sustain == 1)
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)
+s.tick(95, batt=100.0, cvl=59.49)
+check("A2: islanded before the alternate input appears", s.state == "solar")
+s.tick(1, feed=1)
+check("A2: AC in 2 accepted during solar is the same fault",
+      s.state == "shore" and s.eng.st["lockoutUntil"] > s.now and
+      "FAULT: AC re-accepted externally" in (s.out.transition or ""), str(s.out.transition))
+check("A2: the log names the input",
+      any("AC input 1 during solar mode" in l for l in s.logs), str(s.logs[-1:]))
+
+# ---- Stage A3: the probe's clock is the measurement's clock ----
+# SP62: the ramp used to start on the request, so a slow transfer spent the
+# window on shore and the verdict judged a bank that never left.
+s = Sim(ONEWAY_SKIP_PROBE=0)
+s.relay_lag = 20
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)                                        # probe at 300 s, relay opens at 321 s
+check("A3: probe entered", s.state == "probe")
+ramp = s.eng.st["probeRamp"]
+check("A3: the ramp clock starts on the confirmed departure, not on the request",
+      ramp == s.eng.st["probeStart"] + 21000,
+      "ramp %s start %s" % (ramp, s.eng.st["probeStart"]))
+s.tick(69)                                         # 90 s after the request, 69 s after departure
+check("A3: 90 s after the request it is still ramping", s.state == "probe" and
+      "PROBE 1s" in s.out.status_text, s.out.status_text)
+ev = s.eng.st["evalBatt"]
+check("A3: the evaluation window is the last 15 s of the ramp after departure",
+      ev and ev[0][0] == ramp + 75000 and ev[-1][0] == ramp + 89000, str(ev[:1] + ev[-1:]))
+s.tick(1)
+check("A3: the verdict falls 90 s after departure, 111 s after the request",
+      s.state == "solar" and s.now - ramp == 90000, "%s %d" % (s.state, s.now - ramp))
+
+# a transfer that never happens is not a failed solar measurement
+s = Sim(ONEWAY_SKIP_PROBE=0)
+s.relay_lag = 100000                               # the transfer switch never moves
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)
+check("A3: probe entered with the relay stuck", s.state == "probe" and s.eng.st["probeRamp"] == 0)
+check("A3: status says what it is waiting for",
+      s.out.status_text.endswith("PROBE | waiting for transfer"), s.out.status_text)
+check("A3: nothing is captured while it waits", s.eng.st["evalBatt"] == [])
+s.tick(49)                                         # 90 s after probeStart
+check("A3: an unconfirmed transfer returns to shore after the grace",
+      s.state == "shore" and "transfer not confirmed in 90 s" in s.transitions[-1],
+      str(s.transitions[-1:]))
+check("A3: ... with no lockout and no failed probe",
+      s.eng.st["lockoutUntil"] == 0 and s.failures == [], str(s.failures))
+check("A3: ... but the engine-local cooldown doubles on the return tick",
+      s.eng.st["backoffMs"] == 2 * s.t["COOLDOWN_MS"] and s.eng.st["backoffUntil"] > s.now,
+      str(s.eng.st["backoffMs"]))
+check("A3: ... and the floor is back on shore", s.sustain == 1)
+
+# nor is a bank that is already at its ceiling
+s = Sim(ONEWAY_SKIP_PROBE=0)
+s.tick(1, soc=60, target=80, batt_v=56.58, cvl=56.62)   # 0.04 V: nothing to ramp into
+s.tick(340)
+check("A3: the transfer is confirmed but there is no room for the sun",
+      s.state == "probe" and s.eng.st["probeRamp"] == 0)
+check("A3: status names the two voltages",
+      s.out.status_text.endswith("PROBE | waiting for headroom (batt 56.58 V, CVL 56.62 V)"),
+      s.out.status_text)
+s.tick(50)
+check("A3: no headroom returns to shore, not a failed probe",
+      s.state == "shore" and "no voltage headroom" in s.transitions[-1] and
+      s.eng.st["lockoutUntil"] == 0 and s.failures == [], str(s.transitions[-1:]))
+
+# the ordinary probe is unchanged in outcome
+s = Sim(ONEWAY_SKIP_PROBE=0)
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)
+check("A3: an immediate transfer starts the clock on the next tick",
+      s.state == "probe" and s.eng.st["probeRamp"] == s.eng.st["probeStart"] + 1000)
+s.tick(51)
+check("A3: the ordinary probe still ends in solar, with no failure raised",
+      s.state == "solar" and s.failures == [], "%s %s" % (s.state, s.failures))
+
+# ---- issue #8: the failed-probe edge for REC's durable backoff ----
+s = Sim(ONEWAY_SKIP_PROBE=0)
+s.tick(1, soc=60, target=80, batt_v=56.4, m=1)
+s.tick(340)
+s.tick(100, batt=-120.0, cvl=59.49)
+check("#8: an evaluated probe failure raises exactly one edge",
+      s.state == "shore" and s.failures == [s.eng.st["lastTransition"]] and
+      any("probe failed" in tr for tr in s.transitions), str(s.failures))
+check("#8: and never on a later tick", s.out.probe_failed is False)
+s.tick(30)
+check("#8: still one edge", len(s.failures) == 1)
+s = Sim(ONEWAY_SKIP_PROBE=0)
+s.tick(1, soc=60, target=80, batt_v=56.4, m=1)
+s.tick(340)
+check("#8: probe running before the sun goes", s.state == "probe")
+s.tick(70, pv=0.0, m=0)
+check("#8: MPPTs that never wake are a failed probe too",
+      s.state == "shore" and any("never woke" in tr for tr in s.transitions) and
+      s.failures == [s.eng.st["lastTransition"]], str(s.transitions[-1:]))
+s = Sim()
+s.tick(1, soc=60, target=80, batt_v=56.4)
+s.tick(340)
+s.tick(300, batt=-120.0, cvl=59.49)
+check("#8: an ordinary solar deficit return is not a failed probe",
+      s.state == "shore" and any("deficit" in tr for tr in s.transitions) and s.failures == [],
+      str(s.failures))
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:

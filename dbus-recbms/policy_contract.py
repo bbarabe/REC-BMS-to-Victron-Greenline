@@ -64,7 +64,7 @@ class PolicyContract:
                 raise ValueError('sustain must be release (0), floor (1), or ceiling (2)')
             if request['mode'] in ('OFF', 'COMPLETE_FULL') and limits['sustain'] != 0:
                 raise ValueError('disabled/full mode must release sustain')
-            if limits.get('purpose', '') not in ('', 'solar', 'probe', 'buffer', 'descent'):
+            if limits.get('purpose', '') not in ('', 'solar', 'probe', 'buffer', 'descent', 'failed_probe'):
                 raise ValueError('unknown transfer purpose')
             if not self.owned and not consumer_ready:
                 raise ValueError('new consumer ownership handover not verified')

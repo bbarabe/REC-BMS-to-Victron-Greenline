@@ -343,6 +343,30 @@ class RestoredPlantTests(unittest.TestCase):
             sim.run(40)
             self.assertTrue(sim.plant.connected)
 
+    def test_failed_probe_marks_the_request_until_rec_acknowledges_it(self):
+        # issue #8 / master D16: an evaluated probe failure is the one outcome
+        # the engine's own cooldown cannot carry across a restart, so it has to
+        # reach REC as a marked request. Here the cloud arrives the moment the
+        # transfer completes: 120 W of PV against a 433 W island. The marker
+        # rides on every request until REC acknowledges one that carried it,
+        # then the ordinary purpose mapping resumes. This tree's REC side does
+        # not consume the marker yet, so only what the consumer sends is
+        # asserted.
+        def keep_the_probe(cfg):
+            cfg.engine['ONEWAY_SKIP_PROBE'] = 0
+        with self.simulation(target=80, configure_solar=keep_the_probe) as sim:
+            purpose = lambda: sim.solar.last_request['requested_limits']['purpose']
+            sim.set_sun([260, 260])
+            self.until(sim, lambda: sim.solar.sw['/SolarPriority/State'] == 'probe'
+                       and not sim.plant.connected)
+            sim.set_sun([60, 60])
+            self.until(sim, lambda: purpose() == 'failed_probe', timeout=200)
+            self.assertIn('probe failed', sim.solar.sw['/SolarPriority/LastTransition'])
+            self.until(sim, lambda: purpose() != 'failed_probe', timeout=30)
+            self.assertEqual(purpose(), 'solar')
+            sim.run(30)
+            self.assertEqual(purpose(), 'solar')
+
 
 if __name__ == '__main__':
     unittest.main()

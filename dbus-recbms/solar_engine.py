@@ -91,6 +91,12 @@ ENGINE_DEFAULTS = {
     # solar like one-way discharge does; the three-minute deficit exit
     # stands guard. 0 keeps the probe.
     "ONEWAY_SKIP_PROBE": 1,
+    # Stage A (master D16/SP62, repair plan A3): the probe's ramp clock only
+    # starts once the transfer is physically confirmed AND the bank has room
+    # to take the sun. 0.10 V is dbus-recbms' own boost min_margin_v: below
+    # it the MPPTs sit on the bank and a "probe" measures the ceiling, not
+    # the capacity. A bank above its ceiling is not a failed measurement.
+    "PROBE_HEADROOM_V": 0.10,
 }
 
 
@@ -142,7 +148,12 @@ class Inputs:
               # 4.13: dbus-recbms' complete DC-bus island demand, smoothed by
               # the consumer over LOAD_AVG_MS / LOAD_SLOW_MS, and its
               # uncertainty allowance. None: no elective solar admission.
-              "demand_avg", "demand_slow", "demand_margin")
+              "demand_avg", "demand_slow", "demand_margin",
+              # Stage A (master D14/SP56): the Quattro's own report that the
+              # shore input is present, separate from acceptance. 1/0, or
+              # None when the firmware publishes no such path -- unknown is
+              # never read as absent.
+              "ac_available")
 
     def __init__(self):
         for f in self.FIELDS:
@@ -166,12 +177,17 @@ class Outputs:
         self.est = 0.0
         self.need_w = 0.0
         self.state = "shore"
+        # issue #8 / master D16: an EDGE, true only on the tick an EVALUATED
+        # probe failed (the sun could not carry the island, or the MPPTs
+        # never woke). A refused transfer, a bank with no headroom, a big
+        # load or a fault are not failed capacity measurements.
+        self.probe_failed = False
 
 
 def fresh_state(now, t):
     return {
         "state": "shore", "desired": 0, "lastSent": None, "lastAssert": 0,
-        "lastTransition": now, "probeStart": 0, "probeEst": 0,
+        "lastTransition": now, "probeStart": 0, "probeRamp": 0, "probeEst": 0,
         "evalPv": [], "evalBatt": [],
         "readySince": 0, "loadExceedStart": 0, "surgeStart": 0,
         "backoffMs": t["COOLDOWN_MS"], "backoffUntil": 0,
@@ -188,6 +204,10 @@ def fresh_state(now, t):
 
 
 SUSTAIN_OFF, SUSTAIN_FLOOR, SUSTAIN_CEILING = 0, 1, 2   # dbus-recbms modes
+# VE.Bus /Ac/ActiveIn/ActiveInput: 0 = AC in 1, 1 = AC in 2, 240 = nothing
+# accepted (inverting). Any value but 240 is a charger on the AC bus, not
+# only the configured shore input (master D14, SP56).
+FEED_NONE = 240
 
 
 def select_objective(previous, target, soc, enter_pct, exit_pct):
@@ -415,6 +435,7 @@ class Engine:
             st["loadExceedStart"] = 0
             st["surgeStart"] = 0
             st["probeStart"] = 0
+            st["probeRamp"] = 0
             st["evalPv"] = []
             st["evalBatt"] = []
             st["burnReadySince"] = 0
@@ -473,6 +494,9 @@ class Engine:
             st["state"] = "probe"
             st["desired"] = 1
             st["probeStart"] = now
+            # A1/A3: the ramp clock belongs to THIS probe. A burn-down hands
+            # straight over to a probe without passing through toShore.
+            st["probeRamp"] = 0
             st["probeEst"] = max(est, needW or 0.0)
             st["evalPv"] = []
             st["evalBatt"] = []
@@ -794,7 +818,21 @@ class Engine:
                     status[1] = s
 
             elif st["state"] == "probe":
-                elapsed = now - st["probeStart"]
+                # Stage A (A3, master D16/SP62). The ramp clock is the
+                # measurement's clock, so it starts on the physics, not on
+                # the request: the relay may take seconds to open (E13: a
+                # connect command with the feedback still disconnected 31 s
+                # later), and with the bank already at its ceiling the MPPTs
+                # have nothing to ramp into. WAKE_MS / RAMP_MS / EVAL_MS are
+                # measured from probeRamp; until it starts nothing is
+                # evaluated or captured.
+                departed = feed.v == FEED_NONE
+                headroom = (effCvl is not None and battV is not None
+                            and effCvl - battV.v >= t["PROBE_HEADROOM_V"])
+                if not st["probeRamp"] and departed and headroom:
+                    st["probeRamp"] = now
+                elapsed = (now - st["probeRamp"]) if st["probeRamp"] else 0
+                waited = now - st["probeStart"]
                 bigLoad = loadNow.v > st["probeEst"] * 1.5
                 if not owc:
                     bigLoad = bigLoad or loadAvg.v * t["SOLAR_MARGIN"] > st["probeEst"]
@@ -809,9 +847,32 @@ class Engine:
                         loadNow.v, loadAvg.v, st["probeEst"], pvNow,
                         "%.2f" % balance if balance is not None else "-"))
                     status[0] = "blue"
+                elif not st["probeRamp"]:
+                    # A delayed or refused transfer, and a bank with no room
+                    # to take the sun, are bounded waits -- never a failed
+                    # solar capacity measurement (so no lockout, no
+                    # probe_failed, only the engine-local cooldown).
+                    battTxt = "%.2f" % battV.v if battV is not None else "?"
+                    cvlTxt = "%.2f" % effCvl if effCvl is not None else "?"
+                    if waited >= t["FEEDBACK_GRACE_MS"]:
+                        escalateBackoff()
+                        grace = int(round(t["FEEDBACK_GRACE_MS"] / 1000.0))
+                        if not departed:
+                            toShore("probe: transfer not confirmed in %d s "
+                                    "(ActiveInput %d)" % (grace, int(feed.v)))
+                        else:
+                            toShore("probe: no voltage headroom in %d s "
+                                    "(batt %s V, CVL %s V)" % (grace, battTxt, cvlTxt))
+                        status[0] = "blue"
+                    else:
+                        status[0] = "yellow"
+                        status[1] = ("PROBE | waiting for transfer" if not departed else
+                                     "PROBE | waiting for headroom (batt %s V, CVL %s V)" % (
+                                         battTxt, cvlTxt))
                 elif (elapsed >= t["WAKE_MS"] and pvNow < 10
                       and not (m6 and m6.v == 2) and not (m7 and m7.v == 2)):
                     escalateBackoff()
+                    out.probe_failed = True
                     toShore("probe: MPPTs never woke (batt %sV, CVL %sV)" % (
                         "%.2f" % battV.v if battV else "?", "%.2f" % cvl.v if cvl else "?"))
                     status[0] = "blue"
@@ -825,8 +886,13 @@ class Engine:
                 else:
                     pvAvg = time_mean(st["evalPv"], now, t["EVAL_MS"], t["HB_STALE_MS"])[0] if st["evalPv"] else pvNow
                     battAvg = time_mean(st["evalBatt"], now, t["EVAL_MS"], t["HB_STALE_MS"])[0] if st["evalBatt"] else batt.v
-                    if feed.v == FEED_SHORE:
-                        self.log("ERROR IgnoreAcIn has no effect - check the vebus instance / firmware")
+                    if feed.v != FEED_NONE:
+                        # Departure was confirmed when the ramp started, so an
+                        # accepted input now is the Quattro taking AC back
+                        # under the engine's command -- from either input
+                        # (master D14: "not AC1" is not inverter-only).
+                        self.log("ERROR AC input %d was re-accepted during the probe - "
+                                 "check the vebus instance / firmware" % int(feed.v))
                         lockout()
                         toShore("FAULT: AC control ineffective")
                         status[0] = "red"
@@ -834,6 +900,7 @@ class Engine:
                         enter_solar("PV %.0fW, batt %.0fW" % (pvAvg, battAvg))
                     else:
                         escalateBackoff()
+                        out.probe_failed = True
                         toShore("probe failed: PV %.0fW, batt %.0fW | y %.0f+%.0f Voc %.0fV bal %s" % (
                             pvAvg, battAvg, y6.v if y6 else 0, y7.v if y7 else 0, vocMax,
                             "%.2f" % balance if balance is not None else "-"))
@@ -849,8 +916,9 @@ class Engine:
 
                 if st["suspendTrigStart"] and now - st["suspendTrigStart"] >= t["SUSPEND_MS"]:
                     enter_suspend("burndown")
-                elif feed.v == FEED_SHORE and sinceTrans > t["FEEDBACK_GRACE_MS"]:
-                    self.log("ERROR Quattro re-accepted AC during burn-down - standing down")
+                elif feed.v != FEED_NONE and sinceTrans > t["FEEDBACK_GRACE_MS"]:
+                    self.log("ERROR Quattro re-accepted AC input %d during burn-down"
+                             " - standing down" % int(feed.v))
                     lockout()
                     toShore("FAULT: AC re-accepted externally")
                     status[0] = "red"
@@ -964,11 +1032,13 @@ class Engine:
                 # shore branch (JS `var` hoisting) so it was always undefined
                 # here = no gate. ActiveInput is 240 while inverting anyway, so
                 # shore presence cannot be judged in this state; the port
-                # keeps the flow's actual behaviour (no gate).
+                # keeps the flow's actual behaviour (no gate). Any value but
+                # 240 IS a charger the engine did not ask for (master D14).
                 if st["suspendTrigStart"] and now - st["suspendTrigStart"] >= t["SUSPEND_MS"]:
                     enter_suspend("solar")
-                elif feed.v == FEED_SHORE and sinceTrans > t["FEEDBACK_GRACE_MS"]:
-                    self.log("ERROR Quattro re-accepted AC during solar mode - standing down")
+                elif feed.v != FEED_NONE and sinceTrans > t["FEEDBACK_GRACE_MS"]:
+                    self.log("ERROR Quattro re-accepted AC input %d during solar mode"
+                             " - standing down" % int(feed.v))
                     lockout()
                     toShore("FAULT: AC re-accepted externally")
                     status[0] = "red"
@@ -1034,8 +1104,8 @@ class Engine:
         # is connected (shore, suspend) -- solar must be free to charge the
         # rest of the time. Discharging, it is a ceiling the whole time.
         # Re-asserted every ASSERT_MS: dbus-recbms expires it on its own.
-        # 4.5: "connected" means the Quattro reports the shore input as its
-        # active input, not merely that the engine asked for it. With no AC
+        # 4.5: "connected" means the Quattro reports an input as its active
+        # input, not merely that the engine asked for it. With no AC
         # available (2026-09-06: a 1 kW load on solar, no shore power) the
         # Quattro keeps inverting whatever it is told, and a floor then does
         # nothing but pin the CVL at the present SOC and stop solar charging.
@@ -1043,10 +1113,29 @@ class Engine:
         # data it cannot judge: the floor is then wanted regardless of what
         # the Quattro reports (or fails to report), so that it is in force
         # before the charger is, not one tick after it (issue #1).
-        onShore = feed is not None and feed.v == FEED_SHORE
+        #
+        # Stage A (A1/A2, master D02/D14). Acceptance is the LAST thing to
+        # happen at an ordinary return, so waiting for it put the floor and
+        # its CCL cap one tick behind the closure every time (E03: pack
+        # 56.41 V against a 59.34 V Quattro CVL and 200 A at closure). While
+        # heading for shore the floor is therefore wanted as soon as shore is
+        # merely AVAILABLE, and stays wanted while availability is unknown --
+        # until the grace says shore has really been absent, which is the
+        # 2026-09-06 case the rule above exists for. Any accepted input, not
+        # only the configured shore one, is a charger on the bus (SP56).
+        acAccepted = feed is not None and feed.v != FEED_NONE
+        acAvail = inp.ac_available
+        shoreGone = (feed is not None and feed.v == FEED_NONE
+                     and now - st["lastTransition"] > t["FEEDBACK_GRACE_MS"])
         if owc:
-            want = (SUSTAIN_FLOOR if st["state"] in ("shore", "suspend") and (onShore or missing)
-                    else SUSTAIN_OFF)
+            if st["state"] not in ("shore", "suspend"):
+                want = SUSTAIN_OFF          # islanded: solar must be free to charge
+            elif acAccepted or missing:
+                want = SUSTAIN_FLOOR        # a charger is connected (any input)
+            elif acAvail is not None:
+                want = SUSTAIN_FLOOR if acAvail.v == 1 else SUSTAIN_OFF
+            else:
+                want = SUSTAIN_OFF if shoreGone else SUSTAIN_FLOOR
         elif owd:
             want = SUSTAIN_CEILING
         else:
