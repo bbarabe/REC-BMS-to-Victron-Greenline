@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.3.0"
+VERSION = "3.3.1"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1534,8 +1534,11 @@ class RecBmsDriver:
         """The bank moved a full step the hold's way: the hold voltage
         follows it -- a floor up and never down, a ceiling down and never
         up -- and the servo starts afresh from the new anchor. A two-sided
-        hold (mode 3) is never re-anchored: it holds a destination, not
-        wherever the bank got to, and its own servo is the correction."""
+        hold (mode 3) never re-anchors on a step: it holds a destination,
+        not wherever the bank got to, and its own servo is the correction.
+        It re-anchors once on ARRIVAL at that destination (3.3.1, see
+        _service_sustain): the bank's rest voltage there is the hold, and
+        the servo it wound getting there is folded away."""
         su = self.sustain
         name = sustain_name(su["mode"])
         hold_v = su["anchor_v"] + su["servo_v"]
@@ -1691,6 +1694,25 @@ class RecBmsDriver:
                         su["trim_a"] = max(-c.sustain_trim_max_a, su["trim_a"] - c.sustain_trim_a)
                     elif err < 0 and draining:
                         su["trim_a"] = min(c.sustain_trim_max_a, su["trim_a"] + c.sustain_trim_a)
+            if (hold and volts is not None and su["servo_v"] != 0.0
+                    and held_eff - c.sustain_servo_db <= soc <= held_eff + c.sustain_servo_db):
+                # Arrival snap (3.3.1). A hold that lifts (or lowers) the
+                # bank to its destination itself winds the servo the whole
+                # way -- the boat's first HOLD, 2026-09-14: taken at 49.1 %
+                # for 50 %, +0.50 V in twelve minutes, and at 49.9 % the
+                # Quattro sat 0.45 V above a bank it may no longer fill.
+                # The current limit is the only thing restraining it there,
+                # a 0 A limit the Quattro honours slowly (2 A for minutes),
+                # and every solar boost lifts that limit: 6 A into a held
+                # bank per boost. Arriving is a measurement like taking the
+                # hold: the voltage becomes the bank's present rest voltage
+                # and the servo starts again from nothing, so the Quattro
+                # is ON the bank with no headroom to spend, boost or not.
+                # Once per arrival: inside the deadband the servo does not
+                # move, so it stays folded until the bank leaves the band
+                # and comes back.
+                self._sustain_reanchor(volts, amps, "arrived at %.1f%% for %.1f%%: bank %.2fV at %.1fA, servo %+.2fV folded"
+                                       % (soc, held_eff, volts, amps if amps is not None else 0.0, su["servo_v"]))
         # The solar band (see _sustain_band): under a floor the MPPTs get
         # band_v of headroom above the hold voltage while the bank is under
         # the slider; under a two-sided hold always, the current limit

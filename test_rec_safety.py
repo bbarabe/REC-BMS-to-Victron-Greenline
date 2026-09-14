@@ -297,6 +297,77 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.tick()
         self.assertGreater(batt['/Info/MaxChargeCurrent'], 1.0)
 
+    def test_a_hold_arriving_at_its_destination_folds_its_servo_into_a_fresh_anchor(self):
+        # Boat, 2026-09-14 22:25-23:40 UTC: the first HOLD (50 %) was taken
+        # at 49.1 % on shore, the servo wound +0.50 V lifting the bank, and
+        # at 49.9 % the Quattro sat 0.45 V above a bank it may no longer
+        # fill, restrained only by the current limit -- 2 A for minutes on
+        # a 0 A limit, and 6 A into the bank the moment a solar boost
+        # lifted it. 3.3.1: arriving re-anchors on the bank's rest voltage
+        # and folds the servo, once per arrival, from either side.
+        self.driver.settings['chargeslider'] = 50
+        self.driver.sp_enabled = True
+        self.tick()
+        self.assertTrue(self.driver._set_sustain(3))
+        su = self.driver.sustain
+        r = self.cfg.sustain_anchor_r
+        self.driver._sustain_anchor(49.1, 55.55 + 12.0 * r, 12.0, 'test')
+        self.assertAlmostEqual(su['anchor_v'], 55.55, places=2)
+
+        def drive(soc, volts, amps):
+            self.driver._set_sustain(3)                    # the owner re-asserts its lease
+            return self.driver._service_sustain(self.now, soc, 50.0, volts, amps)
+
+        for _ in range(30):                                # the lift: 0.02 V per period
+            self.now += self.cfg.sustain_servo_s
+            drive(49.1, 55.6, 12.0)
+        self.assertAlmostEqual(su['servo_v'], self.cfg.sustain_servo_up, places=3)
+        self.assertAlmostEqual(su['anchor_v'], 55.55, places=2)
+        # Still a deadband short of the destination: nothing folds yet.
+        self.now += 1
+        drive(49.8, 55.6, 12.0)
+        self.assertAlmostEqual(su['servo_v'], self.cfg.sustain_servo_up, places=3)
+        self.assertAlmostEqual(su['anchor_v'], 55.55, places=2)
+        # Arrival from below at 5 A: the hold IS the bank's rest voltage,
+        # the servo is gone, the Quattro is commanded onto the bank.
+        self.now += 1
+        target = drive(49.9, 55.6, 5.0)
+        self.assertAlmostEqual(su['anchor_v'], 55.6 - 5.0 * r, delta=.006)
+        self.assertEqual(su['servo_v'], 0.0)
+        self.assertAlmostEqual(self.driver.batt['/RecBms/Sustain/HoldVoltage'], su['anchor_v'], places=2)
+        self.assertAlmostEqual(target, su['anchor_v'] + self.driver._sustain_band(
+            getattr(self.driver, 'band_available', False), 49.9, 50.0), places=2)
+        # Inside the band the anchor stands whatever the bank reads.
+        folded = su['anchor_v']
+        for soc, volts in ((50.0, 55.7), (49.95, 55.5), (50.05, 55.8)):
+            self.now += 1
+            drive(soc, volts, 0.0)
+            self.assertAlmostEqual(su['anchor_v'], folded, places=2)
+            self.assertEqual(su['servo_v'], 0.0)
+        # Arrival from above with the servo wound down folds the same way;
+        # a bank still outside the band does not.
+        su['servo_v'] = -0.3
+        self.now += 1
+        drive(50.3, 55.8, -1.0)
+        self.assertAlmostEqual(su['servo_v'], -0.3, places=3)
+        self.assertAlmostEqual(su['anchor_v'], folded, places=2)
+        self.now += 1
+        drive(50.1, 55.8, -1.0)
+        self.assertAlmostEqual(su['anchor_v'], 55.8 + 1.0 * r, delta=.006)
+        self.assertEqual(su['servo_v'], 0.0)
+        # A floor never folds: its servo is not an arrival mechanism.
+        self.assertTrue(self.driver._set_sustain(0))
+        self.driver.settings['chargeslider'] = 60
+        self.assertTrue(self.driver._set_sustain(1))
+        su = self.driver.sustain                            # a release makes a fresh state
+        self.driver._sustain_anchor(49.1, 55.55, 0.0, 'test')
+        su['servo_v'] = 0.3
+        self.now += 1
+        self.driver._set_sustain(1)
+        self.driver._service_sustain(self.now, 49.1, 60.0, 55.6, 0.0)
+        self.assertAlmostEqual(su['servo_v'], 0.3, places=3)
+        self.assertAlmostEqual(su['anchor_v'], 55.55, places=2)
+
     def test_a_re_asserted_hold_keeps_its_anchor_and_refreshes_expiry(self):
         self.driver.settings['chargeslider'] = 80
         self.tick()

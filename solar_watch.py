@@ -39,6 +39,9 @@ TOPICS = {
         'RecBms/Sustain/Active': 'hold', 'RecBms/Sustain/Mode': 'hold_mode',
         'RecBms/Sustain/Soc': 'hold_soc', 'RecBms/Sustain/HoldVoltage': 'hold_v',
         'RecBms/Sustain/Servo': 'hold_servo', 'RecBms/Sustain/ChargeLimit': 'hold_ccl',
+        'RecBms/Sustain/TrimA': 'trim', 'RecBms/Sustain/Status': 'hold_status',
+        'RecBms/SolarBoost/Active': 'boost', 'RecBms/SolarBoost/Applied': 'boost_v',
+        'RecBms/SolarBoost/WindowOpen': 'boost_window', 'RecBms/SolarBoost/Status': 'boost_status',
         'RecBms/SolarLead': 'lead', 'RecBms/LeadFault': 'lead_fault',
         'RecBms/Voltage/Ready': 'ready',
         'RecBms/Voltage/RequestedQuattro': 'req_q', 'RecBms/Voltage/RequestedSolar': 'req_s',
@@ -67,8 +70,15 @@ TOPICS = {
         'SolarPriority/Desired': 'sp_desired', 'SolarPriority/LimitedBy': 'sp_limited_by',
     },
 }
+# Per MPPT (one set of fields per instance, suffixed with the instance): the
+# yield, the operation mode (1 limited, 2 tracking), the array voltage, the
+# output current and the limit DVCC hands it. Needed to tell a curtailed
+# charger from a shaded one (2026-09-14: the HOLD's 1 A cap starves one MPPT
+# entirely, which the engine's balance read as shade).
+MPPT_TOPICS = {'Yield/Power': 'y', 'MppOperationMode': 'm', 'Pv/V': 'voc',
+               'Dc/0/Current': 'a', 'Link/ChargeCurrent': 'lim'}
 EDGE_FIELDS = ('active_input', 'ignore_state', 'ignore_cmd', 'shore_available', 'transport',
-               'relay_pending', 'hold', 'hold_mode', 'sp_state', 'sp_desired', 'mode')
+               'relay_pending', 'hold', 'hold_mode', 'sp_state', 'sp_desired', 'mode', 'boost')
 
 
 def record(args):
@@ -78,6 +88,9 @@ def record(args):
     for service, paths in TOPICS.items():
         for path, field in paths.items():
             lookup['N/%s/%s/%d/%s' % (args.portal, service, instances[service], path)] = field
+    for inst in args.mppt:
+        for path, field in MPPT_TOPICS.items():
+            lookup['N/%s/solarcharger/%d/%s' % (args.portal, inst, path)] = '%s%d' % (field, inst)
     latest = {}
     edges = []
 
@@ -138,6 +151,12 @@ def record(args):
                     print('reconnect failed: %s' % exc, flush=True)
             row = dict(latest)
             row['t'] = round(now, 1)
+            if now - received['at'] > 10:
+                # Nothing heard for a while: the values are the last ones
+                # seen, not the boat's present state. Marked so summaries
+                # skip them (2026-09-14 23:01Z: the Cerbo changed address
+                # and 5 min of stale copies were written before anyone knew).
+                row['stale_s'] = round(now - received['at'])
             row['iso'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))
             while edges:
                 stamp, field, old, new = edges.pop(0)
@@ -156,6 +175,8 @@ def summary(path):
             try:
                 item = json.loads(line)
             except ValueError:
+                continue
+            if item.get('stale_s'):
                 continue
             (edges if 'edge' in item else rows).append(item)
     if not rows:
@@ -193,10 +214,12 @@ def main():
     ap.add_argument('--vebus', type=int, default=276)
     ap.add_argument('--battery', type=int, default=200)
     ap.add_argument('--switch', type=int, default=221)
+    ap.add_argument('--mppt', default='278,279', help='solarcharger instances to record per charger')
     ap.add_argument('--out', default='solar-trace.jsonl')
     ap.add_argument('--hours', type=float, default=12.0)
     ap.add_argument('--summary', metavar='TRACE', help='summarise a recorded trace and exit')
     args = ap.parse_args()
+    args.mppt = [int(x) for x in args.mppt.split(',') if x.strip()]
     if args.summary:
         summary(args.summary)
         return
