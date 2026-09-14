@@ -416,18 +416,20 @@ class AdapterBoundaryTests(unittest.TestCase):
                                 for write in sim.bus.writes))
 
     # ------------------------------------------------ stage A: prepared return
-    def drive_policy(self, sim, intent='connected', purpose='solar', sustain=1):
+    def drive_policy(self, sim, intent='connected', purpose='solar', sustain=1,
+                     mode='CHARGE', target=80.0):
         """Write one leased request directly, with no consumer in the loop.
 
         The engine agent owns solar_priority.py; these cases have to exercise
         REC's own transfer sequence against arbitrary protocol requests, so the
-        request is written straight to the writeable protocol path.
+        request is written straight to the writeable protocol path. `sustain 3`
+        is one the consumer in this checkout does not send yet.
         """
         status = self.status(sim)
         self.request_id = max(getattr(self, 'request_id', 0), status['accepted_id']) + 1
         request = {'version': 2, 'generation': status['generation'],
-                   'request_id': self.request_id, 'mode': 'CHARGE', 'target_soc': 80.0,
-                   'transfer_intent': intent,
+                   'request_id': self.request_id, 'mode': mode,
+                   'target_soc': float(target), 'transfer_intent': intent,
                    'requested_limits': {'sustain': sustain, 'purpose': purpose},
                    'lease_s': 15}
         code = sim.bus.write(sim.battery_name, '/RecBms/Policy/Request', json.dumps(request))
@@ -457,7 +459,9 @@ class AdapterBoundaryTests(unittest.TestCase):
             if sim.plant.connected and not was and not closure:
                 closure.update(time_s=sim.clock.elapsed, quattro_v=sim.plant.dvcc.quattro_v,
                                ccl_a=sim.plant.ccl_a, voltage=sim.plant.voltage,
-                               ocv=sim.plant.ocv(), pv_a=sum(sim.plant.pv_w) / sim.plant.voltage)
+                               ocv=sim.plant.ocv(), pv_a=sum(sim.plant.pv_w) / sim.plant.voltage,
+                               hold_v=sim.rec.batt['/RecBms/Sustain/HoldVoltage'],
+                               hold_mode=sim.rec.batt['/RecBms/Sustain/Mode'])
         sim.plant.update_connection = update_connection
         return closure
 
@@ -587,6 +591,159 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertLess(events.index(('publish', CCL)), events.index(('write', IGNORE)))
             self.assertEqual(sim.rec.batt[CCL], 0)
             self.assertEqual([w['value'] for w in sim.bus.writes if w['path'] == IGNORE][-1], 0)
+
+    # --------------------------------- stage B: target regulation (hold 3)
+    # Every case below drives the protocol by hand: the consumer in this
+    # checkout does not request sustain 3 yet, and the engine's own objective
+    # selection belongs to solar_engine.py. What is under test is REC's
+    # primitive -- what the Quattro and the MPPTs are actually commanded, and
+    # what the bank does about it.
+    def manual_protocol(self, sim):
+        """Let the consumer take ownership once, then drive it ourselves."""
+        self.wait_for(sim, lambda: sim.rec.policy_adapter.contract.owned, timeout_s=120)
+        sim.solar_running = False
+
+    def hold_for(self, sim, seconds, sample=None, **request):
+        """Run `seconds` of plant with the same request re-asserted at the
+        consumer's 10 s cadence (the lease is 15 s, the hold 120 s)."""
+        for n in range(int(seconds)):
+            if n % 10 == 0:
+                self.drive_policy(sim, **request)
+            sim.run(1)
+            if sample is not None:
+                sample()
+
+    def request_hold(self, sim, target=60.0):
+        return {'mode': 'HOLD', 'target': target, 'sustain': 3,
+                'intent': 'connected', 'purpose': ''}
+
+    def test_a_two_sided_hold_keeps_the_bank_at_its_destination_overnight(self):
+        # E04/D03/SP23: ordinary HOLD released sustain, so the slider curve
+        # came back with the standing 0.15 V lead under it, the Quattro sat
+        # below the bank and a steady -49 W lost 1.448 SOC points in 24 h --
+        # which the engine then made up by filling and burning the band
+        # (SP26). Mode 3 anchors on the measured bank and servos both ways.
+        # Measured here, 4 h on shore at 60 % with no sun, 300 W AC + 50 W
+        # DC: SOC 60.000 -> 59.948 (59.896..60.105), net +0.126 Ah over the
+        # final hour, Quattro commanded 56.34 V = the hold voltage itself.
+        with self.simulation(plant_config=PlantConfig(initial_soc=60.0), target=60) as sim:
+            sim.set_load(ac_w=300, dc_w=50)
+            sim.set_sun((0, 0))
+            self.manual_protocol(sim)
+            socs = []
+            sample = lambda: socs.append(sim.plant.soc)
+            self.hold_for(sim, 10800, sample=sample, **self.request_hold(sim))
+            before = sim.plant.energy.charge_ah - sim.plant.energy.discharge_ah
+            self.hold_for(sim, 3600, sample=sample, **self.request_hold(sim))
+            net = (sim.plant.energy.charge_ah - sim.plant.energy.discharge_ah) - before
+            self.assertTrue(sim.plant.connected)
+            self.assertLessEqual(max(socs), 60.3)
+            self.assertGreaterEqual(min(socs), 59.7)
+            self.assertLessEqual(abs(net), .5)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 3)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Soc'], 60.0)
+            # B2: the Quattro sits ON the hold, not an ordinary lead under it.
+            hold_v = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
+            self.assertEqual(sim.rec.lead_v, 0.0)
+            self.assertAlmostEqual(sim.plant.dvcc.quattro_v, hold_v, places=2)
+            self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v, places=2)
+
+    def test_a_hold_at_its_target_curtails_surplus_pv_instead_of_filling(self):
+        # SP15/SP23/SP28 and plan B2: at the destination the band closes and
+        # the lead with it, every charger is commanded the hold voltage and
+        # the surplus is simply declined -- no harvest to burn back later.
+        # Measured: 60.400 % -> 60.292 % over 2 h under 1400 W of sun, peak
+        # 60.413 %, 2.57 kWh of available PV not taken.
+        with self.simulation(plant_config=PlantConfig(initial_soc=60.4), target=60) as sim:
+            sim.set_load(ac_w=300, dc_w=50)
+            sim.set_sun((600, 800))
+            self.manual_protocol(sim)
+            self.hold_for(sim, 600, **self.request_hold(sim))
+            curtailed = sim.plant.energy.pv_curtailed_wh
+            socs = []
+            self.hold_for(sim, 6600, sample=lambda: socs.append(sim.plant.soc),
+                          **self.request_hold(sim))
+            self.assertLess(max(socs), 60.6)
+            self.assertGreater(sim.plant.energy.pv_curtailed_wh, curtailed + 500)
+            hold_v = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
+            self.assertEqual(sim.rec.lead_v, 0.0)
+            self.assertAlmostEqual(sim.plant.solar_v, hold_v, places=2)
+            self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v, places=2)
+
+    def test_a_hold_below_target_opens_the_band_and_closes_it_on_arrival(self):
+        # The sun may finish the last bit: band_v of MPPT headroom over the
+        # hold while the bank is more than a servo deadband under its
+        # destination, and none at or above it. Measured: 59.0 % reaches
+        # 59.9 % in 2037 s under 1400 W of sun, the MPPT ceiling dropping
+        # from hold + 0.30 V to the hold itself at arrival.
+        with self.simulation(plant_config=PlantConfig(initial_soc=59.0), target=60) as sim:
+            sim.set_load(ac_w=300, dc_w=50)
+            sim.set_sun((600, 800))
+            self.manual_protocol(sim)
+            self.hold_for(sim, 600, **self.request_hold(sim))
+            hold_v = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
+            self.assertEqual(sim.rec.lead_v, sim.rec.cfg.sustain_band_v)
+            self.assertAlmostEqual(sim.plant.base_v, hold_v, places=2)
+            self.assertAlmostEqual(sim.plant.solar_v,
+                                   hold_v + sim.rec.cfg.sustain_band_v, places=2)
+            self.assertGreater(sum(sim.plant.pv_w), 1000)
+            socs = []
+            self.hold_for(sim, 2100, sample=lambda: socs.append(sim.plant.soc),
+                          **self.request_hold(sim))
+            self.assertGreaterEqual(max(socs), 59.9)
+            self.assertLess(max(socs), 60.3)
+            hold_v = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
+            self.assertEqual(sim.rec.lead_v, 0.0)
+            self.assertAlmostEqual(sim.plant.solar_v, hold_v, places=2)
+            self.assertAlmostEqual(sim.plant.base_v, hold_v, places=2)
+
+    def test_a_descent_answers_a_refill_from_any_source(self):
+        # E08/D07/SP40: alternating an hour of darkness and an hour of
+        # 1400 W sun for eight hours put 17.684 Ah back into a bank meant to
+        # descend, 1.228 % reverse, because the ceiling servo only answered
+        # the inferred Quattro and the anchor lagged the SOC by a full step.
+        # The same shape replayed here with the pre-change servo gives
+        # 17.026 Ah (1.182 %, final SOC 78.966); with the `filling` step it
+        # gives 0.116 Ah (0.008 %) and the bank actually descends, 80.009 %
+        # -> 77.250 %.
+        with self.simulation(plant_config=PlantConfig(initial_soc=80.0), target=60) as sim:
+            sim.set_load(ac_w=300, dc_w=50)
+            sim.set_sun((0, 0))
+            self.wait_for(sim, lambda: not sim.plant.connected)
+            sim.solar_running = False
+            started, charged = sim.plant.soc, sim.plant.energy.charge_ah
+            for hour in range(8):
+                sim.set_sun((0, 0) if hour % 2 == 0 else (600, 800))
+                self.hold_for(sim, 3600, mode='DISCHARGE', target=60, sustain=2,
+                              intent='island', purpose='descent')
+            reverse = sim.plant.energy.charge_ah - charged
+            self.assertLess(reverse, 4.0)
+            self.assertLess(sim.plant.soc, started - 2.0)
+            self.assertFalse(sim.plant.connected)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 2)
+
+    def test_a_prepared_hold_return_installs_the_two_sided_hold_first(self):
+        # A1/B2 together: a HOLD return is prepared only once mode 3 is
+        # anchored, so the pair that reaches the relay is the hold's own
+        # voltage (at or below the bank) under the sustain current brake --
+        # the reconnect protection ordinary HOLD never had.
+        with self.dark_island() as sim:
+            closure = self.watch_closure(sim)
+            for _ in range(120):
+                self.drive_policy(sim, mode='HOLD', sustain=3)
+                sim.run(1)
+                if sim.plant.connected:
+                    break
+            self.assertTrue(closure, 'the HOLD return never closed the relay')
+            self.assertEqual(closure['hold_mode'], 3)
+            self.assertAlmostEqual(closure['quattro_v'], closure['hold_v'], places=2)
+            self.assertLessEqual(closure['quattro_v'],
+                                 max(closure['voltage'], closure['ocv']) + .01)
+            self.assertLessEqual(closure['ccl_a'],
+                                 closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
+            self.assertTrue(self.status(sim)['transfer']['prepared'])
+            self.assertIsNone(self.status(sim)['transfer']['last_fault'])
+
 
 class FailedProbeBackoffTests(unittest.TestCase):
     """Issue #8/D16: actual probe outcomes reach the durable relay backoff.

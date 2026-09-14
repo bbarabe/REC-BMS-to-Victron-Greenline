@@ -60,8 +60,8 @@ class PolicyContract:
             if not isinstance(limits, dict) or set(limits) - {'boost_v', 'purpose', 'sustain'}:
                 raise ValueError('unknown requested limits')
             _number(limits.get('boost_v', 0), 0, 0.30, 'boost_v')
-            if type(limits.get('sustain')) is not int or limits['sustain'] not in (0, 1, 2):
-                raise ValueError('sustain must be release (0), floor (1), or ceiling (2)')
+            if type(limits.get('sustain')) is not int or limits['sustain'] not in (0, 1, 2, 3):
+                raise ValueError('sustain must be release (0), floor (1), ceiling (2) or hold (3)')
             if request['mode'] in ('OFF', 'COMPLETE_FULL') and limits['sustain'] != 0:
                 raise ValueError('disabled/full mode must release sustain')
             if limits.get('purpose', '') not in ('', 'solar', 'probe', 'buffer', 'descent', 'failed_probe'):

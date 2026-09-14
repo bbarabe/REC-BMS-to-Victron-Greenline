@@ -12,9 +12,15 @@ from rec_policy_adapter import RecPolicyAdapter
 
 class IntentLeaseTests(unittest.TestCase):
     def test_restart_reconstructs_floor_only_for_matching_target_and_fresh_shore(self):
+        # Stage B: a lost lease under HOLD reconstructs the two-sided hold
+        # (3) the way CHARGE reconstructs its floor -- on the same accepted
+        # input, for the same destination. Releasing it instead would put
+        # the slider curve back with the standing lead under it (E04/D03).
         for mode, feed, target, expected in (
                 ('CHARGE', 0, 80., 1), ('CHARGE', 240, 80., 0),
                 ('CHARGE', None, 80., 0), ('CHARGE', 0, 60., 0),
+                ('HOLD', 0, 80., 3), ('HOLD', 240, 80., 0),
+                ('HOLD', 0, 60., 0),
                 ('DISCHARGE', 240, 80., 2)):
             with self.subTest(mode=mode, feed=feed, target=target):
                 calls = []

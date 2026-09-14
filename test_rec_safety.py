@@ -249,6 +249,62 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.assertEqual(self.driver.batt['/RecBms/Sustain/Active'], 0)
         self.assertIn('expired', self.driver.batt['/RecBms/Sustain/Status'])
 
+    def test_two_sided_hold_anchors_like_a_floor_and_holds_the_slider(self):
+        # Stage B/B2: ordinary HOLD used to release sustain, leaving the
+        # slider curve with the standing 0.15 V lead under it -- the Quattro
+        # below the bank, a steady -49 W, 1.448 points in 24 h (E04/D03).
+        # Mode 3 anchors on the measured bank like a floor, reports the
+        # DESTINATION as its held SOC, and makes the lead in force its own
+        # band so the Quattro is commanded the hold voltage itself.
+        self.driver.settings['chargeslider'] = 80
+        self.driver.sp_enabled = True
+        self.tick()
+        self.assertTrue(self.driver._set_sustain(3))
+        self.tick()
+        batt = self.driver.batt
+        self.assertEqual(batt['/RecBms/Sustain/Mode'], 3)
+        self.assertEqual(batt['/RecBms/Sustain/Status'], 'hold')
+        self.assertEqual(batt['/RecBms/Sustain/Soc'], 80)
+        hold_v = batt['/RecBms/Sustain/HoldVoltage']
+        self.assertAlmostEqual(hold_v, 56.6, places=2)
+        # 60.01 % is well under the 80 % destination: the sun gets its band.
+        self.assertAlmostEqual(self.driver.lead_v, self.cfg.sustain_band_v, places=3)
+        self.assertAlmostEqual(batt['/RecBms/TargetChargeVoltage'],
+                               hold_v + self.cfg.sustain_band_v, places=2)
+        self.assertAlmostEqual(self.plant.base, hold_v, places=2)
+        # At the destination the band closes and the lead with it: every
+        # charger is commanded the hold voltage and surplus PV is curtailed.
+        self.driver.settings['chargeslider'] = 60
+        self.tick()
+        self.assertEqual(self.driver.lead_v, 0.0)
+        self.assertAlmostEqual(batt['/RecBms/TargetChargeVoltage'], hold_v, places=2)
+        self.assertAlmostEqual(self.plant.base, hold_v, places=2)
+        self.assertEqual(batt['/RecBms/Sustain/Soc'], 60)
+
+    def test_a_re_asserted_hold_keeps_its_anchor_and_refreshes_expiry(self):
+        self.driver.settings['chargeslider'] = 80
+        self.tick()
+        self.assertTrue(self.driver._set_sustain(3))
+        self.tick()
+        anchor = self.driver.sustain['anchor_v']
+        self.now += 60
+        feed_complete(self.driver.bms, self.now, current=-20)
+        self.assertTrue(self.driver._set_sustain(3))
+        self.tick()
+        self.assertEqual(self.driver.sustain['anchor_v'], anchor)
+        self.assertEqual(self.driver.batt['/RecBms/Sustain/SecondsLeft'],
+                         int(self.cfg.sustain_hold_s))
+
+    def test_a_boost_is_allowed_under_a_hold_and_refused_under_a_ceiling(self):
+        self.driver.settings['chargeslider'] = 80
+        self.tick()
+        self.assertTrue(self.driver._set_sustain(3))
+        self.tick()
+        self.assertTrue(self.driver._boost_allowed(.3)[0])
+        self.assertTrue(self.driver._set_sustain(2))
+        self.tick()
+        self.assertFalse(self.driver._boost_allowed(.3)[0])
+
     def test_raw_current_is_unquantized_and_limits_are_external(self):
         feed_complete(self.driver.bms, self.now, current=.1)
         self.tick()
@@ -396,6 +452,62 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.assertTrue(self.driver._voltage_applied(56.4, .3))
         charger['/Link/ChargeVoltage'] = None
         self.assertFalse(self.driver._voltage_applied(56.4, .3))
+
+
+class SustainPrimitiveTests(unittest.TestCase):
+    """Stage B: the two-sided hold (mode 3) and the ceiling's filling step."""
+    FLOOR, CEILING, HOLD = R.SUSTAIN_FLOOR, R.SUSTAIN_CEILING, R.SUSTAIN_HOLD
+
+    def test_a_hold_holds_the_destination_and_ratchets_nowhere(self):
+        # SP23: the hold's reference is the target, not what the bank
+        # reached, so sustain_hold hands the held value straight back and
+        # _service_sustain judges the bank against the slider itself.
+        for soc in (62.0, 58.0, None):
+            for charging in (False, True):
+                for sun in (False, True):
+                    self.assertEqual(
+                        R.sustain_hold(self.HOLD, 60.0, soc, charging, sun), 60.0,
+                        (soc, charging, sun))
+
+    def test_hold_servo_answers_a_drain_up_and_anything_above_target_down(self):
+        db = .1
+        servo = lambda err, charging, draining, filling=False: R.sustain_servo(
+            self.HOLD, err, charging, db, draining, filling)
+        # Under the destination and still draining: the Quattro is not
+        # covering the loads -- up, exactly as a floor.
+        self.assertEqual(servo(-.5, False, True), 1)
+        # Under it but not draining: solar is raising the bank, which is the
+        # band's job. Never fought (SP15/SP38).
+        self.assertEqual(servo(-.5, False, False), 0)
+        self.assertEqual(servo(-.5, False, False, True), 0)
+        # Above it: down from ANY source -- the sun, the Quattro, or simply
+        # a bank at night the loads should be allowed to bring down (E04).
+        self.assertEqual(servo(.5, False, False), -1)
+        self.assertEqual(servo(.5, True, False), -1)
+        self.assertEqual(servo(.5, False, False, True), -1)
+        self.assertEqual(servo(.5, False, True), -1)
+        # Inside the deadband nothing moves either way.
+        self.assertEqual(servo(.05, False, True), 0)
+        self.assertEqual(servo(-.05, True, True), 0)
+
+    def test_ceiling_steps_down_on_solar_filling_but_not_on_a_plateau(self):
+        # E08/D07: alternating an hour of darkness and an hour of 1400 W sun
+        # for eight hours put 17.684 Ah back into a bank meant to descend,
+        # 1.228 % reverse, because the servo only answered the inferred
+        # Quattro. +0.5 A with PV flowing is reverse movement whoever made it.
+        servo = lambda charging, draining, filling: R.sustain_servo(
+            self.CEILING, -.5, charging, .1, draining, filling)
+        self.assertEqual(servo(False, False, True), -1)    # +0.5 A on PV
+        self.assertEqual(servo(False, False, False), 0)    # 0 A sunny plateau
+        self.assertEqual(servo(False, True, False), 0)     # -0.5 A, the plan
+        self.assertEqual(servo(True, False, False), -1)    # the Quattro, as before
+
+    def test_filling_changes_nothing_for_a_floor(self):
+        floor = lambda err, charging, draining, filling: R.sustain_servo(
+            self.FLOOR, err, charging, .1, draining, filling)
+        self.assertEqual(floor(-.5, False, True, False), 1)
+        self.assertEqual(floor(.5, False, False, True), 0)   # solar is not fought
+        self.assertEqual(floor(.5, True, False, True), -1)
 
 
 if __name__ == '__main__':
