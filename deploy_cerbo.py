@@ -458,11 +458,19 @@ def verify(cb, pkg, base, expect=None):
         if path == "/Mgmt/ProcessVersion":
             running = value
         print("   %-42s %s" % (svc.split(".")[-1] + path, value))
+    cmd_out = ""
     for cmd in pkg.get("verify_cmds", []):
         o, e = cb.run(cmd, timeout=15)
+        cmd_out += (o or e)
         print("   $ %s\n     %s" % (cmd, (o or e).strip().replace("\n", "\n     ")))
     if expect is None:
         return True
+    if not any(path == "/Mgmt/ProcessVersion" for _, path in pkg["verify"]):
+        # No D-Bus process version (camera-relay): the package's own status
+        # output has to show the shipped version instead, e.g. stats.json's
+        # "version": "0.6.0". Without this the relay was declared old and
+        # restarted twice on 2026-09-14 although it was already running 0.6.0.
+        return re.search(r"(?<![\w.])%s(?![\w.])" % re.escape(expect), cmd_out) is not None
     return str(running or "").strip("'\"").startswith(expect + " ")
 
 
