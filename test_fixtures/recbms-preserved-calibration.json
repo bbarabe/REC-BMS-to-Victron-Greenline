@@ -96,6 +96,7 @@
     "taper_margin_v": "0.03",
     "pv_min_a": "0.5",
     "servo_drain_a": "0.3",
+    "arrival_fold_v": "0.25",
     "trim_step_a": "0.5",
     "trim_max_a": "3.0",
     "dusk_s": "300"

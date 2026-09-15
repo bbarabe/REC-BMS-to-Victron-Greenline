@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.3.1"
+VERSION = "3.3.2"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -230,6 +230,10 @@ class Config:
         self.sustain_servo_db = max(0.0, self._number(su.get("servo_deadband_pct", 0.1)))
         self.sustain_servo_up = max(0.0, self._number(su.get("servo_max_up_v", 0.5)))
         self.sustain_servo_down = max(0.0, self._number(su.get("servo_max_down_v", 2.0)))
+        # 3.3.2: a two-sided hold folds its servo on arrival only when it
+        # carries at least this much -- a real lift or descent, not the
+        # few hundredths that cover the loads at the band's edge.
+        self.sustain_arrival_fold_v = max(0.0, self._number(su.get("arrival_fold_v", 0.25)))
         self.sustain_band_v = max(0.0, min(1.0, self._number(su.get("band_v", 0.30))))
         self.sustain_anchor_r = max(0.0, self._number(su.get("anchor_ir_mohm", 3))) / 1000.0
         self.sustain_taper_a = max(0.0, self._number(su.get("taper_a", 3)))
@@ -629,6 +633,15 @@ def sustain_servo(mode, err, charging, deadband, draining=True, filling=False):
     the bank and a steady -49 W drained 1.448 points in 24 h: E04/D03.)
     A bank still under its destination that solar is raising is left
     alone -- finishing the last bit is the band's job.
+
+    3.3.2: the unconditional lift ("up whenever under, draining or not")
+    applies only while the bank is clearly under -- more than two
+    deadbands. Within two deadbands of the destination the hold servos
+    like the floor: up while draining, still once the Quattro covers the
+    loads. Winding on regardless there put +0.48 V on a bank 0.02 %
+    under its band (boat, 2026-09-15 dawn), and the arrival fold then
+    took the whole offset away, loads included, so the bank drained
+    again: a 30-minute limit cycle at the band's edge.
     """
     if mode == SUSTAIN_FLOOR:
         if err < -deadband and draining:
@@ -647,7 +660,7 @@ def sustain_servo(mode, err, charging, deadband, draining=True, filling=False):
         # voltage (a hold servoed under the bank left the MPPTs at 0 W for
         # four sunny hours in the fixture, 2026-09-14).
         if err < -deadband:
-            return 1
+            return 1 if (draining or err < -2 * deadband) else 0
         if err > deadband and charging:
             return -1
         return 0
@@ -1694,7 +1707,7 @@ class RecBmsDriver:
                         su["trim_a"] = max(-c.sustain_trim_max_a, su["trim_a"] - c.sustain_trim_a)
                     elif err < 0 and draining:
                         su["trim_a"] = min(c.sustain_trim_max_a, su["trim_a"] + c.sustain_trim_a)
-            if (hold and volts is not None and su["servo_v"] != 0.0
+            if (hold and volts is not None and abs(su["servo_v"]) >= c.sustain_arrival_fold_v > 0
                     and held_eff - c.sustain_servo_db <= soc <= held_eff + c.sustain_servo_db):
                 # Arrival snap (3.3.1). A hold that lifts (or lowers) the
                 # bank to its destination itself winds the servo the whole
@@ -1708,9 +1721,12 @@ class RecBmsDriver:
                 # hold: the voltage becomes the bank's present rest voltage
                 # and the servo starts again from nothing, so the Quattro
                 # is ON the bank with no headroom to spend, boost or not.
-                # Once per arrival: inside the deadband the servo does not
-                # move, so it stays folded until the bank leaves the band
-                # and comes back.
+                # Only a servo that carries a real lift or descent
+                # (arrival_fold_v, 0.25 V) is folded: the few hundredths
+                # the servo keeps at the band's edge to cover the loads
+                # are not an arrival, and folding them re-anchored the
+                # hold every 30 s all night while the bank sat on the
+                # edge (boat, 2026-09-15 13:32-14:08 UTC).
                 self._sustain_reanchor(volts, amps, "arrived at %.1f%% for %.1f%%: bank %.2fV at %.1fA, servo %+.2fV folded"
                                        % (soc, held_eff, volts, amps if amps is not None else 0.0, su["servo_v"]))
         # The solar band (see _sustain_band): under a floor the MPPTs get

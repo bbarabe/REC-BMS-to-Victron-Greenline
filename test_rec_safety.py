@@ -344,6 +344,24 @@ class RecDriverSafetyTests(unittest.TestCase):
             drive(soc, volts, 0.0)
             self.assertAlmostEqual(su['anchor_v'], folded, places=2)
             self.assertEqual(su['servo_v'], 0.0)
+        # The band's edge (3.3.2): the bank drains a hair under, the servo
+        # steps up while it drains and stops once it sits still; the few
+        # hundredths it keeps to cover the loads are never folded when the
+        # bank touches 49.9 % again -- folding them re-anchored the hold
+        # every 30 s all night on the boat.
+        for _ in range(3):
+            self.now += self.cfg.sustain_servo_s
+            drive(49.89, 55.6, -0.9)
+        self.assertAlmostEqual(su['servo_v'], 3 * self.cfg.sustain_servo_v, places=3)
+        self.now += self.cfg.sustain_servo_s
+        drive(49.89, 55.6, 0.0)                            # covered: still
+        self.assertAlmostEqual(su['servo_v'], 3 * self.cfg.sustain_servo_v, places=3)
+        for soc in (49.9, 49.89, 49.9, 50.0):
+            self.now += 1
+            drive(soc, 55.6, 0.0)
+            self.assertAlmostEqual(su['servo_v'], 3 * self.cfg.sustain_servo_v, places=3)
+            self.assertAlmostEqual(su['anchor_v'], folded, places=2)
+        su['servo_v'] = 0.0
         # Arrival from above with the servo wound down folds the same way;
         # a bank still outside the band does not.
         su['servo_v'] = -0.3
@@ -560,11 +578,19 @@ class SustainPrimitiveTests(unittest.TestCase):
         db = .1
         servo = lambda err, charging, draining, filling=False: R.sustain_servo(
             self.HOLD, err, charging, db, draining, filling)
-        # Under the destination: up, draining or not -- the Quattro is
-        # capped at charge_limit_a under a hold, so the step fills gently.
+        # Clearly under the destination: up, draining or not -- the Quattro
+        # is capped at charge_limit_a under a hold, so the step fills gently.
         self.assertEqual(servo(-.5, False, True), 1)
         self.assertEqual(servo(-.5, False, False), 1)
         self.assertEqual(servo(-.5, False, False, True), 1)
+        self.assertEqual(servo(-.21, False, False), 1)
+        # Within two deadbands of it the hold servos like the floor (3.3.2):
+        # up while the bank drains, still once the Quattro covers the loads.
+        # Winding on regardless put +0.48 V on a bank 0.02 % under its band.
+        self.assertEqual(servo(-.15, False, True), 1)
+        self.assertEqual(servo(-.15, False, False), 0)
+        self.assertEqual(servo(-.15, True, False), 0)
+        self.assertEqual(servo(-.11, False, False, True), 0)
         # Above it: down only when the Quattro is the one filling it. The
         # sun cannot fill a hold at its destination (the current limit
         # curtails it) and a bank the loads should bring down is not
