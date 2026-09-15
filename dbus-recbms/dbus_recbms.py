@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.6.1"
+VERSION = "3.6.2"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -189,7 +189,14 @@ class Config:
         # ItemsChanged. Control paths (CVL/CCL/DCL, targets, lead, alarms,
         # sustain/boost) are published at full resolution regardless.
         pb = cp["publish"] if cp.has_section("publish") else {}
-        self.voltage_step = self._number(pb.get("voltage_step", 0.05))
+        # 3.6.2: 0.01 by default. DVCC's shared voltage sense forwards this
+        # published figure to every charger as ITS battery voltage, so the
+        # chargers regulate against it at this resolution: quantised to
+        # 0.05 V they ran bang-bang in 0.05 V bands and a hold servo in
+        # 0.01 V steps could not land them on the loads (boat, 2026-09-15
+        # 23:16 UTC: CVL 55.63 against a published 55.65, arrays at 0 W
+        # with the bank draining until the servo had climbed to 55.69).
+        self.voltage_step = self._number(pb.get("voltage_step", 0.01))
         self.current_step = self._number(pb.get("current_step", 0.5))
         self.power_step = self._number(pb.get("power_step", 10))
         self.temperature_step = self._number(pb.get("temperature_step", 0.5))
@@ -1811,7 +1818,7 @@ class RecBmsDriver:
                 # a floor never holds more than the owner set, a ceiling never
                 # less: the servo judges the bank against the bounded value
                 held_eff = min(su["soc"], slider) if floor else max(su["soc"], slider)
-            if now - su["servo_ts"] >= c.sustain_servo_s and self.boost["active"]:
+            if self.boost["active"]:
                 # 3.4.2: a solar boost is a MEASUREMENT -- the charge limit
                 # is lifted on purpose and the bank fills on purpose for two
                 # minutes. Regulating on that would be regulating on our own
@@ -1820,8 +1827,11 @@ class RecBmsDriver:
                 # unthrottled arrays filled the held bank, and the moment
                 # the boost ended the limit fell back onto its 0.1 A floor,
                 # which is exactly the starvation the boost was meant to
-                # cure. The servo and the trim stand still while a boost
-                # runs; the period restarts when it ends.
+                # cure. The servo stands still while a boost runs, and a
+                # full period starts when it ends (3.6.2: refreshed every
+                # tick, not per period -- a step 10 s after the boost's end
+                # answered the fill still decaying from +7.5 A and cut the
+                # arrays to 0 W, boat 2026-09-15 23:16 UTC).
                 su["servo_ts"] = now
             elif now - su["servo_ts"] >= c.sustain_servo_s:
                 su["servo_ts"] = now

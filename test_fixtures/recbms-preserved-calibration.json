@@ -103,7 +103,7 @@
     "dusk_s": "300"
   },
   "publish": {
-    "voltage_step": "0.05",
+    "voltage_step": "0.01",
     "current_step": "0.5",
     "power_step": "10",
     "temperature_step": "0.5",

@@ -520,8 +520,18 @@ class RecDriverSafetyTests(unittest.TestCase):
         for _ in range(4):
             period(50.2, 6.0)                               # filling above target under a boost
         self.assertEqual(su['servo_v'], 0.0)
+        self.now += 20
+        self.driver._service_sustain(self.now, 50.2, 50.0, 55.6, 6.0)
         self.driver.boost['active'] = False
-        period(50.2, 6.0)                                   # the same fill, boost over: the servo answers
+        # 3.6.2: a full period after the boost's end, not the remainder of
+        # one -- ten seconds after the boost the boat's bank was still
+        # giving back the boost's fill (+7.5 A decaying to 0 in 30 s), and
+        # a step on that cut the arrays to 0 W.
+        self.now += 10
+        self.driver._service_sustain(self.now, 50.2, 50.0, 55.6, 5.0)
+        self.assertEqual(su['servo_v'], 0.0)
+        self.now += 20
+        self.driver._service_sustain(self.now, 50.2, 50.0, 55.6, 6.0)   # the same fill, boost over: the servo answers
         self.assertAlmostEqual(su['servo_v'], -self.cfg.sustain_hold_step_v, places=4)
 
     def test_a_re_asserted_hold_keeps_its_anchor_and_refreshes_expiry(self):
