@@ -114,7 +114,7 @@
     "state_file": "solar-control-state.json",
     "capacity_version": "rated-1440",
     "calendar_timezone": "UTC",
-    "shore_ac_input": "1",
+    "shore_ac_input": "auto",
     "consumer_service_suffix": "solarpriority",
     "consumer_instance": "221",
     "mppt_instances": "278,279"

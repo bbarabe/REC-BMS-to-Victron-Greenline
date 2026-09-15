@@ -9,7 +9,7 @@ from pathlib import Path
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parent / 'dbus-recbms'))
-from policy_contract import PolicyContract, TransferSupervisor
+from policy_contract import PolicyContract, TransferSupervisor, resolve_shore_input
 
 
 class TransferBoundaryTests(unittest.TestCase):
@@ -236,6 +236,36 @@ class TransferBoundaryTests(unittest.TestCase):
         request.update(request_id=2, target_soc=40)
         self.assertTrue(contract.accept(request, 2, 40))
         self.assertTrue(contract.active(2, target_soc=40))
+
+
+class ShoreInputResolverTests(unittest.TestCase):
+    """Which Quattro AC input carries shore power (owner, 2026-09-15: shore
+    moves from AC in 1 to AC in 2, so nothing may hard-code the input)."""
+
+    def test_a_pinned_input_wins_over_everything(self):
+        self.assertEqual(resolve_shore_input(2, (3, 0), 0, (1, 0), 1), (2, 'configured'))
+        self.assertEqual(resolve_shore_input(1, (0, 3), 1, (0, 1), 2), (1, 'configured'))
+
+    def test_the_gx_input_types_decide_when_exactly_one_is_grid_or_shore(self):
+        self.assertEqual(resolve_shore_input('auto', (0, 3), 240, (None, None), None), (2, 'gx input type'))
+        self.assertEqual(resolve_shore_input('auto', (3, 0), 0, (1, 0), None), (1, 'gx input type'))
+        self.assertEqual(resolve_shore_input('auto', (2, 1), 0, (1, 1), None), (2, 'gx input type'))   # generator + grid
+        # ... and they override an input already settled on: the rewire.
+        self.assertEqual(resolve_shore_input('auto', (0, 3), 0, (1, 0), 1), (2, 'gx input type'))
+
+    def test_a_settled_input_is_kept_on_ambiguous_evidence(self):
+        # An island reads ActiveInput 240 and no availability: keep it.
+        self.assertEqual(resolve_shore_input('auto', (None, None), 240, (0, 0), 2), (2, 'kept'))
+        self.assertEqual(resolve_shore_input('auto', (0, 0), 240, (None, None), 1), (1, 'kept'))
+        # Both inputs typed shore, or neither: the settled input stands.
+        self.assertEqual(resolve_shore_input('auto', (3, 3), 1, (1, 1), 1), (1, 'kept'))
+
+    def test_a_fresh_start_reads_the_quattro(self):
+        self.assertEqual(resolve_shore_input('auto', (0, 0), 1, (0, 1), None), (2, 'accepted input'))
+        self.assertEqual(resolve_shore_input('auto', (None, None), 0, (1, 0), None), (1, 'accepted input'))
+        self.assertEqual(resolve_shore_input('auto', (0, 0), 240, (0, 1), None), (2, 'only input available'))
+        self.assertEqual(resolve_shore_input('auto', (0, 0), 240, (1, 1), None), (1, 'default'))
+        self.assertEqual(resolve_shore_input('auto', (None, None), None, (None, None), None), (1, 'default'))
 
 
 if __name__ == '__main__':

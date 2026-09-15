@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.3.2"
+VERSION = "3.4.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -96,11 +96,15 @@ class Config:
                                              policy.get('state_file', 'solar-control-state.json'))
         self.capacity_version = policy.get('capacity_version', 'rated-1440')
         self.policy_calendar_timezone = policy.get('calendar_timezone', 'UTC')
-        self.policy_ac_input = int(policy.get('shore_ac_input', 1))
+        # 3.4.0: 'auto' (the default) resolves the shore input at runtime
+        # from the GX's AC input types, then the Quattro's own facts
+        # (policy_contract.resolve_shore_input); 1 or 2 pins it.
+        raw = str(policy.get('shore_ac_input', 'auto')).strip().lower()
+        self.policy_ac_input = 'auto' if raw in ('', 'auto') else int(raw)
         self.policy_consumer_suffix = policy.get('consumer_service_suffix', 'solarpriority')
         self.policy_consumer_instance = int(policy.get('consumer_instance', 221))
-        if self.policy_ac_input not in (1, 2):
-            raise ValueError('policy shore_ac_input must be 1 or 2')
+        if self.policy_ac_input not in ('auto', 1, 2):
+            raise ValueError('policy shore_ac_input must be auto, 1 or 2')
         self.policy_mppt_instances = tuple(int(v.strip()) for v in policy.get('mppt_instances', '278,279').split(','))
         self.policy_parameters = dict(cp['control']) if cp.has_section('control') else {}
         c = cp["can"] if cp.has_section("can") else {}

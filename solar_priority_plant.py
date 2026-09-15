@@ -33,7 +33,14 @@ VEBUS = "com.victronenergy.vebus.plant"
 ARRAYS = ("com.victronenergy.solarcharger.plant_a",
           "com.victronenergy.solarcharger.plant_b")
 OFFSET = "/Debug/BatteryOperationalLimits/SolarVoltageOffset"
-IGNORE = "/Ac/Control/IgnoreAcIn1"
+SETTINGS = "com.victronenergy.settings"
+# The GX's own statement of what each AC input is (0 none, 1 grid, 2
+# generator, 3 shore power), which is where a resolver looks first.
+GX_INPUT = "/Settings/SystemSetup/AcInput%d"
+CONTROL = "/Ac/Control/IgnoreAcIn%d"
+STATE = "/Ac/State/IgnoreAcIn%d"
+AVAILABLE = "/Ac/State/AcIn%dAvailable"
+IGNORE = CONTROL % 1
 BASE = "/Info/MaxChargeVoltage"
 CCL = "/Info/MaxChargeCurrent"
 
@@ -61,6 +68,14 @@ class PlantConfig:
     inverter_idle_w: float = 40.0
     quattro_max_w: float = 5000.0
     shore_max_w: float = 7000.0
+    # Which physical Quattro AC input shore power arrives on (1 or 2); the
+    # other input is the alternate supply. The owner rewired shore from AC in
+    # 1 to AC in 2 on 2026-09-15, and no service is told which it is.
+    shore_input: int = 1
+    # The GX's two AC input types, seeded to agree with shore_input (shore
+    # power on the shore input, nothing on the other). An explicit (type1,
+    # type2) pair overrides that: (0, 0) is a GX nobody ever configured.
+    gx_input_types: tuple = None
     pv_ramp_w_s: float = 100.0
     quattro_ramp_w_s: float = 200.0
     quattro_voltage_bias_v: float = 0.08
@@ -270,6 +285,11 @@ class DelayedBus:
         if name == "com.victronenergy.settings":
             if method == "SetValue":
                 self.settings[path] = args[0]
+                # The store answers GetValue; the paths localsettings also
+                # publishes as a service have to reach the monitors as well.
+                service = self.services.get(name)
+                if service is not None and path in service.values:
+                    service[path] = args[0]
                 return 0
             if method == "AddSetting":
                 group, leaf, default = args[:3]
@@ -569,8 +589,14 @@ class ChargerPlant:
         self.base_v, self.offset_v = config.initial_base_v, config.initial_offset_v
         self.pv_voltage_v = self.solar_v
         self.ccl_a, self.connected, self.shore_available = 0.0, True, True
-        # A second AC input the Quattro may accept while AC1 is ignored or
-        # absent: "not AC1" is not proof of inverter-only operation (SP56).
+        # Shore is on one physical input, the alternate on the other: which is
+        # which is the installation's fact, never the controller's assumption.
+        if config.shore_input not in (1, 2):
+            raise ValueError("shore_input must be 1 or 2")
+        self.shore_input = int(config.shore_input)
+        self.alternate_input = 3 - self.shore_input
+        # A second AC input the Quattro may accept while shore is ignored or
+        # absent: "not shore" is not proof of inverter-only operation (SP56).
         self.alternate_available = False
         self.on_alternate = False
         self.ignore = 0
@@ -608,7 +634,7 @@ class ChargerPlant:
     def update_connection(self, cause='source'):
         shore = not self.ignore and self.shore_available
         connected = bool(shore or self.alternate_available)
-        # AC in 2 carries the boat only while AC in 1 cannot.
+        # The alternate input carries the boat only while shore cannot.
         self.on_alternate = connected and not shore
         if connected != self.connected:
             self.connected = connected
@@ -725,9 +751,13 @@ class CoupledSimulation:
         self.missing_can = set()
         self.trace = []
         self._next_tick = 1.0
+        types = self.plant.cfg.gx_input_types
+        if types is None:
+            types = tuple(3 if n == self.plant.shore_input else 0 for n in (1, 2))
         self.bus.settings.update({"/Settings/RecBms/ChargeSlider": target,
             "/Settings/RecBms/EqLastCompleted": self.clock.time(),
             "/Settings/SolarPriority/Enabled": int(enabled),
+            GX_INPUT % 1: int(types[0]), GX_INPUT % 2: int(types[1]),
             "/Settings/System/AccessLevel": 3, "/Settings/SystemSetup/BmsInstance": 200})
         self._make_sources()
         try:
@@ -850,16 +880,22 @@ class CoupledSimulation:
         # availability and acknowledged-ignore state do (read 2026-09-14 on
         # vebus 276: AcIn1Available 1, AcIn2Available 0, IgnoreAcIn1 0,
         # IgnoreAcIn2 0, ActiveIn/Connected 1, ActiveInput 0).
-        self.vebus = self._source(VEBUS, 276, {IGNORE: 0, "/Connected": 1,
-            "/Ac/Control/IgnoreAcIn2": 0, "/Ac/ActiveIn/ActiveInput": 0,
+        shore, alternate = self.plant.shore_input, self.plant.alternate_input
+        self.vebus = self._source(VEBUS, 276, {CONTROL % 1: 0, "/Connected": 1,
+            CONTROL % 2: 0, "/Ac/ActiveIn/ActiveInput": shore - 1,
             "/Ac/ActiveIn/Connected": 1, "/Ac/NumberOfAcInputs": 2,
-            "/Ac/State/AcIn1Available": 1, "/Ac/State/AcIn2Available": 0,
-            "/Ac/State/IgnoreAcIn1": 0, "/Ac/State/IgnoreAcIn2": 0,
+            AVAILABLE % shore: 1, AVAILABLE % alternate: 0,
+            STATE % 1: 0, STATE % 2: 0,
             "/Ac/Out/L1/P": self.plant.ac_w, "/Ac/In/1/CurrentLimit": 32.0,
             "/Dc/0/Voltage": self.plant.voltage, "/Dc/0/Current": 0.0,
             "/Dc/0/Power": 0.0, "/BatteryOperationalLimits/MaxChargeCurrent": 0.0,
             "/BatteryOperationalLimits/MaxChargeVoltage": self.plant.base_v},
-            writable=(IGNORE, "/Ac/Control/IgnoreAcIn2"))
+            writable=(CONTROL % 1, CONTROL % 2))
+        # localsettings is a service like any other here: the GX's AC input
+        # types are read over the bus AND watched on a DbusMonitor tree, so
+        # the same two values the store answers GetValue with are published.
+        self.gx_settings = self._source(SETTINGS, 0,
+            {GX_INPUT % n: self.bus.settings[GX_INPUT % n] for n in (1, 2)})
         self.arrays = [self._source(name, instance, {"/Pv/V": 70.0,
             "/Yield/Power": 0.0, "/MppOperationMode": 2, "/Dc/0/Current": 0.0,
             "/Dc/0/Voltage": self.plant.voltage, "/Link/ChargeVoltage": self.plant.solar_v,
@@ -889,8 +925,16 @@ class CoupledSimulation:
             kind, delay = mapping[path]
         elif name == SYSTEM and path == OFFSET:
             kind, delay = "offset_v", self.latency.offset_s
-        elif name == VEBUS and path in (IGNORE, "/Ac/Control/IgnoreAcIn2"):
+        elif name == VEBUS and path == CONTROL % self.plant.shore_input:
             kind, delay = "ignore", self.latency.relay_s
+        elif name == VEBUS and path in (CONTROL % 1, CONTROL % 2):
+            # A command written to the input shore is NOT on cannot move the
+            # transfer switch: it would only strand an ignore on an input
+            # nobody is watching. Recorded so a test can prove it never
+            # happened.
+            self.plant.commands.append({'time_s': self.clock.elapsed,
+                'kind': 'ignore_wrong_input', 'path': path, 'value': value})
+            return
         else:
             return
         self.bus.later(delay, lambda: self.plant.apply(kind, value))
@@ -929,14 +973,17 @@ class CoupledSimulation:
         # on shore it retains a positive residual (AC-in minus AC-out); while
         # inverting, conversion/idle losses draw extra DC beyond the net figure.
         reported_dc_w = net_dc_w + overhead if p.connected else net_dc_w - overhead
+        shore, alternate = p.shore_input, p.alternate_input
         for path, value in {
-            "/Ac/ActiveIn/ActiveInput": (1 if p.on_alternate else 0) if p.connected else 240,
+            "/Ac/ActiveIn/ActiveInput": ((alternate if p.on_alternate else shore) - 1)
+                                        if p.connected else 240,
             "/Ac/ActiveIn/Connected": int(p.connected),
-            "/Ac/State/AcIn1Available": int(p.shore_available),
-            "/Ac/State/AcIn2Available": int(p.alternate_available),
+            AVAILABLE % shore: int(p.shore_available),
+            AVAILABLE % alternate: int(p.alternate_available),
             # The acknowledged ignore state, which this fixture applies only
-            # after relay_s -- never the value just written.
-            "/Ac/State/IgnoreAcIn1": int(p.ignore), "/Ac/State/IgnoreAcIn2": 0,
+            # after relay_s -- never the value just written. Only the shore
+            # input is ever held: nothing ignores the alternate.
+            STATE % shore: int(p.ignore), STATE % alternate: 0,
             "/Ac/Out/L1/P": p.ac_w, "/Dc/0/Voltage": p.voltage,
             "/Dc/0/Power": reported_dc_w,
             "/Dc/0/Current": net_dc_w / p.voltage,

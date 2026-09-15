@@ -24,14 +24,14 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.4.1"
-ENGINE_VERSION = "4.17-restored"
+VERSION = "3.5.0"
+ENGINE_VERSION = "4.18-restored"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from control_inputs import normalize_bus_snapshot, SourceRegistry, TimedMean, selected_battery_matches
 from solar_engine import Engine, Inputs, Val, ENGINE_DEFAULTS
-from policy_contract import dumps, VERSION as PROTOCOL_VERSION
+from policy_contract import dumps, VERSION as PROTOCOL_VERSION, resolve_shore_input
 
 log = logging.getLogger("dbus-solarpriority")
 
@@ -91,7 +91,14 @@ class Config:
         self.mppt7_instance = int(i.get("mppt_b_instance", 279))
         self.vebus_instance = int(i.get("vebus_instance", 276))
         self.battery_instance = int(i.get("battery_instance", 200))
-        self.ac_in = int(i.get("shore_ac_input", 1))     # 1 or 2
+        # 3.5.0: 'auto' (default) resolves the shore input at runtime --
+        # REC's published resolution first, else the GX's AC input types,
+        # else the Quattro's own facts (policy_contract.resolve_shore_input);
+        # 1 or 2 pins it.
+        raw = str(i.get("shore_ac_input", "auto")).strip().lower()
+        self.ac_in = "auto" if raw in ("", "auto") else int(raw)
+        if self.ac_in not in ("auto", 1, 2):
+            raise ValueError("inputs shore_ac_input must be auto, 1 or 2")
         self.tick_ms = int(i.get("tick_ms", 1000))
         # EstimateW / NeedW are published in steps of this many watts, and a
         # tick's changes go out as one ItemsChanged (2026-09-05: at 0.1 W
@@ -169,11 +176,15 @@ INPUT_MAP = {
     # firmware publishes /Ac/State/AcIn1Available (1 tonight),
     # /Ac/State/AcIn2Available (0), /Ac/State/IgnoreAcIn1|2 and
     # /Ac/ActiveIn/Connected; /Ac/In/1/Connected does not exist on it. Both
-    # inputs are monitored so the tree is complete, but only the configured
-    # shore input feeds the engine (_field_for); a firmware without the path
-    # leaves ac_available None -- unknown, never absent.
-    ("vebus", "/Ac/State/AcIn1Available"): ("ac_available", lambda v: v in (0, 1)),
-    ("vebus", "/Ac/State/AcIn2Available"): ("ac_available", lambda v: v in (0, 1)),
+    # inputs are kept and the tick derives the engine's ac_available from
+    # the resolved shore input (3.5.0); a firmware without the path leaves
+    # it None -- unknown, never absent.
+    ("vebus", "/Ac/State/AcIn1Available"): ("ac1_available", lambda v: v in (0, 1)),
+    ("vebus", "/Ac/State/AcIn2Available"): ("ac2_available", lambda v: v in (0, 1)),
+    # The GX's AC input types (0 none, 1 grid, 2 generator, 3 shore): the
+    # owner's own statement of which input is shore, read from localsettings.
+    ("settings", "/Settings/SystemSetup/AcInput1"): ("ac1_type", lambda v: v in (0, 1, 2, 3)),
+    ("settings", "/Settings/SystemSetup/AcInput2"): ("ac2_type", lambda v: v in (0, 1, 2, 3)),
     ("vebus", "/Ac/Out/L1/P"):            ("ac_out", _rng(-20000, 20000)),
     ("battery", "/RecBms/TargetChargeVoltage"): ("cvl", _rng(20, 80)),
     ("battery", "/RecBms/SolarBoost/Active"):   ("boost_active", lambda v: True),
@@ -201,8 +212,9 @@ class SolarPriorityDriver:
         self.cfg = cfg
         self.now0 = time.time()
         self.inp = Inputs()
-        self.inp.feed_shore = 0 if cfg.ac_in == 1 else 1
-        self.ignore_path = "/Ac/Control/IgnoreAcIn%d" % cfg.ac_in
+        self.shore_input = cfg.ac_in if cfg.ac_in in (1, 2) else None
+        self.shore_input_reason = "configured" if self.shore_input else ""
+        self.inp.feed_shore = (self.shore_input or 1) - 1
         self.last_status = None
         self.engine = Engine(cfg.engine, self._ms(), self._engine_log)
         self.generation = None
@@ -254,11 +266,34 @@ class SolarPriorityDriver:
             except (ValueError, OSError):
                 pass
         GLib.timeout_add(cfg.tick_ms, self._tick)
-        log.info("engine v%s, tick %d ms, shore on AC-in %d", ENGINE_VERSION,
+        log.info("engine v%s, tick %d ms, shore on AC-in %s", ENGINE_VERSION,
                  cfg.tick_ms, cfg.ac_in)
 
     def _ms(self):
         return int(time.monotonic() * 1000)
+
+    def _resolve_shore_input(self, status):
+        """Which AC input is shore this tick, and the engine fields that
+        depend on it. REC is the IgnoreAcIn writer, so its published
+        resolution wins whenever it is there; otherwise the same rule REC
+        applies (policy_contract.resolve_shore_input) runs on this side's
+        own readings, so the two never disagree for long."""
+        v = lambda f: f.v if f is not None else None
+        i = self.inp
+        new, reason = resolve_shore_input(
+            self.cfg.ac_in, (v(i.ac1_type), v(i.ac2_type)), v(i.feed),
+            (v(i.ac1_available), v(i.ac2_available)), self.shore_input)
+        rec = status.get('shore_ac_input')
+        if self.cfg.ac_in == "auto" and rec in (1, 2):
+            new, reason = int(rec), "rec"
+        # The fallback is provisional: used this tick, never settled, so the
+        # first ticks before the sources arrive cannot pin input 1 for good.
+        if reason != "default" and new != self.shore_input:
+            log.info("shore AC input %s -> %d (%s)", self.shore_input, new, reason)
+            self.shore_input = new
+        self.shore_input_reason = reason
+        i.feed_shore = new - 1
+        i.ac_available = i.ac1_available if new == 1 else i.ac2_available
 
     def _engine_log(self, msg):
         if msg.startswith("ERROR "):
@@ -481,8 +516,6 @@ class SolarPriorityDriver:
             return None, None
         elif cls == "battery" and inst != c.battery_instance:
             return None, None
-        if field == "ac_available" and path != "/Ac/State/AcIn%dAvailable" % c.ac_in:
-            return None, None       # the other AC input's availability is not shore's
         return field, valid
 
     def _store(self, service, path, value, now):
@@ -696,6 +729,7 @@ class SolarPriorityDriver:
             self.demand_mean.points.clear()
             self.demand_slow_mean.points.clear()
         self.inp.departure_allowed = status.get('departure_allowed', False)
+        self._resolve_shore_input(status if source_valid else {})
         protocol_ready = (status.get('version') == PROTOCOL_VERSION and
                           bool(status.get('generation')) and source_valid)
         if status.get('generation') != self.generation:

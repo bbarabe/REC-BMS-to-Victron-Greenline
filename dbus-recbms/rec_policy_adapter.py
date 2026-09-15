@@ -6,7 +6,7 @@ import time
 
 from control_inputs import DemandModel, SourceRegistry, LoadServiceEvidence, TimedMean, finite, normalize_bus_snapshot, selected_battery_matches
 from energy_accounting import EnergyLedger
-from policy_contract import PolicyContract, TransferSupervisor, dumps
+from policy_contract import PolicyContract, TransferSupervisor, dumps, resolve_shore_input
 from rec_control_config import ControlConfig
 from policy_telemetry import PolicyTelemetry
 
@@ -45,6 +45,15 @@ class RecPolicyAdapter:
         self.sources_names = {}
         self.sense_capable_sources = set()
         self.last_poll = None
+        # 3.4.0: the shore AC input is resolved, not configured (owner,
+        # 2026-09-15: shore moves from AC in 1 to AC in 2). Restored from the
+        # durable transfer state so a restart on an island keeps ignoring
+        # the input it left.
+        durable_input = self.transfer.durable.get('shore_input')
+        self.shore_input = durable_input if durable_input in (1, 2) else None
+        self.shore_input_reason = 'restored' if self.shore_input else ''
+        self.gx_input_types = (None, None)
+        self.gx_types_at = None
         self.discovery_at = None
         self.discovery_names = None
         self.read_issued = {}
@@ -211,6 +220,59 @@ class RecPolicyAdapter:
     def _value(self, role, path, now):
         return self.sources.get(self.sources_names.get(role), path, now)
 
+    def _gx_input_types(self, now):
+        """The GX's AC input types, read from localsettings every 30 s
+        (two blocking GetValues; the whole settings tree is far too big to
+        poll like the other sources). None when unreadable."""
+        if self.gx_types_at is None or now - self.gx_types_at >= 30:
+            self.gx_types_at = now
+            types = []
+            for n in (1, 2):
+                value = self.driver._settings_get('/Settings/SystemSetup/AcInput%d' % n)
+                try:
+                    types.append(int(value) if value is not None else None)
+                except (TypeError, ValueError):
+                    types.append(None)
+            self.gx_input_types = tuple(types)
+        return self.gx_input_types
+
+    def _resolve_shore_input(self, now):
+        """Which AC input the REC controls (policy_contract.resolve_shore_input).
+        On a change the input being left is released: a standing ignore on
+        it would otherwise outlive the switch with nobody left to clear it."""
+        configured = getattr(self.driver.cfg, 'policy_ac_input', 'auto')
+        feed = self._value('vebus', '/Ac/ActiveIn/ActiveInput', now)
+        available = (self._value('vebus', '/Ac/State/AcIn1Available', now),
+                     self._value('vebus', '/Ac/State/AcIn2Available', now))
+        new, reason = resolve_shore_input(configured, self._gx_input_types(now), feed, available,
+                                          self.shore_input)
+        # The fallback is provisional: it is used this tick but never
+        # settled, so the first ticks before the Quattro's values arrive
+        # cannot pin input 1 for good (fixture, 2026-09-15).
+        if reason != 'default' and new != self.shore_input:
+            old = self.shore_input
+            log.info('shore AC input %s -> %d (%s; GX types %s, ActiveInput %s, available %s)',
+                     old, new, reason, self.gx_input_types, feed, available)
+            if old in (1, 2):
+                self._release_input(old, now)
+            self.shore_input = new
+            self.transfer.durable['shore_input'] = new
+            self.ledger.save()
+        self.shore_input_reason = reason
+        return new
+
+    def _release_input(self, number, now):
+        state = self._value('vebus', '/Ac/State/IgnoreAcIn%d' % number, now)
+        name = self.sources_names.get('vebus')
+        if state != 1 or not name:
+            return
+        try:
+            code = self.driver.sbus.call_blocking(name, '/Ac/Control/IgnoreAcIn%d' % number, BUSITEM,
+                                                  'SetValue', 'v', [0], timeout=2)
+        except Exception as exc:
+            code = exc
+        log.warning('released the ignore standing on AC in %d after the shore input moved (%s)', number, code)
+
     def _sense_required(self, role):
         """Once exposed, a remote-sense selector may never become optional.
 
@@ -365,7 +427,7 @@ class RecPolicyAdapter:
         if command == 1 and not self.ledger.save():
             self.transfer.command_result(command, -1, now, wall)
             return
-        path = '/Ac/Control/IgnoreAcIn%d' % getattr(self.driver.cfg, 'policy_ac_input', 1)
+        path = '/Ac/Control/IgnoreAcIn%d' % (self.shore_input or 1)
         try:
             code = self.driver.sbus.call_blocking(name, path, BUSITEM, 'SetValue', 'v', [command], timeout=2)
         except Exception:
@@ -529,7 +591,7 @@ class RecPolicyAdapter:
             self._value('system', '/ActiveBmsService', now),
             self._value('system', '/Dc/Battery/BatteryService', now),
             self._value('system', '/ActiveBmsInstance', now))
-        shore_input = getattr(self.driver.cfg, 'policy_ac_input', 1)
+        shore_input = self._resolve_shore_input(now)
         feed = self._value('vebus', '/Ac/ActiveIn/ActiveInput', now)
         connected = None if feed is None else feed == shore_input - 1
         # A2/SP56, read on the boat 2026-09-14 (vebus 276): availability, the
@@ -690,6 +752,7 @@ class RecPolicyAdapter:
         status = self.contract.status(now)
         status.update(mode=control['mode'], ready=ready, lease_valid=lease,
                       source_valid=source_valid, departure_allowed=departure_allowed,
+                      shore_ac_input=self.shore_input, shore_ac_input_reason=self.shore_input_reason,
                       request_current=lease, sources_coherent=actuators['coherent'],
                       departure_available=bool(connected is True and not self.transfer.departure_reason(now, wall)),
                       actuator_settled=bool(control.get('actuator', {}).get('settled', False)), limits={k: control[k] for k in ('quattro_v', 'solar_v', 'ccl_a')},
@@ -697,8 +760,10 @@ class RecPolicyAdapter:
         ledger = self.ledger.snapshot(compact=True)
         public_ledger = {k: ledger[k] for k in ('total', 'overhead', 'references', 'budget', 'reverse', 'buffer',
                                                'net_wh', 'net_ah', 'gap_count', 'complete_history', 'capacity_version', 'calendar_days', 'recovery')}
-        snapshot = {'version': 2, 'implementation_version': '3.3.0',
-                    'configuration_id': self.configuration_id, 'shore_ac_input': self.driver.cfg.policy_ac_input,
+        snapshot = {'version': 2, 'implementation_version': '3.4.0',
+                    'configuration_id': self.configuration_id, 'shore_ac_input': self.shore_input,
+                    'shore_ac_input_reason': self.shore_input_reason,
+                    'shore_ac_input_configured': self.driver.cfg.policy_ac_input,
                     'wall_s': wall, 'sample_monotonic_s': stamp,
                     'support_coherent': actuators['support_coherent'],
                     'source_poll': self.poll_diagnostics,

@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.17"
+ENGINE_VERSION = "4.18"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -177,7 +177,12 @@ class Inputs:
               # shore input is present, separate from acceptance. 1/0, or
               # None when the firmware publishes no such path -- unknown is
               # never read as absent.
-              "ac_available")
+              "ac_available",
+              # 4.18: the consumer keeps both inputs' availability and the
+              # GX's AC input types and derives ac_available / feed_shore
+              # from the resolved shore input each tick. The engine reads
+              # only the derived pair.
+              "ac1_available", "ac2_available", "ac1_type", "ac2_type")
 
     def __init__(self):
         for f in self.FIELDS:

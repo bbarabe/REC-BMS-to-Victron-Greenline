@@ -2,10 +2,14 @@
 """Record a Solar Priority transfer trace from the Cerbo over MQTT (read-only).
 
 Subscribes to the handful of paths that describe a shore departure or return
--- the Quattro's active input, the ignore command and its acknowledged state,
-shore availability, the commanded and accepted voltage pair, the CCL, the
-sustain hold, the policy transport state and the signed Quattro V x I -- and
-writes one JSON line per second to a file, plus a line on every relay edge.
+-- the Quattro's active input, the ignore command and its acknowledged state
+on BOTH AC inputs, both availabilities, the GX's two AC input types, the
+commanded and accepted voltage pair, the CCL, the sustain hold, the policy
+transport state and the signed Quattro V x I -- and writes one JSON line per
+second to a file, plus a line on every relay edge. Shore is not nailed to AC
+in 1 (the owner rewired it to AC in 2 on 2026-09-15), so each row also
+carries the resolved shore_input and the single-input ignore_state,
+ignore_cmd and shore_available taken from it.
 MQTT on port 1883 is the read path that never disturbs the box (no SSH); the
 broker needs a keepalive every 30 s to keep publishing, which this sends.
 
@@ -25,9 +29,14 @@ import time
 TOPICS = {
     'vebus': {
         'Ac/ActiveIn/ActiveInput': 'active_input',
-        'Ac/State/IgnoreAcIn1': 'ignore_state',
-        'Ac/Control/IgnoreAcIn1': 'ignore_cmd',
-        'Ac/State/AcIn1Available': 'shore_available',
+        # Both inputs, always: which one is shore is the installation's fact,
+        # and a stranded ignore on the other one is exactly what we watch for.
+        'Ac/State/IgnoreAcIn1': 'ignore_state1',
+        'Ac/State/IgnoreAcIn2': 'ignore_state2',
+        'Ac/Control/IgnoreAcIn1': 'ignore_cmd1',
+        'Ac/Control/IgnoreAcIn2': 'ignore_cmd2',
+        'Ac/State/AcIn1Available': 'ac1_available',
+        'Ac/State/AcIn2Available': 'ac2_available',
         'Ac/ActiveIn/Connected': 'ac_connected',
         'Dc/0/Voltage': 'q_v', 'Dc/0/Current': 'q_a', 'Dc/0/Power': 'q_reported_w',
         'BatteryOperationalLimits/MaxChargeVoltage': 'q_cvl',
@@ -69,6 +78,13 @@ TOPICS = {
         'SolarPriority/Sustain': 'sp_sustain', 'SolarPriority/OneWay': 'sp_oneway',
         'SolarPriority/Desired': 'sp_desired', 'SolarPriority/LimitedBy': 'sp_limited_by',
     },
+    # localsettings (instance 0): the GX's own AC input types -- 0 none,
+    # 1 grid, 2 generator, 3 shore power -- which is the owner's statement of
+    # which input shore power arrives on, and what both services resolve from.
+    'settings': {
+        'Settings/SystemSetup/AcInput1': 'ac1_type',
+        'Settings/SystemSetup/AcInput2': 'ac2_type',
+    },
 }
 # Per MPPT (one set of fields per instance, suffixed with the instance): the
 # yield, the operation mode (1 limited, 2 tracking), the array voltage, the
@@ -77,13 +93,43 @@ TOPICS = {
 # entirely, which the engine's balance read as shade).
 MPPT_TOPICS = {'Yield/Power': 'y', 'MppOperationMode': 'm', 'Pv/V': 'voc',
                'Dc/0/Current': 'a', 'Link/ChargeCurrent': 'lim'}
-EDGE_FIELDS = ('active_input', 'ignore_state', 'ignore_cmd', 'shore_available', 'transport',
-               'relay_pending', 'hold', 'hold_mode', 'sp_state', 'sp_desired', 'mode', 'boost')
+EDGE_FIELDS = ('active_input', 'shore_input', 'ignore_state', 'ignore_cmd', 'shore_available',
+               'transport', 'relay_pending', 'hold', 'hold_mode', 'sp_state', 'sp_desired',
+               'mode', 'boost')
+# Derived per row from the resolved shore input rather than subscribed, so
+# every existing reader of these names (and --summary) keeps working whichever
+# input shore is on.
+DERIVED_FIELDS = ('shore_input', 'ignore_state', 'ignore_cmd', 'shore_available')
+SHORE_TYPES = (1, 3)        # grid and shore power; a generator is not shore
+
+
+def derive(latest, previous):
+    """The resolved shore input and the single-input fields taken from it.
+
+    The GX's types decide when exactly one input is grid or shore; failing
+    that the accepted input says (ActiveInput 0 = AC in 1, 1 = AC in 2), and
+    failing that the trace keeps what it had. Same order the two services
+    resolve in (policy_contract.resolve_shore_input).
+    """
+    t1, t2 = latest.get('ac1_type'), latest.get('ac2_type')
+    if t2 in SHORE_TYPES and t1 not in SHORE_TYPES:
+        shore = 2
+    elif t1 in SHORE_TYPES and t2 not in SHORE_TYPES:
+        shore = 1
+    elif latest.get('active_input') in (0, 1):
+        shore = latest['active_input'] + 1
+    else:
+        shore = previous if previous in (1, 2) else 1
+    return {'shore_input': shore,
+            'ignore_state': latest.get('ignore_state%d' % shore),
+            'ignore_cmd': latest.get('ignore_cmd%d' % shore),
+            'shore_available': latest.get('ac%d_available' % shore)}
 
 
 def record(args):
     import paho.mqtt.client as mqtt
-    instances = {'vebus': args.vebus, 'battery': args.battery, 'system': 0, 'switch': args.switch}
+    instances = {'vebus': args.vebus, 'battery': args.battery, 'system': 0,
+                 'switch': args.switch, 'settings': 0}
     lookup = {}
     for service, paths in TOPICS.items():
         for path, field in paths.items():
@@ -92,6 +138,7 @@ def record(args):
         for path, field in MPPT_TOPICS.items():
             lookup['N/%s/solarcharger/%d/%s' % (args.portal, inst, path)] = '%s%d' % (field, inst)
     latest = {}
+    derived = {}
     edges = []
 
     def on_message(client, userdata, msg):
@@ -166,6 +213,11 @@ def record(args):
                         except Exception as exc2:
                             print('connect to %s failed: %s' % (hosts[current['i']], exc2), flush=True)
             row = dict(latest)
+            row.update(derive(latest, derived.get('shore_input')))
+            for field in DERIVED_FIELDS:
+                if field in EDGE_FIELDS and field in derived and derived[field] != row[field]:
+                    edges.append((now, field, derived[field], row[field]))
+                derived[field] = row[field]
             row['t'] = round(now, 1)
             if now - received['at'] > 10:
                 # Nothing heard for a while: the values are the last ones

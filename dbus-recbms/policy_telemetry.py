@@ -79,6 +79,7 @@ FIELDS = (
     ('Relay/Acknowledged', 'status', ('transfer', 'acknowledged')),
     ('Relay/ShoreAvailable', 'status', ('transfer', 'available')),
     ('Relay/ActiveInput', 'status', ('transfer', 'active_input')),
+    ('Relay/ShoreInput', 'snapshot', ('shore_ac_input',)),
     ('Relay/Prepared', 'status', ('transfer', 'prepared')),
     ('Relay/PrepareAgeSeconds', 'status', ('transfer', 'prepare_age_s')),
     ('Demand/Valid', 'snapshot', ('demand', 'valid')),

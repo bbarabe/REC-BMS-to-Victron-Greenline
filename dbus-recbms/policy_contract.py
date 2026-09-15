@@ -90,6 +90,43 @@ class PolicyContract:
                 'lease_valid': self.active(now), 'rejection': self.rejection}
 
 
+# GX "AC input type" settings (/Settings/SystemSetup/AcInput1|2): 0 = not
+# available, 1 = grid, 2 = generator, 3 = shore power. Grid and shore are
+# both a supply the boat may leave for the sun; a generator is not.
+SHORE_INPUT_TYPES = (1, 3)
+
+
+def resolve_shore_input(configured, types, active_input, available, last):
+    """Which Quattro AC input carries shore power: 1 or 2, with the reason.
+
+    A fixed `configured` (1 or 2) wins. Otherwise ('auto') the GX's own AC
+    input types decide when exactly one input is grid or shore -- the owner
+    sets those when rewiring, and they are the semantic answer whatever the
+    relay is doing. Failing that, the input already resolved is KEPT: a
+    box that has settled on an input never moves off it on ambiguous
+    evidence (an island reads ActiveInput 240 and no availability at all).
+    Only a fresh start with nothing to go on reads the live facts -- the
+    accepted input (/Ac/ActiveIn/ActiveInput 0 = AC in 1, 1 = AC in 2), then
+    the single available input -- and the last resort is input 1. Pure, so
+    both services can share it and it can be tested off the boat.
+    """
+    if configured in (1, 2):
+        return int(configured), 'configured'
+    t1, t2 = (types or (None, None))[:2]
+    typed = [n for n, t in ((1, t1), (2, t2)) if t in SHORE_INPUT_TYPES]
+    if len(typed) == 1:
+        return typed[0], 'gx input type'
+    if last in (1, 2):
+        return int(last), 'kept'
+    if active_input in (0, 1):
+        return int(active_input) + 1, 'accepted input'
+    a1, a2 = (available or (None, None))[:2]
+    present = [n for n, a in ((1, a1), (2, a2)) if a == 1]
+    if len(present) == 1:
+        return present[0], 'only input available'
+    return 1, 'default'
+
+
 class TransferSupervisor:
     """All relay purposes share dwell, feedback accounting, fault and backoff.
 
@@ -115,7 +152,7 @@ class TransferSupervisor:
                              ('backoff_until', 0.0), ('failures', 0), ('external_edges', 0),
                              ('logical_s', 0.0), ('last_wall_s', None), ('last_fault', None),
                              ('probe_failures', []), ('last_departure_s', None),
-                             ('last_failed_departure', None)):
+                             ('last_failed_departure', None), ('shore_input', None)):
             self.durable.setdefault(key, default)
         self.connected_dwell_s = connected_dwell_s
         self.timeout_s = timeout_s

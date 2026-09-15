@@ -610,6 +610,68 @@ class RestoredPlantTests(unittest.TestCase):
             self.assertLessEqual(sim.plant.soc, 60.8)
             self.assertLess(sim.plant.energy.shore_charge_wh - shore_before, 200)
 
+    def shore_status(self, sim):
+        """The shore input REC published, or None before it has said."""
+        raw = sim.rec.batt.values.get('/RecBms/Policy/Status')
+        return (json.loads(raw) if raw else {}).get('shore_ac_input')
+
+    def ignore_states(self, sim, into):
+        """Sample both acknowledged ignore states: a hold left standing on
+        the wrong input would be invisible in an end-of-run reading."""
+        into.append((sim.vebus['/Ac/State/IgnoreAcIn1'], sim.vebus['/Ac/State/IgnoreAcIn2']))
+
+    def runs(self, values):
+        """A sampled sequence collapsed to its distinct consecutive values."""
+        return [v for n, v in enumerate(values) if n == 0 or values[n - 1] != v]
+
+    def test_shore_on_ac_input_2_is_resolved_and_controlled(self):
+        # The owner rewired shore power from AC in 1 to AC in 2 (2026-09-15).
+        # Neither service is configured with the answer: the GX's own AC input
+        # types say which input is shore, REC publishes what it resolved, and
+        # every relay command goes to that input -- a command written to the
+        # other one would strand an ignore on an input nobody is watching.
+        from solar_priority_plant import PlantConfig
+        with self.simulation(target=80, plant_config=PlantConfig(shore_input=2, initial_soc=60)) as sim:
+            states = []
+            sim.run(30)
+            self.assertEqual(self.shore_status(sim), 2)
+            self.assertEqual(sim.vebus['/Ac/ActiveIn/ActiveInput'], 1)
+            self.until(sim, lambda: (self.ignore_states(sim, states), not sim.plant.connected)[1])
+            self.assertEqual(sim.vebus['/Ac/ActiveIn/ActiveInput'], 240)
+            self.assertFalse(sim.plant.relay_edges[-1]['connected'])
+            sim.run(30)
+            closure = self.watch_closure(sim)
+            sim.set_load(ac_w=3000)                       # above the 2.5 kW suspend threshold
+            self.until(sim, lambda: sim.solar.sw['/SolarPriority/State'] == 'suspend', timeout=60)
+            self.until(sim, lambda: (self.ignore_states(sim, states), sim.plant.connected)[1], timeout=600)
+            self.assertTrue(closure, 'the suspend never reached shore')
+            self.assertEqual(closure['active_input'], 240)
+            self.assertEqual(sim.vebus['/Ac/ActiveIn/ActiveInput'], 1)
+            self.assertEqual(sim.vebus['/Ac/ActiveIn/Connected'], 1)
+            self.assertTrue(json.loads(sim.rec.batt['/RecBms/Policy/Status'])['transfer']['prepared'])
+            # AC in 2 was held and released; AC in 1 is not ours to touch
+            self.assertEqual(self.runs([one for one, _ in states]), [0])
+            self.assertEqual(self.runs([two for _, two in states]), [0, 1, 0])
+            self.assertEqual({write['path'] for write in sim.bus.writes if 'IgnoreAcIn' in write['path']},
+                             {'/Ac/Control/IgnoreAcIn2'})
+            self.assertEqual([c for c in sim.plant.commands if c['kind'] == 'ignore_wrong_input'], [])
+
+    def test_shore_input_resolves_from_live_evidence_without_gx_types(self):
+        # A GX nobody ever configured: both AC input types read 0, so they say
+        # nothing at all. The only evidence is the boat sitting accepted on AC
+        # in 2, and both services have to read it the same way -- a resolution
+        # taken before any of the Quattro's facts arrive is not evidence.
+        from solar_priority_plant import PlantConfig
+        with self.simulation(target=80, plant_config=PlantConfig(shore_input=2, gx_input_types=(0, 0))) as sim:
+            self.assertEqual(sim.vebus['/Ac/ActiveIn/ActiveInput'], 1)
+            self.until(sim, lambda: self.shore_status(sim) == 2, timeout=60)
+            self.until(sim, lambda: not sim.plant.connected)
+            self.assertEqual(sim.vebus['/Ac/State/IgnoreAcIn2'], 1)
+            self.assertEqual(sim.vebus['/Ac/State/IgnoreAcIn1'], 0)
+            self.assertEqual({write['path'] for write in sim.bus.writes if 'IgnoreAcIn' in write['path']},
+                             {'/Ac/Control/IgnoreAcIn2'})
+            self.assertEqual([c for c in sim.plant.commands if c['kind'] == 'ignore_wrong_input'], [])
+
 
 if __name__ == '__main__':
     unittest.main()
