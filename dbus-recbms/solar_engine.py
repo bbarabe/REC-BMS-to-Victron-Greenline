@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.18"
+ENGINE_VERSION = "4.19"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -107,6 +107,11 @@ ENGINE_DEFAULTS = {
     # on a marina-light open-circuit voltage with zero yield; each lifts
     # dbus-recbms' sustain charge-current cap for two minutes for nothing.
     "BOOST_MIN_PV_W": 20,
+    # 4.19: under a charge current limit this small the yield says nothing
+    # about the sun (the hold curtails PV by current at its destination:
+    # 0.1 A / 6 W under a 75 V sky, boat 2026-09-15), so the boost, which
+    # lifts that limit, is gated on daylight alone.
+    "BOOST_CAPPED_A": 3,
     # 4.9: on the sustain floor the MPPTs sit one solar band above the
     # bank and run unthrottled, so the capture IS the capacity and a probe
     # proves nothing (2026-09-10: one probe, est 572 W vs need 529 W, both
@@ -182,7 +187,9 @@ class Inputs:
               # GX's AC input types and derives ac_available / feed_shore
               # from the resolved shore input each tick. The engine reads
               # only the derived pair.
-              "ac1_available", "ac2_available", "ac1_type", "ac2_type")
+              "ac1_available", "ac2_available", "ac1_type", "ac2_type",
+              # 4.19: the charge current limit in force (/Info/MaxChargeCurrent)
+              "ccl_a")
 
     def __init__(self):
         for f in self.FIELDS:
@@ -692,8 +699,13 @@ class Engine:
                 live_any = any(m is not None and m.v == 2 and cap_fresh(cp)
                                for m, cp in ((m6, st["cap6"]), (m7, st["cap7"])))
                 unthrottled = live_any and not throttled_any
+                # 4.19: a current cap makes the yield meaningless -- the
+                # hold's curtailment at its destination left 6 W flowing
+                # under a 75 V sky and no boost ever fired, so the engine
+                # could not measure the arrays it needed to leave shore.
+                capped = inp.ccl_a is not None and inp.ccl_a.v <= t["BOOST_CAPPED_A"]
                 if (not boosting and dayOk and vocMax >= t["VOC_DAY_V"] and not vocRising
-                        and pvNow >= t["BOOST_MIN_PV_W"] and not unthrottled
+                        and (pvNow >= t["BOOST_MIN_PV_W"] or capped) and not unthrottled
                         and not aboveCvl and not shoreMissing and soc.v >= minSoc
                         and quattroW <= t["SURPLUS_QUIET_W"] and not owd
                         and (now - st["lastBoostTs"]) >=

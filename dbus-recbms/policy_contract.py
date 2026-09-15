@@ -318,6 +318,21 @@ class TransferSupervisor:
             self.fault(now, wall, 'relay SetValue refused (%s)' % code)
             self.last_command = None
 
+    def command_deferred(self, value, now, reason='VE.Bus service absent'):
+        """The command could not be written at all -- the VE.Bus service was
+        not on the bus (2026-09-15 19:19-19:55 UTC: three restarts of it while
+        the owner moved shore to AC in 2, each turned into a refused write and
+        an hour's fault lockout on a boat that had done nothing wrong). Nothing
+        was refused: the issue is undone, a reserved departure handed back,
+        and the next tick asserts again once the service is there."""
+        if self.pending == value:
+            self.pending = None
+            self.pending_since = None
+        self.last_assert = None
+        if value == 1 and self.durable['departures']:
+            self.durable['departures'].pop()
+        self.limited_by = reason
+
     def _command(self, value, now, wall, urgent=False):
         # Confirmed shore needs no repeated write. Cancellation, refusal and
         # timeout still get an immediate assertion despite cached feedback.

@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1711,6 +1711,19 @@ class RecBmsDriver:
                         su["trim_a"] = max(-c.sustain_trim_max_a, su["trim_a"] - c.sustain_trim_a)
                     elif err < 0 and draining:
                         su["trim_a"] = min(c.sustain_trim_max_a, su["trim_a"] + c.sustain_trim_a)
+                    # 3.4.1: a trim outlives its cause otherwise. The boat's
+                    # re-accept surge of 2026-09-15 filled the bank to
+                    # 50.2 %, the trim wound to -2.5 A, and with the bank
+                    # then draining (not filling) nothing ever unwound it:
+                    # the cap sat on its 0.1 A floor all afternoon, the
+                    # MPPTs made 6 W under a 75 V sky, the DC loads came
+                    # out of the bank on shore, and the engine could not
+                    # even measure the arrays. A trim relaxes toward zero
+                    # once the bank stops doing what it was trimmed for.
+                    elif su["trim_a"] < 0 and not filling:
+                        su["trim_a"] = min(0.0, su["trim_a"] + c.sustain_trim_a)
+                    elif su["trim_a"] > 0 and not draining:
+                        su["trim_a"] = max(0.0, su["trim_a"] - c.sustain_trim_a)
             if (hold and volts is not None and abs(su["servo_v"]) >= c.sustain_arrival_fold_v > 0
                     and held_eff - c.sustain_servo_db <= soc <= held_eff + c.sustain_servo_db):
                 # Arrival snap (3.3.1). A hold that lifts (or lowers) the

@@ -24,8 +24,8 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.5.0"
-ENGINE_VERSION = "4.18-restored"
+VERSION = "3.5.1"
+ENGINE_VERSION = "4.19-restored"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -187,6 +187,9 @@ INPUT_MAP = {
     ("settings", "/Settings/SystemSetup/AcInput2"): ("ac2_type", lambda v: v in (0, 1, 2, 3)),
     ("vebus", "/Ac/Out/L1/P"):            ("ac_out", _rng(-20000, 20000)),
     ("battery", "/RecBms/TargetChargeVoltage"): ("cvl", _rng(20, 80)),
+    # 4.19: the charge current limit in force; under a small one the yield
+    # says nothing about the sun and the boost is gated on daylight alone.
+    ("battery", "/Info/MaxChargeCurrent"):      ("ccl_a", _rng(0, 2000)),
     ("battery", "/RecBms/SolarBoost/Active"):   ("boost_active", lambda v: True),
     ("battery", "/RecBms/SolarBoost/WindowOpen"): ("boost_window", lambda v: True),
     ("battery", "/RecBms/SolarBoost/EffectiveChargeVoltage"): ("boost_eff", _rng(20, 80)),

@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.18")
+check("engine version bumped", SP.ENGINE_VERSION == "4.19")
 Val = SP.Val
 
 
@@ -429,6 +429,19 @@ s.tick(400, soc=60, target=80, pv=0.0, m=1, voc=62.0, batt_v=56.4)   # dusk: Voc
 check("4.7: no boost on an open-circuit voltage with no yield", s.boosts == [], str(s.boosts))
 s.tick(400, pv=60.0)
 check("4.7: boost once PV is flowing", s.boosts and s.boosts[-1] == s.t["BOOST_V"], str(s.boosts))
+
+# ---- 4.19: a current cap makes the yield meaningless; boost on daylight ----
+s = Sim()
+s.tick(60, soc=60, target=80, pv=30.0, m=2, voc=75.0, load=1000.0, batt_v=56.4)   # a dim capture: no exploratory probe
+s.tick(400, pv=5.0, m=1)                                              # then 6 W under a 75 V sky, no cap known
+check("4.19: no boost on a trickle when the limit is unknown", s.boosts == [] and s.state == "shore", (str(s.boosts), s.state))
+s.inp.ccl_a = SP.Val(0.1, s.now)
+s.tick(400, pv=5.0)
+check("4.19: boost on a trickle under a 0.1 A charge limit", s.boosts and s.boosts[-1] == s.t["BOOST_V"] and s.state == "shore", (str(s.boosts), s.state))
+s = Sim()
+s.inp.ccl_a = SP.Val(0.1, s.now)
+s.tick(400, soc=60, target=80, pv=0.0, m=0, voc=20.0, batt_v=56.4)   # night under the same cap
+check("4.19: no boost at night under a cap", s.boosts == [], str(s.boosts))
 
 # ---- the SOC floor still wins ----
 s = Sim()

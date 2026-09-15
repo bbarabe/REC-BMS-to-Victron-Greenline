@@ -420,8 +420,9 @@ class RecPolicyAdapter:
             return
         name = self.sources_names.get('vebus') or self.driver._find_vebus()
         if not name:
-            self.transfer.command_result(command, -1, now, wall)
-            self.ledger.save()
+            # No VE.Bus service to write to (a restart): nothing was refused,
+            # so no fault -- the command is re-asserted when it is back.
+            self.transfer.command_deferred(command, now)
             return
         # Reservations and departure history are durable before issuing control.
         if command == 1 and not self.ledger.save():

@@ -203,6 +203,32 @@ class TransferBoundaryTests(unittest.TestCase):
         self.assertIsNone(supervisor.durable['last_failed_departure'])
         self.assertEqual(supervisor.snapshot(0, 1000)['departures_24h'], 1)
 
+    def test_a_command_with_no_vebus_service_is_deferred_not_faulted(self):
+        # Boat, 2026-09-15 19:19-19:55 UTC: the VE.Bus service restarted three
+        # times while the owner moved shore to AC in 2; each connect issued
+        # into the gap was booked as a refused write and an hour's fault
+        # lockout, so a boat that had done nothing wrong could not leave shore
+        # until 20:55 under a 75 V sky. The write never happened: undo the
+        # issue, hand a reserved departure back, assert again next tick.
+        supervisor = self.connected()
+        self.assertEqual(self.step(supervisor, 300), 1)
+        self.assertEqual(len(supervisor.durable['departures']), 1)
+        supervisor.command_deferred(1, 300)
+        self.assertIsNone(supervisor.pending)
+        self.assertEqual(supervisor.durable['departures'], [])
+        self.assertEqual(supervisor.durable['fault_until'], 0.0)
+        self.assertNotIn('lockout', supervisor.departure_reason(301, 1301))
+        self.assertEqual(supervisor.limited_by, 'VE.Bus service absent')
+        # The next tick asserts again, without the 30 s re-assert throttle.
+        self.assertEqual(self.step(supervisor, 301), 1)
+        # A deferred connect behaves the same way: no fault, re-asserted.
+        supervisor = self.connected()
+        supervisor.observe(False, 10, 1010)
+        self.assertEqual(self.step(supervisor, 10, intent='connected', protective=True), 0)
+        supervisor.command_deferred(0, 10)
+        self.assertEqual(supervisor.durable['fault_until'], 0.0)
+        self.assertEqual(self.step(supervisor, 11, intent='connected', protective=True), 0)
+
     def test_withdrawn_return_leaves_an_island_not_a_running_timer(self):
         # Boat, 2026-09-14 16:06 UTC: a one-tick loss of permission began a
         # prepared return, permission came back, the island intent resumed,

@@ -386,6 +386,44 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.assertAlmostEqual(su['servo_v'], 0.3, places=3)
         self.assertAlmostEqual(su['anchor_v'], 55.55, places=2)
 
+    def test_a_hold_trim_relaxes_once_its_cause_is_gone(self):
+        # Boat, 2026-09-15 afternoon: a re-accept surge filled the held bank
+        # to 50.2 %, the trim wound to -2.5 A and nothing unwound it once
+        # the bank stopped filling, so the cap sat on its 0.1 A floor under
+        # a 75 V sky. 3.4.1: a trim steps back toward zero when the bank no
+        # longer does what it was trimmed for, never past zero.
+        self.driver.settings['chargeslider'] = 50
+        self.driver.sp_enabled = True
+        self.tick()
+        self.assertTrue(self.driver._set_sustain(3))
+        su = self.driver.sustain
+        self.driver._sustain_anchor(50.0, 55.6, 0.0, 'test')
+
+        def period(soc, amps):
+            self.now += self.cfg.sustain_servo_s
+            self.driver._set_sustain(3)
+            self.driver._service_sustain(self.now, soc, 50.0, 55.6, amps)
+
+        step = self.cfg.sustain_trim_a
+        for _ in range(3):
+            period(50.2, 2.0)                               # filling above target: down
+        self.assertAlmostEqual(su['trim_a'], -3 * step, places=3)
+        period(50.2, -1.0)                                  # draining above target: relax
+        self.assertAlmostEqual(su['trim_a'], -2 * step, places=3)
+        period(50.2, 0.0)                                   # still: relax
+        self.assertAlmostEqual(su['trim_a'], -1 * step, places=3)
+        period(50.2, 0.0)
+        period(50.2, 0.0)
+        self.assertEqual(su['trim_a'], 0.0)                 # never past zero
+        for _ in range(2):
+            period(49.95, -1.0)                             # draining under target: up
+        self.assertAlmostEqual(su['trim_a'], 2 * step, places=3)
+        period(49.95, 0.0)                                  # covered: relax down
+        self.assertAlmostEqual(su['trim_a'], 1 * step, places=3)
+        period(49.95, 0.5)                                  # filling under target: relax down
+        period(49.95, 0.5)
+        self.assertEqual(su['trim_a'], 0.0)
+
     def test_a_re_asserted_hold_keeps_its_anchor_and_refreshes_expiry(self):
         self.driver.settings['chargeslider'] = 80
         self.tick()
