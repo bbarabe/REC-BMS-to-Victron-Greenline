@@ -95,6 +95,9 @@
     "taper_s": "60",
     "taper_margin_v": "0.03",
     "pv_min_a": "0.5",
+    "hold_step_v": "0.01",
+    "hold_servo_up_v": "0.10",
+    "hold_servo_down_v": "0.30",
     "servo_drain_a": "0.3",
     "arrival_fold_v": "0.25",
     "dusk_s": "300"

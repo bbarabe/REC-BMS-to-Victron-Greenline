@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.6.0"
+VERSION = "3.6.1"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -262,6 +262,12 @@ class Config:
         # 3.6.0: the hold's current trim (3.2.0-3.5.x, trim_step_a and
         # trim_max_a) went with the current-regulated destination it served;
         # a config that still carries the keys is simply not read there.
+        # 3.6.1: at its destination the hold servos on the bank's CURRENT
+        # in finer steps, with a small authority either way (see
+        # hold_current_servo): the boat's bank takes ~1.5 A per 0.01 V.
+        self.sustain_hold_step_v = max(0.0, self._number(su.get("hold_step_v", 0.01)))
+        self.sustain_hold_servo_up = max(0.0, self._number(su.get("hold_servo_up_v", 0.10)))
+        self.sustain_hold_servo_down = max(0.0, self._number(su.get("hold_servo_down_v", 0.30)))
         # v1.8.4: the dusk snap -- PV current under pv_min_a for this long,
         # after a day of sun, re-anchors the hold to the bank's own voltage
         self.sustain_dusk_s = max(0.0, self._number(su.get("dusk_s", 300)))
@@ -665,6 +671,9 @@ def sustain_servo(mode, err, charging, deadband, draining=True, filling=False):
     loads at its own rest voltage) is left alone, as a ceiling's sunny
     plateau is (SP38): nothing charges it further, and the loads take it
     down whenever they exceed what the chargers give at that voltage.
+    3.6.1: this function serves the hold only while the band is open
+    (the bank under its destination); at the destination the finer
+    current servo takes over (hold_current_servo).
     """
     if mode == SUSTAIN_FLOOR:
         if err < -deadband and draining:
@@ -693,6 +702,47 @@ def sustain_servo(mode, err, charging, deadband, draining=True, filling=False):
         return 0
     if mode == SUSTAIN_CEILING and (charging or filling):
         return -1
+    return 0
+
+
+def hold_current_servo(err, amps, deadband, drain_a):
+    """The two-sided hold's servo AT its destination (3.6.1): which way to
+    move the hold voltage this period, +1 up, -1 down, 0 leave it.
+
+    At the destination every charger sits on the hold voltage and the
+    bank's own current says where that voltage is relative to the bank:
+    filling means it sits over the bank, draining means under it (the
+    chargers are giving less than the loads). The SOC error only sets
+    what current is wanted. Inside the deadband: none either way, the
+    chargers carry the loads and the bank sits still. Above the target:
+    none INTO the bank, and a gentle drift out of it is welcome -- up to
+    two drain thresholds -- so the bank trends back without the chargers
+    being starved; below it: a drain is answered, a fill is the plan.
+
+    Why current and not SOC (the 3.6.0 rule "down while filling above"):
+    a step down on every period the bank filled ran the hold voltage past
+    the landing point. Boat, 2026-09-15 23:00 UTC: two 0.02 V steps took
+    the bank from +5 A to -1 A, the arrays sat at open-circuit voltage
+    making 0 W under a bright sky, and the DC loads came out of a bank
+    0.2 % over its target -- for the hours it would have taken the loads
+    to bring it 0.2 % down. The bank takes about 1.5 A per 0.01 V here,
+    so the finer step lands the chargers on the loads within an amp.
+    Pure, so it can be tested off the boat.
+    """
+    if amps is None:
+        return 0
+    if err > deadband:
+        if amps > drain_a:
+            return -1
+        if amps < -2 * drain_a:
+            return 1
+        return 0
+    if err < -deadband:
+        return 1 if amps < -drain_a else 0
+    if amps > drain_a:
+        return -1
+    if amps < -drain_a:
+        return 1
     return 0
 
 
@@ -1775,11 +1825,24 @@ class RecBmsDriver:
                 su["servo_ts"] = now
             elif now - su["servo_ts"] >= c.sustain_servo_s:
                 su["servo_ts"] = now
-                d = sustain_servo(su["mode"], soc - held_eff, charging,
-                                  c.sustain_servo_db, draining, filling)
-                if d:
-                    su["servo_v"] = max(-c.sustain_servo_down, min(
-                        c.sustain_servo_up, su["servo_v"] + d * c.sustain_servo_v))
+                if hold and su["at_dest"]:
+                    # 3.6.1: at the destination the hold voltage is the
+                    # regulator and the bank's current is the error
+                    # signal, in finer steps with a small authority
+                    # either way (the arrival fold put the anchor on the
+                    # bank's own rest voltage; the servo only has to land
+                    # the chargers on the loads from there).
+                    d = hold_current_servo(soc - held_eff, amps, c.sustain_servo_db,
+                                           c.sustain_drain_a)
+                    if d:
+                        su["servo_v"] = max(-c.sustain_hold_servo_down, min(
+                            c.sustain_hold_servo_up, su["servo_v"] + d * c.sustain_hold_step_v))
+                else:
+                    d = sustain_servo(su["mode"], soc - held_eff, charging,
+                                      c.sustain_servo_db, draining, filling)
+                    if d:
+                        su["servo_v"] = max(-c.sustain_servo_down, min(
+                            c.sustain_servo_up, su["servo_v"] + d * c.sustain_servo_v))
             if hold and su["arrived"] and volts is not None:
                 # 3.6.0: the bank came up through target - deadband and the
                 # band just closed (_sustain_destination). From here the
