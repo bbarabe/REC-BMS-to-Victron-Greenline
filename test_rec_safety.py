@@ -273,30 +273,24 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.assertAlmostEqual(batt['/RecBms/TargetChargeVoltage'],
                                hold_v + self.cfg.sustain_band_v, places=2)
         self.assertAlmostEqual(self.plant.base, hold_v, places=2)
-        # At the destination the band stays -- PV must still be able to
-        # reach the loads -- and the surplus is curtailed by current: the
-        # published CCL becomes the DC load DVCC does not compensate itself
-        # (0 A when the DC system is metered), so the Quattro sits on the
-        # hold voltage with nothing to put into the bank.
+        # At the destination (3.6.0) the band closes: the lead in force is
+        # nothing, every charger is commanded the hold voltage and the bank
+        # is regulated by that voltage. The charge limit stays the floor's
+        # PV + charge_limit_a -- a real constraint, never the near-zero
+        # figure that had DVCC switch an MPPT off (boat, 2026-09-15).
         self.driver.settings['chargeslider'] = 60
-        self.driver.policy_adapter.last_snapshot = {'demand': {
-            'valid': True, 'measured_dc': False, 'external_dc_w': 56.6}}
         self.tick()
-        self.assertAlmostEqual(self.driver.lead_v, self.cfg.sustain_band_v, places=3)
-        self.assertAlmostEqual(batt['/RecBms/TargetChargeVoltage'],
-                               hold_v + self.cfg.sustain_band_v, places=2)
+        self.assertEqual(self.driver.lead_v, 0.0)
+        hold_v = batt['/RecBms/Sustain/HoldVoltage']
+        self.assertAlmostEqual(batt['/RecBms/TargetChargeVoltage'], hold_v, places=2)
         self.assertAlmostEqual(self.plant.base, hold_v, places=2)
         self.assertEqual(batt['/RecBms/Sustain/Soc'], 60)
-        self.assertAlmostEqual(batt['/RecBms/Sustain/ChargeLimit'], 1.0, places=1)
-        self.assertAlmostEqual(batt['/Info/MaxChargeCurrent'], 56.6 / 56.6, places=1)
-        self.driver.policy_adapter.last_snapshot = {'demand': {
-            'valid': True, 'measured_dc': True, 'external_dc_w': 56.6}}
+        # the new pair verifies on the next ticks; the limit is then the floor's
         self.tick()
-        self.assertAlmostEqual(batt['/Info/MaxChargeCurrent'], R.SUSTAIN_HOLD_MIN_A, places=3)
-        # Without a valid demand the floor's own cap stands in.
-        self.driver.policy_adapter.last_snapshot = {}
         self.tick()
-        self.assertGreater(batt['/Info/MaxChargeCurrent'], 1.0)
+        self.assertGreaterEqual(batt['/Info/MaxChargeCurrent'], self.cfg.sustain_ccl_a)
+        self.assertGreaterEqual(batt['/RecBms/Sustain/ChargeLimit'] or self.cfg.sustain_ccl_a,
+                                self.cfg.sustain_ccl_a)
 
     def test_a_hold_arriving_at_its_destination_folds_its_servo_into_a_fresh_anchor(self):
         # Boat, 2026-09-14 22:25-23:40 UTC: the first HOLD (50 %) was taken
@@ -387,12 +381,80 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.assertAlmostEqual(su['servo_v'], 0.3, places=3)
         self.assertAlmostEqual(su['anchor_v'], 55.55, places=2)
 
-    def test_a_hold_trim_relaxes_once_its_cause_is_gone(self):
-        # Boat, 2026-09-15 afternoon: a re-accept surge filled the held bank
-        # to 50.2 %, the trim wound to -2.5 A and nothing unwound it once
-        # the bank stopped filling, so the cap sat on its 0.1 A floor under
-        # a 75 V sky. 3.4.1: a trim steps back toward zero when the bank no
-        # longer does what it was trimmed for, never past zero.
+    def test_a_hold_closes_its_band_on_arrival_and_reopens_it_two_deadbands_under(self):
+        # 3.6.0 (Victron: CVL is the top-of-charge control, CCL a genuine
+        # current constraint). Under its destination a hold gives the sun
+        # the band and the floor's cap; arriving at target - deadband
+        # closes the band, re-anchors on the bank's rest voltage whatever
+        # the servo carries, and from there the hold voltage regulates.
+        # The latch reopens only two deadbands under, so a bank dithering
+        # on the edge never flips the MPPT ceiling by band_v.
+        self.driver.settings['chargeslider'] = 50
+        self.driver.sp_enabled = True
+        self.tick()
+        self.assertTrue(self.driver._set_sustain(3))
+        su = self.driver.sustain
+        r = self.cfg.sustain_anchor_r
+        self.driver._sustain_anchor(49.5, 55.5, 0.0, 'test')
+        self.assertIsNone(su['at_dest'])
+
+        def drive(soc, volts, amps):
+            self.now += 1
+            self.driver._set_sustain(3)
+            return self.driver._service_sustain(self.now, soc, 50.0, volts, amps)
+
+        # Under the destination: the band is open, the sun fills at the cap.
+        target = drive(49.5, 55.5, 8.0)
+        self.assertIs(su['at_dest'], False)
+        self.assertAlmostEqual(target, su['anchor_v'] + self.cfg.sustain_band_v, places=2)
+        self.assertAlmostEqual(self.driver._sustain_band(True, 49.5, 50.0),
+                               self.cfg.sustain_band_v, places=3)
+        drive(49.85, 55.55, 8.0)                            # a deadband and a half under: still open
+        self.assertIs(su['at_dest'], False)
+        self.assertAlmostEqual(su['anchor_v'], 55.5, places=2)
+        # Arrival at 49.9 %: the band closes and the hold IS the bank's
+        # rest voltage now, even with no servo to fold.
+        target = drive(49.9, 55.6, 8.0)
+        self.assertIs(su['at_dest'], True)
+        self.assertAlmostEqual(su['anchor_v'], 55.6 - 8.0 * r, delta=.006)
+        self.assertEqual(su['servo_v'], 0.0)
+        self.assertFalse(su['arrived'])
+        self.assertAlmostEqual(target, su['anchor_v'], places=2)
+        self.assertEqual(self.driver._sustain_band(True, 49.9, 50.0), 0.0)
+        folded = su['anchor_v']
+        # Dithering on the edge neither reopens the band nor re-anchors.
+        for soc in (49.89, 49.9, 49.85, 49.95, 49.81, 50.2):
+            target = drive(soc, 55.6, 0.0)
+            self.assertIs(su['at_dest'], True, soc)
+            self.assertAlmostEqual(su['anchor_v'], folded, places=2)
+            self.assertAlmostEqual(target, folded + su['servo_v'], places=2)
+        # Two deadbands under: the band reopens so the sun can finish again.
+        target = drive(49.79, 55.55, -1.0)
+        self.assertIs(su['at_dest'], False)
+        self.assertAlmostEqual(target, folded + su['servo_v'] + self.cfg.sustain_band_v, places=2)
+        # ... and the next arrival folds again.
+        drive(49.9, 55.62, 4.0)
+        self.assertIs(su['at_dest'], True)
+        self.assertAlmostEqual(su['anchor_v'], 55.62 - 4.0 * r, delta=.006)
+        # A hold taken at or above its destination is there from the start:
+        # no band, and no "arrival" to fold.
+        self.assertTrue(self.driver._set_sustain(0))
+        self.assertTrue(self.driver._set_sustain(3))
+        su = self.driver.sustain
+        self.driver._sustain_anchor(50.3, 55.7, 0.0, 'test')
+        target = drive(50.3, 55.75, 0.0)
+        self.assertIs(su['at_dest'], True)
+        self.assertFalse(su['arrived'])
+        self.assertAlmostEqual(su['anchor_v'], 55.7, places=2)
+        self.assertAlmostEqual(target, 55.7, places=2)
+
+    def test_a_hold_servo_answers_a_fill_above_target_from_any_source(self):
+        # 3.6.0: at the destination the hold regulates by voltage, so the
+        # sun CAN fill the bank there when the hold voltage sits over it
+        # (the Quattro's bias over its command does the same at night); a
+        # fill above the target is the sign that it does, and the servo
+        # steps the voltage down whoever is filling. A bank sitting still
+        # or draining above the target is left to the loads.
         self.driver.settings['chargeslider'] = 50
         self.driver.sp_enabled = True
         self.tick()
@@ -405,33 +467,30 @@ class RecDriverSafetyTests(unittest.TestCase):
             self.driver._set_sustain(3)
             self.driver._service_sustain(self.now, soc, 50.0, 55.6, amps)
 
-        step = self.cfg.sustain_trim_a
+        step = self.cfg.sustain_servo_v
         for _ in range(3):
-            period(50.2, 2.0)                               # filling above target: down
-        self.assertAlmostEqual(su['trim_a'], -3 * step, places=3)
-        period(50.2, -1.0)                                  # draining above target: relax
-        self.assertAlmostEqual(su['trim_a'], -2 * step, places=3)
-        period(50.2, 0.0)                                   # still: relax
-        self.assertAlmostEqual(su['trim_a'], -1 * step, places=3)
-        period(50.2, 0.0)
-        period(50.2, 0.0)
-        self.assertEqual(su['trim_a'], 0.0)                 # never past zero
+            period(50.2, 2.0)                               # PV filling above target: down
+        self.assertAlmostEqual(su['servo_v'], -3 * step, places=3)
+        period(50.2, -1.0)                                  # draining above: left to the loads
+        period(50.2, 0.0)                                   # sitting above: left alone
+        self.assertAlmostEqual(su['servo_v'], -3 * step, places=3)
+        period(50.05, 0.0)                                  # inside the deadband: nothing
+        self.assertAlmostEqual(su['servo_v'], -3 * step, places=3)
         for _ in range(2):
-            period(49.95, -1.0)                             # draining under target: up
-        self.assertAlmostEqual(su['trim_a'], 2 * step, places=3)
-        period(49.95, 0.0)                                  # covered: relax down
-        self.assertAlmostEqual(su['trim_a'], 1 * step, places=3)
-        period(49.95, 0.5)                                  # filling under target: relax down
-        period(49.95, 0.5)
-        self.assertEqual(su['trim_a'], 0.0)
+            period(49.85, -1.0)                             # draining under: up, as the floor
+        self.assertAlmostEqual(su['servo_v'], -1 * step, places=3)
+        period(49.85, 0.0)                                  # covered: still
+        period(49.85, 0.5)                                  # the sun finishing: still
+        self.assertAlmostEqual(su['servo_v'], -1 * step, places=3)
 
     def test_a_hold_stands_still_while_a_boost_measures(self):
         # Boat, 2026-09-15 20:50 UTC, the first boost on 3.4.1: the lifted
-        # limit let the arrays fill the held bank at 6 A for two minutes,
-        # the trim answered that fill with -2.0 A, and when the boost ended
-        # the limit fell straight back onto its 0.1 A floor. A boost is our
-        # own measurement: neither the trim nor the servo may regulate on
-        # it. Both resume, on a fresh period, once it ends.
+        # limit let the arrays fill the held bank at 6 A for two minutes
+        # and the hold's regulation answered that fill as if it were the
+        # world's doing. A boost is our own measurement: the servo may not
+        # regulate on it (3.4.2; the current trim that also stood still
+        # then is gone in 3.6.0). It resumes, on a fresh period, once the
+        # boost ends.
         self.driver.settings['chargeslider'] = 50
         self.driver.sp_enabled = True
         self.tick()
@@ -447,11 +506,10 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.driver.boost['active'] = True
         for _ in range(4):
             period(50.2, 6.0)                               # filling above target under a boost
-        self.assertEqual(su['trim_a'], 0.0)
         self.assertEqual(su['servo_v'], 0.0)
         self.driver.boost['active'] = False
-        period(50.2, 6.0)                                   # the same fill, boost over: trim answers
-        self.assertAlmostEqual(su['trim_a'], -self.cfg.sustain_trim_a, places=3)
+        period(50.2, 6.0)                                   # the same fill, boost over: the servo answers
+        self.assertAlmostEqual(su['servo_v'], -self.cfg.sustain_servo_v, places=3)
 
     def test_a_re_asserted_hold_keeps_its_anchor_and_refreshes_expiry(self):
         self.driver.settings['chargeslider'] = 80
@@ -658,13 +716,14 @@ class SustainPrimitiveTests(unittest.TestCase):
         self.assertEqual(servo(-.15, False, False), 0)
         self.assertEqual(servo(-.15, True, False), 0)
         self.assertEqual(servo(-.11, False, False, True), 0)
-        # Above it: down only when the Quattro is the one filling it. The
-        # sun cannot fill a hold at its destination (the current limit
-        # curtails it) and a bank the loads should bring down is not
-        # answered by starving the MPPTs of voltage.
+        # Above it (3.6.0): down while anything fills it, the Quattro or the
+        # sun -- the hold regulates by voltage at its destination and a fill
+        # means the hold voltage sits over the bank. A bank sitting still or
+        # draining above is left to the loads, never answered by starving
+        # the MPPTs of voltage.
         self.assertEqual(servo(.5, True, False), -1)
+        self.assertEqual(servo(.5, False, False, True), -1)
         self.assertEqual(servo(.5, False, False), 0)
-        self.assertEqual(servo(.5, False, False, True), 0)
         self.assertEqual(servo(.5, False, True), 0)
         # Inside the deadband nothing moves either way.
         self.assertEqual(servo(.05, False, True), 0)

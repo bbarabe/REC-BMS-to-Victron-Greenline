@@ -642,22 +642,27 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertLessEqual(abs(net), .5)
             self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 3)
             self.assertEqual(sim.rec.batt['/RecBms/Sustain/Soc'], 60.0)
-            # B2: the Quattro sits ON the hold, not an ordinary lead under it;
-            # the MPPTs keep their band (PV must reach the loads) and the
-            # charge limit is what keeps the bank from filling.
+            # 3.6.0: at the destination the Quattro AND the MPPTs sit on the
+            # hold voltage -- the bank's own rest voltage -- and the bank is
+            # regulated by that voltage; the charge limit is the floor's
+            # PV + charge_limit_a, a real constraint and never near zero.
             hold_v = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
-            self.assertEqual(sim.rec.lead_v, sim.rec.cfg.sustain_band_v)
+            self.assertEqual(sim.rec.lead_v, 0.0)
             self.assertAlmostEqual(sim.plant.dvcc.quattro_v, hold_v, delta=.03)
-            self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v + sim.rec.cfg.sustain_band_v, delta=.03)
-            self.assertLessEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_trim_max_a)
+            self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v, delta=.03)
+            self.assertGreaterEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_ccl_a)
 
     def test_a_hold_at_its_target_curtails_surplus_pv_instead_of_filling(self):
         # SP15/SP23/SP28 and plan B2: at the destination the band closes and
         # the lead with it, every charger is commanded the hold voltage and
         # the surplus is simply declined -- no harvest to burn back later.
         # Measured: 60.400 % -> 60.292 % over 2 h under 1400 W of sun, peak
-        # 60.413 %, 2.57 kWh of available PV not taken.
-        with self.simulation(plant_config=PlantConfig(initial_soc=60.4), target=60) as sim:
+        # 60.413 %, 2.57 kWh of available PV not taken. The Quattro is parked
+        # by "prefer renewable energy" as it is on the boat by day: with both
+        # chargers on one voltage, a charging Quattro (a few hundredths over
+        # its command) would carry the DC loads instead of the sun.
+        with self.simulation(plant_config=PlantConfig(initial_soc=60.4, prefer_renewable=1),
+                             target=60) as sim:
             sim.set_load(ac_w=300, dc_w=50)
             sim.set_sun((600, 800))
             self.manual_protocol(sim)
@@ -668,12 +673,13 @@ class AdapterBoundaryTests(unittest.TestCase):
                           **self.request_hold(sim))
             self.assertLess(max(socs), 60.6)
             self.assertGreater(sim.plant.energy.pv_curtailed_wh, curtailed + 500)
-            # curtailed by CURRENT, with the MPPT band intact so PV still
-            # carries the DC loads on shore
+            # curtailed by VOLTAGE (3.6.0): the MPPTs sit on the hold voltage,
+            # voltage-limited and tracking, and still carry the DC loads on
+            # shore; the charge limit is the floor's, never near zero
             hold_v = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
-            self.assertEqual(sim.rec.lead_v, sim.rec.cfg.sustain_band_v)
-            self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v + sim.rec.cfg.sustain_band_v, delta=.03)
-            self.assertLessEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_trim_max_a)
+            self.assertEqual(sim.rec.lead_v, 0.0)
+            self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v, delta=.03)
+            self.assertGreaterEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_ccl_a)
             self.assertGreater(sum(sim.plant.pv_w), 20)
 
     def test_a_hold_below_target_opens_the_band_and_closes_it_on_arrival(self):
@@ -699,9 +705,12 @@ class AdapterBoundaryTests(unittest.TestCase):
                           **self.request_hold(sim))
             self.assertGreaterEqual(max(socs), 59.9)
             self.assertLess(max(socs), 60.3)
-            # arrived: the band stays, the charge limit closes
-            self.assertEqual(sim.rec.lead_v, sim.rec.cfg.sustain_band_v)
-            self.assertLessEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_trim_max_a)
+            # arrived (3.6.0): the band closes, every charger sits on the
+            # hold voltage and the charge limit stays the floor's
+            self.assertEqual(sim.rec.lead_v, 0.0)
+            self.assertAlmostEqual(sim.plant.dvcc.solar_v,
+                                   sim.rec.batt['/RecBms/Sustain/HoldVoltage'], delta=.03)
+            self.assertGreaterEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_ccl_a)
 
     def test_a_descent_answers_a_refill_from_any_source(self):
         # E08/D07/SP40: alternating an hour of darkness and an hour of

@@ -48,7 +48,7 @@ TOPICS = {
         'RecBms/Sustain/Active': 'hold', 'RecBms/Sustain/Mode': 'hold_mode',
         'RecBms/Sustain/Soc': 'hold_soc', 'RecBms/Sustain/HoldVoltage': 'hold_v',
         'RecBms/Sustain/Servo': 'hold_servo', 'RecBms/Sustain/ChargeLimit': 'hold_ccl',
-        'RecBms/Sustain/TrimA': 'trim', 'RecBms/Sustain/Status': 'hold_status',
+        'RecBms/Sustain/Status': 'hold_status',
         'RecBms/SolarBoost/Active': 'boost', 'RecBms/SolarBoost/Applied': 'boost_v',
         'RecBms/SolarBoost/WindowOpen': 'boost_window', 'RecBms/SolarBoost/Status': 'boost_status',
         'RecBms/SolarLead': 'lead', 'RecBms/LeadFault': 'lead_fault',
