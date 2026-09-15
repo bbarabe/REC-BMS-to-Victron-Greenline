@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.5.0"
+VERSION = "3.5.1"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1407,6 +1407,14 @@ class RecBmsDriver:
             return False
         if volts <= 0:
             self._boost_clear("released by requester")
+            return True
+        if self.boost["active"] and abs(self.boost["volts"] - volts) < 1e-6:
+            # 3.5.1: a re-request of the running boost keeps it alive (the
+            # engine does this while a measured departure is imminent, so
+            # the limit never drops back before the relay); the expiry
+            # restarts, the clamp is re-checked every tick regardless.
+            self.boost["req_ts"] = time.monotonic()
+            self._pub["/RecBms/SolarBoost/Status"] = "ramp"
             return True
         ok, why = self._boost_allowed(volts)
         if not ok:

@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.20"
+ENGINE_VERSION = "4.21"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -112,6 +112,14 @@ ENGINE_DEFAULTS = {
     # 0.1 A / 6 W under a 75 V sky, boat 2026-09-15), so the boost, which
     # lifts that limit, is gated on daylight alone.
     "BOOST_CAPPED_A": 3,
+    # 4.21: once a boost shows the sun covering the need, the boost is kept
+    # alive (re-requested this often) until the departure, so the charge
+    # limit never drops back between the measurement and the relay: on the
+    # boat (2026-09-15 22:05 UTC) a 7 s gap between the boost's expiry and
+    # the probe's own boost re-capped the MPPTs, DVCC switched the larger
+    # one off, its tracker restarted cold at open-circuit voltage and the
+    # probe measured 40 W from a 650 W array.
+    "BOOST_KEEPALIVE_MS": 60000,
     # 4.9: on the sustain floor the MPPTs sit one solar band above the
     # bank and run unthrottled, so the capture IS the capacity and a probe
     # proves nothing (2026-09-10: one probe, est 572 W vs need 529 W, both
@@ -231,7 +239,7 @@ def fresh_state(now, t):
         "suspendTrigStart": 0, "suspendStart": 0, "suspendBase": 0,
         "resumeStart": 0, "suspendPrev": None,
         "battWinLong": [], "mdl6": None, "mdl7": None, "vocRef": None,
-        "lastBoostTs": 0, "lockoutUntil": 0,
+        "lastBoostTs": 0, "boostKeepTs": 0, "lockoutUntil": 0,
         "oneway": None, "sustainSent": 0, "sustainAssert": 0,
     }
 
@@ -659,6 +667,9 @@ class Engine:
                     and pvNow >= needW * t["SOLAR_MARGIN"]):
                 st["cap6"] = capture(st["cap6"], m6, y6)
                 st["cap7"] = capture(st["cap7"], m7, y7)
+                # (the keepalive that keeps the lifted limit until the
+                # departure lives in the shore branch, gated like the
+                # departure itself)
             # Signed measured Quattro DC voltage * current is authoritative.
             # Missing metering is never reconstructed from mixed-age totals.
             quattroW = inp.quattro_w.v
@@ -726,6 +737,15 @@ class Engine:
 
                 gateOk = (sinceTrans >= t["COOLDOWN_MS"] and now >= st["backoffUntil"]
                           and now >= st["lockoutUntil"])
+                if (ready and gateOk and boosting
+                        and (now - st["boostKeepTs"]) >= t["BOOST_KEEPALIVE_MS"]):
+                    # 4.21: the departure is imminent (ready, nothing gating
+                    # it): re-request the boost so it cannot expire during
+                    # the confirm. A gated engine (cooldown, backoff) lets
+                    # it expire -- a lifted limit is a bank filling at full
+                    # sun, not something to hold through a backoff.
+                    boostMsg[0] = t["BOOST_V"]
+                    st["boostKeepTs"] = now
 
                 if owd and ready and gateOk and (now - st["readySince"]) >= t["READY_MS"]:
                     # No probe: nothing to prove, the loads may run the bank

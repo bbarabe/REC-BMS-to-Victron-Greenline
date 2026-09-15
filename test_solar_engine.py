@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.20")
+check("engine version bumped", SP.ENGINE_VERSION == "4.21")
 Val = SP.Val
 
 
@@ -438,10 +438,21 @@ s.tick(60, soc=60, target=80, pv=30.0, m=2, voc=75.0, load=1000.0, batt_v=56.4) 
 s.tick(400, pv=5.0, m=1)                                                          # capped, as on the boat
 s.tick(10, boost_active=1, pv=200.0, m=2)                                         # the boost lifts the cap; ramping
 check("4.20: no capture while the boost is under the need", s.eng.st["cap6"]["w"] < 100, s.eng.st["cap6"])
+before = len(s.boosts)
 s.tick(1, pv=1300.0)                                                              # covers the ~1140 W need
 check("4.20: capture taken the moment the boost covers the need", abs(s.eng.st["cap6"]["w"] - 1300.0) < 1, s.eng.st["cap6"])
+check("4.21: the boost is re-requested the moment coverage is seen", len(s.boosts) == before + 1 and s.boosts[-1] == s.t["BOOST_V"], s.boosts)
 s.tick(40)
 check("4.20: departure does not wait for the boost to end", s.state in ("probe", "solar"), s.state)
+# A gated engine lets the boost expire: coverage under a lockout re-requests
+# nothing (a mere backoff is released early by capacity evidence, as always).
+s = Sim()
+s.tick(60, soc=60, target=80, pv=30.0, m=2, voc=75.0, load=1000.0, batt_v=56.4)
+s.tick(400, pv=5.0, m=1)
+s.eng.st["lockoutUntil"] = s.now + 3600000
+before = len(s.boosts)
+s.tick(120, boost_active=1, pv=1300.0, m=2)
+check("4.21: no keepalive while the departure is gated", len(s.boosts) == before and s.state == "shore", (s.boosts, s.state))
 
 # ---- 4.19: a current cap makes the yield meaningless; boost on daylight ----
 s = Sim()
