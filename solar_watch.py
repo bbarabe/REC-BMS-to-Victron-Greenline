@@ -116,17 +116,26 @@ def record(args):
         for topic in lookup:
             client.subscribe(topic)
         received['at'] = time.time()
-        print('%s connected (rc %s), %d topics' % (time.strftime('%H:%M:%S', time.gmtime()), rc, len(lookup)), flush=True)
+        print('%s connected to %s (rc %s), %d topics' % (
+            time.strftime('%H:%M:%S', time.gmtime()), hosts[current['i']], rc, len(lookup)), flush=True)
+        edges.append((time.time(), 'recorder_host', None, hosts[current['i']]))
 
     def on_message_wrapped(client, userdata, msg):
         received['at'] = time.time()
         on_message(client, userdata, msg)
 
+    # The Cerbo has two addresses (wifi0 and eth0, the latter only while
+    # the Simrad is on) and swapped between them twice on the night of
+    # 2026-09-14: each silence is retried on the same host first, then the
+    # next host in the list is tried, round robin, so an address change
+    # costs the recorder a few minutes rather than the rest of the night.
+    hosts = [h.strip() for h in args.host.split(',') if h.strip()]
+    current = {'i': 0}
     client = mqtt.Client()
     client.on_connect = on_connect
     client.on_message = on_message_wrapped
     client.reconnect_delay_set(min_delay=1, max_delay=30)
-    client.connect(args.host, 1883, 60)
+    client.connect(hosts[0], 1883, 60)
     client.loop_start()
     deadline = time.time() + args.hours * 3600
     last_keepalive = 0.0
@@ -149,6 +158,13 @@ def record(args):
                     client.reconnect()
                 except Exception as exc:
                     print('reconnect failed: %s' % exc, flush=True)
+                    if len(hosts) > 1:
+                        current['i'] = (current['i'] + 1) % len(hosts)
+                        print('trying %s' % hosts[current['i']], flush=True)
+                        try:
+                            client.connect(hosts[current['i']], 1883, 60)
+                        except Exception as exc2:
+                            print('connect to %s failed: %s' % (hosts[current['i']], exc2), flush=True)
             row = dict(latest)
             row['t'] = round(now, 1)
             if now - received['at'] > 10:
@@ -209,7 +225,8 @@ def summary(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--host', default='192.168.50.107')
+    ap.add_argument('--host', default='192.168.50.107,192.168.50.170',
+                    help='comma-separated addresses to try in turn (wifi0 first, eth0 second)')
     ap.add_argument('--portal', default='102c6b8611dd')
     ap.add_argument('--vebus', type=int, default=276)
     ap.add_argument('--battery', type=int, default=200)
