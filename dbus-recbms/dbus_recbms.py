@@ -111,7 +111,8 @@ class Config:
         self.policy_prefer_renewable = str(policy.get('prefer_renewable', 'auto')).strip().lower()
         if self.policy_prefer_renewable not in ('auto', 'off'):
             raise ValueError('policy prefer_renewable must be auto or off')
-        self.policy_dawn_pv_a = max(0.0, self._number(policy.get('dawn_pv_a', 1.0)))
+        self.policy_dawn_voc_v = max(0.0, self._number(policy.get('dawn_voc_v', 60)))
+        self.policy_dusk_voc_v = max(0.0, self._number(policy.get('dusk_voc_v', 50)))
         self.policy_dawn_s = max(0.0, self._number(policy.get('dawn_s', 600)))
         self.policy_day_deficit_pct = max(0.0, self._number(policy.get('day_deficit_pct', 1.0)))
         self.policy_mppt_instances = tuple(int(v.strip()) for v in policy.get('mppt_instances', '278,279').split(','))

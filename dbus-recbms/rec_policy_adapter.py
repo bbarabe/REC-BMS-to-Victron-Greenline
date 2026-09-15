@@ -203,7 +203,7 @@ class RecPolicyAdapter:
                          '/Dc/0/Voltage', '/BatteryOperationalLimits/MaxChargeCurrent',
                          '/BatteryOperationalLimits/MaxChargeVoltage', '/Dc/0/MaxChargeCurrent')
                 if source_role.startswith('solar'):
-                    paths = ('/Yield/Power', '/MppOperationMode', '/Connected', '/Dc/0/Current',
+                    paths = ('/Yield/Power', '/MppOperationMode', '/Connected', '/Dc/0/Current', '/Pv/V',
                              '/Dc/0/Voltage', '/Link/ChargeVoltage', '/Link/ChargeCurrent',
                              '/Settings/ChargeCurrentLimit', '/Link/VoltageSense',
                              '/Link/VoltageSenseActive')
@@ -272,21 +272,29 @@ class RecPolicyAdapter:
         return new
 
     def _daylight(self, now):
-        """True once PV current has been at least dawn_pv_a for dawn_s,
-        False once it has been under the floor's pv_min_a for dusk_s, None
-        until either has happened. Two timers with a gap between their
-        thresholds, so a passing cloud changes nothing and each edge comes
-        once a day."""
+        """True once the brightest array's voltage has been at least
+        dawn_voc_v for dawn_s, False once every array has read under
+        dusk_voc_v for dusk_s, None until either has happened. The ARRAY
+        voltage, never the PV current: on shore the hold's cap curtails the
+        current to a tenth of an amp under a bright sky (2026-09-15), which a
+        current-based rule would have called night at two in the afternoon.
+        Two timers with a gap between their thresholds, so a passing cloud
+        changes nothing and each edge comes once a day."""
         cfg = self.driver.cfg
-        pv = self.driver._fresh_pv(now)
-        if pv is None:
+        volts = []
+        for instance in getattr(cfg, 'policy_mppt_instances', (278, 279)):
+            v = finite(self._value('solar%d' % instance, '/Pv/V', now))
+            if v is not None:
+                volts.append(v)
+        brightest = max(volts) if volts else None
+        if brightest is None:
             self.light_since = self.dark_since = None
-        elif pv >= cfg.policy_dawn_pv_a:
+        elif brightest >= cfg.policy_dawn_voc_v:
             self.dark_since = None
             self.light_since = now if self.light_since is None else self.light_since
             if now - self.light_since >= cfg.policy_dawn_s:
                 self.daylight = True
-        elif pv < cfg.sustain_pv_min_a:
+        elif brightest < cfg.policy_dusk_voc_v:
             self.light_since = None
             self.dark_since = now if self.dark_since is None else self.dark_since
             if now - self.dark_since >= cfg.sustain_dusk_s:
