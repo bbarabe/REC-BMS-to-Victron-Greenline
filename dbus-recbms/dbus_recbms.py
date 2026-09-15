@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.4.1"
+VERSION = "3.4.2"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1687,7 +1687,19 @@ class RecBmsDriver:
                 # a floor never holds more than the owner set, a ceiling never
                 # less: the servo judges the bank against the bounded value
                 held_eff = min(su["soc"], slider) if floor else max(su["soc"], slider)
-            if now - su["servo_ts"] >= c.sustain_servo_s:
+            if now - su["servo_ts"] >= c.sustain_servo_s and self.boost["active"]:
+                # 3.4.2: a solar boost is a MEASUREMENT -- the charge limit
+                # is lifted on purpose and the bank fills on purpose for two
+                # minutes. Regulating on that would be regulating on our own
+                # experiment: the boat's first boost on 3.4.1 (2026-09-15
+                # 20:50 UTC) wound the trim from 0 to -2.0 A because the
+                # unthrottled arrays filled the held bank, and the moment
+                # the boost ended the limit fell back onto its 0.1 A floor,
+                # which is exactly the starvation the boost was meant to
+                # cure. The servo and the trim stand still while a boost
+                # runs; the period restarts when it ends.
+                su["servo_ts"] = now
+            elif now - su["servo_ts"] >= c.sustain_servo_s:
                 su["servo_ts"] = now
                 d = sustain_servo(su["mode"], soc - held_eff, charging,
                                   c.sustain_servo_db, draining, filling)

@@ -424,6 +424,34 @@ class RecDriverSafetyTests(unittest.TestCase):
         period(49.95, 0.5)
         self.assertEqual(su['trim_a'], 0.0)
 
+    def test_a_hold_stands_still_while_a_boost_measures(self):
+        # Boat, 2026-09-15 20:50 UTC, the first boost on 3.4.1: the lifted
+        # limit let the arrays fill the held bank at 6 A for two minutes,
+        # the trim answered that fill with -2.0 A, and when the boost ended
+        # the limit fell straight back onto its 0.1 A floor. A boost is our
+        # own measurement: neither the trim nor the servo may regulate on
+        # it. Both resume, on a fresh period, once it ends.
+        self.driver.settings['chargeslider'] = 50
+        self.driver.sp_enabled = True
+        self.tick()
+        self.assertTrue(self.driver._set_sustain(3))
+        su = self.driver.sustain
+        self.driver._sustain_anchor(50.0, 55.6, 0.0, 'test')
+
+        def period(soc, amps):
+            self.now += self.cfg.sustain_servo_s
+            self.driver._set_sustain(3)
+            self.driver._service_sustain(self.now, soc, 50.0, 55.6, amps)
+
+        self.driver.boost['active'] = True
+        for _ in range(4):
+            period(50.2, 6.0)                               # filling above target under a boost
+        self.assertEqual(su['trim_a'], 0.0)
+        self.assertEqual(su['servo_v'], 0.0)
+        self.driver.boost['active'] = False
+        period(50.2, 6.0)                                   # the same fill, boost over: trim answers
+        self.assertAlmostEqual(su['trim_a'], -self.cfg.sustain_trim_a, places=3)
+
     def test_a_re_asserted_hold_keeps_its_anchor_and_refreshes_expiry(self):
         self.driver.settings['chargeslider'] = 80
         self.tick()
