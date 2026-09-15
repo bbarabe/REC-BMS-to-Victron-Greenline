@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.4.2"
+VERSION = "3.5.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -105,6 +105,15 @@ class Config:
         self.policy_consumer_instance = int(policy.get('consumer_instance', 221))
         if self.policy_ac_input not in ('auto', 1, 2):
             raise ValueError('policy shore_ac_input must be auto, 1 or 2')
+        # 3.5.0: the Quattro's "Prefer renewable energy" toggle, managed
+        # daily (policy_contract.prefer_renewable_wanted): 'auto' manages
+        # it, 'off' never touches it.
+        self.policy_prefer_renewable = str(policy.get('prefer_renewable', 'auto')).strip().lower()
+        if self.policy_prefer_renewable not in ('auto', 'off'):
+            raise ValueError('policy prefer_renewable must be auto or off')
+        self.policy_dawn_pv_a = max(0.0, self._number(policy.get('dawn_pv_a', 1.0)))
+        self.policy_dawn_s = max(0.0, self._number(policy.get('dawn_s', 600)))
+        self.policy_day_deficit_pct = max(0.0, self._number(policy.get('day_deficit_pct', 1.0)))
         self.policy_mppt_instances = tuple(int(v.strip()) for v in policy.get('mppt_instances', '278,279').split(','))
         self.policy_parameters = dict(cp['control']) if cp.has_section('control') else {}
         c = cp["can"] if cp.has_section("can") else {}

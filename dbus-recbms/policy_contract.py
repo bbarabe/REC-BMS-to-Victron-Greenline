@@ -127,6 +127,36 @@ def resolve_shore_input(configured, types, active_input, available, last):
     return 1, 'default'
 
 
+def prefer_renewable_wanted(mode, daylight, soc, reference, deficit_pct, last):
+    """What the Quattro's "Prefer renewable energy" toggle should read:
+    1 = prefer solar, 0 = charge now, None = leave it alone.
+
+    Owner, 2026-09-15: "charge now in the evening, prefer solar in the
+    morning", once a day, an occasional reversal being no harm. Solar
+    Priority off leaves the owner's own setting alone. DISCHARGE keeps
+    solar preferred day and night: the descent is the plan. CHARGE and HOLD
+    prefer solar by day and charge now by night, and by day fall back to
+    charging only once the bank is a full `deficit_pct` under its floor or
+    target (a dark day), holding that until it is back inside the band so
+    the toggle does not chatter. Unknown daylight keeps the last decision.
+    Pure, so both the fixture and the boat run the same rule.
+    """
+    if mode not in ('CHARGE', 'HOLD', 'DISCHARGE'):
+        return None, 'solar priority off: left alone'
+    if mode == 'DISCHARGE':
+        return 1, 'discharge: the descent is the plan'
+    if daylight is None:
+        return last, 'daylight not known yet'
+    if not daylight:
+        return 0, 'night: charge now'
+    if soc is not None and reference is not None:
+        if soc < reference - deficit_pct:
+            return 0, 'day deficit: %.1f%% is %.1f under %.1f%%: charge now' % (soc, reference - soc, reference)
+        if last == 0 and soc < reference:
+            return 0, 'day deficit: charging back to %.1f%%' % reference
+    return 1, 'day: prefer solar'
+
+
 class TransferSupervisor:
     """All relay purposes share dwell, feedback accounting, fault and backoff.
 

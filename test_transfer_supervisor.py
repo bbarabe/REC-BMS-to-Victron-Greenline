@@ -9,7 +9,7 @@ from pathlib import Path
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parent / 'dbus-recbms'))
-from policy_contract import PolicyContract, TransferSupervisor, resolve_shore_input
+from policy_contract import PolicyContract, TransferSupervisor, resolve_shore_input, prefer_renewable_wanted
 
 
 class TransferBoundaryTests(unittest.TestCase):
@@ -292,6 +292,29 @@ class ShoreInputResolverTests(unittest.TestCase):
         self.assertEqual(resolve_shore_input('auto', (0, 0), 240, (0, 1), None), (2, 'only input available'))
         self.assertEqual(resolve_shore_input('auto', (0, 0), 240, (1, 1), None), (1, 'default'))
         self.assertEqual(resolve_shore_input('auto', (None, None), None, (None, None), None), (1, 'default'))
+
+
+class PreferRenewableTests(unittest.TestCase):
+    """The Quattro's prefer-renewable toggle, once a day (owner, 2026-09-15)."""
+
+    def test_off_and_discharge(self):
+        self.assertEqual(prefer_renewable_wanted('OFF', True, 50.0, 60.0, 1.0, None), (None, 'solar priority off: left alone'))
+        self.assertEqual(prefer_renewable_wanted('DISCHARGE', False, 40.0, 30.0, 1.0, 0)[0], 1)
+        self.assertEqual(prefer_renewable_wanted('DISCHARGE', True, 40.0, 30.0, 1.0, None)[0], 1)
+
+    def test_day_and_night(self):
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 50.0, 50.0, 1.0, None), (1, 'day: prefer solar'))
+        self.assertEqual(prefer_renewable_wanted('CHARGE', False, 50.0, 50.0, 1.0, 1), (0, 'night: charge now'))
+        self.assertEqual(prefer_renewable_wanted('HOLD', None, 50.0, 50.0, 1.0, 1)[0], 1)   # unknown: keep
+        self.assertEqual(prefer_renewable_wanted('HOLD', None, 50.0, 50.0, 1.0, None)[0], None)
+
+    def test_a_dark_day_charges_once_the_bank_is_a_point_under_and_holds_until_back(self):
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 49.2, 50.0, 1.0, 1)[0], 1)   # within a point: solar
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 48.9, 50.0, 1.0, 1)[0], 0)   # a point under: charge
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 49.5, 50.0, 1.0, 0)[0], 0)   # recovering: still charge
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 50.0, 50.0, 1.0, 0)[0], 1)   # back inside: solar
+        self.assertEqual(prefer_renewable_wanted('CHARGE', True, 58.9, 60.0, 1.0, 1)[0], 0)
+        self.assertEqual(prefer_renewable_wanted('CHARGE', True, None, 60.0, 1.0, 1)[0], 1) # no SOC: no deficit call
 
 
 if __name__ == '__main__':

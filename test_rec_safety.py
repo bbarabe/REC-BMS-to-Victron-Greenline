@@ -241,7 +241,8 @@ class RecDriverSafetyTests(unittest.TestCase):
                 left = self.driver.batt['/RecBms/SolarBoost/SecondsLeft']
                 self.assertTrue(0 <= left <= self.cfg.boost_hold_s - elapsed + 1, (elapsed, left))
                 self.assertLessEqual(self.driver.batt['/RecBms/Sustain/SecondsLeft'], self.cfg.sustain_hold_s - elapsed + 1)
-        self.now += 3
+        # Past the boost's own expiry (240 s since 2026-09-15), on monotonic time.
+        self.now += max(3, self.cfg.boost_hold_s - (self.now - start) + 1)
         feed_complete(self.driver.bms, self.now)
         self.tick()
         self.assertEqual(self.driver.batt['/RecBms/SolarBoost/Active'], 0)

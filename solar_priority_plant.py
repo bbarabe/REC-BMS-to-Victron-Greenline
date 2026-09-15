@@ -41,6 +41,13 @@ CONTROL = "/Ac/Control/IgnoreAcIn%d"
 STATE = "/Ac/State/IgnoreAcIn%d"
 AVAILABLE = "/Ac/State/AcIn%dAvailable"
 IGNORE = CONTROL % 1
+# The Quattro's "prefer renewable energy" setting, writable on the VE.Bus
+# service. With it set and shore connected the charger does not charge the
+# bank at all: it sits in sustain (state 244), measured on the boat
+# 2026-09-15 as zero amps for an hour while the DC loads drained the bank at
+# 0.8 A on shore. This vebus service publishes no /State, so 244 has nowhere
+# to go here; /Dc/0/Current is the fact the services read.
+PREFER = "/Dc/0/PreferRenewableEnergy"
 BASE = "/Info/MaxChargeVoltage"
 CCL = "/Info/MaxChargeCurrent"
 
@@ -76,6 +83,11 @@ class PlantConfig:
     # power on the shore input, nothing on the other). An explicit (type1,
     # type2) pair overrides that: (0, 0) is a GX nobody ever configured.
     gx_input_types: tuple = None
+    # The Quattro's "prefer renewable energy" setting as seeded on the plant
+    # (/Dc/0/PreferRenewableEnergy): 1 keeps the charger in sustain while
+    # shore is connected -- no bank charging, no covering of the DC loads --
+    # 0 charges to the DVCC limits as before. 0 is every other scenario here.
+    prefer_renewable: int = 0
     pv_ramp_w_s: float = 100.0
     quattro_ramp_w_s: float = 200.0
     quattro_voltage_bias_v: float = 0.08
@@ -600,6 +612,9 @@ class ChargerPlant:
         self.alternate_available = False
         self.on_alternate = False
         self.ignore = 0
+        if config.prefer_renewable not in (0, 1):
+            raise ValueError("prefer_renewable must be 0 or 1")
+        self.prefer_renewable = int(config.prefer_renewable)
         self.rec_cvl, self.rec_ccl, self.rec_dcl = 62.7, 200.0, 400.0
         self.energy, self.relay_edges, self.commands = Energy(), [], []
         self.policy_mode = ''
@@ -625,6 +640,10 @@ class ChargerPlant:
         if kind == 'ignore':
             self.ignore = int(value)
             self.update_connection('command')
+        elif kind == 'prefer_renewable':
+            self.prefer_renewable = int(value)
+            self.commands.append({'time_s': self.clock.elapsed, 'kind': kind,
+                                  'value': self.prefer_renewable})
         else:
             setattr(self, kind, float(value))
             self.commands.append({'time_s': self.clock.elapsed, 'kind': kind,
@@ -642,6 +661,16 @@ class ChargerPlant:
                                      'connected': connected, 'cause': cause})
             if connected:
                 self.quattro.reconnect()
+
+    @property
+    def charger_enabled(self):
+        """A connected Quattro charges only while renewables are not preferred.
+
+        With the preference set the charger sits in sustain: no current to the
+        bank and none covering the DC loads either. The inverter is not running
+        on shore, so its idle is not drawn in that state.
+        """
+        return self.connected and not self.prefer_renewable
 
     @staticmethod
     def ramp(old, target, rate, dt):
@@ -669,8 +698,10 @@ class ChargerPlant:
         hardware_cap = min(c.quattro_max_w, shore_capacity)
         q_voltage = self.quattro.voltage_v + c.quattro_voltage_bias_v
         q_voltage_w = q_voltage * (q_voltage - ocv) / c.resistance_ohm + demand - sum(self.pv_w)
-        self.q_w = self.quattro.advance(self.elapsed_s, dt, self.connected, self.dvcc.quattro_v,
-            self.q_permission_a, self.voltage, q_voltage_w, hardware_cap)
+        # Sustain is not a disconnection: the bus, the shore pass-through and
+        # the relay state are untouched, only the charger's contribution is.
+        self.q_w = self.quattro.advance(self.elapsed_s, dt, self.charger_enabled,
+            self.dvcc.quattro_v, self.q_permission_a, self.voltage, q_voltage_w, hardware_cap)
         self.pv_voltage_v = QuattroResponse.respond(self.pv_voltage_v, self.dvcc.solar_v, dt,
                                                     c.pv_voltage_response_s)
         # All sources share the terminal; each MPPT also has its own sense and
@@ -889,8 +920,9 @@ class CoupledSimulation:
             "/Ac/Out/L1/P": self.plant.ac_w, "/Ac/In/1/CurrentLimit": 32.0,
             "/Dc/0/Voltage": self.plant.voltage, "/Dc/0/Current": 0.0,
             "/Dc/0/Power": 0.0, "/BatteryOperationalLimits/MaxChargeCurrent": 0.0,
-            "/BatteryOperationalLimits/MaxChargeVoltage": self.plant.base_v},
-            writable=(CONTROL % 1, CONTROL % 2))
+            "/BatteryOperationalLimits/MaxChargeVoltage": self.plant.base_v,
+            PREFER: self.plant.prefer_renewable},
+            writable=(CONTROL % 1, CONTROL % 2, PREFER))
         # localsettings is a service like any other here: the GX's AC input
         # types are read over the bus AND watched on a DbusMonitor tree, so
         # the same two values the store answers GetValue with are published.
@@ -927,6 +959,10 @@ class CoupledSimulation:
             kind, delay = "offset_v", self.latency.offset_s
         elif name == VEBUS and path == CONTROL % self.plant.shore_input:
             kind, delay = "ignore", self.latency.relay_s
+        elif name == VEBUS and path == PREFER:
+            # A Quattro setting, applied over the same VE.Bus as the relay
+            # command and therefore on the same latency.
+            kind, delay = "prefer_renewable", self.latency.relay_s
         elif name == VEBUS and path in (CONTROL % 1, CONTROL % 2):
             # A command written to the input shore is NOT on cannot move the
             # transfer switch: it would only strand an ignore on an input

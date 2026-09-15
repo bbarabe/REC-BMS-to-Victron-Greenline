@@ -67,9 +67,9 @@
   "solarboost": {
     "enabled": "true",
     "max_boost_v": "0.30",
-    "hold_s": "120",
-    "measure_start_s": "75",
-    "measure_len_s": "30",
+    "hold_s": "240",
+    "measure_start_s": "180",
+    "measure_len_s": "45",
     "cell_max_v": "4.05",
     "cell_min_t": "5",
     "cell_max_t": "45",
@@ -115,6 +115,10 @@
     "capacity_version": "rated-1440",
     "calendar_timezone": "UTC",
     "shore_ac_input": "auto",
+    "prefer_renewable": "auto",
+    "dawn_pv_a": "1.0",
+    "dawn_s": "600",
+    "day_deficit_pct": "1.0",
     "consumer_service_suffix": "solarpriority",
     "consumer_instance": "221",
     "mppt_instances": "278,279"

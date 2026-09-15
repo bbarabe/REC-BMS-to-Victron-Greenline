@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.19"
+ENGINE_VERSION = "4.20"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -648,6 +648,17 @@ class Engine:
                 needW = None
             covers = lambda watts: needW is not None and watts >= needW
             needTxt = "%.0f" % needW if needW is not None else "?"
+            # 4.20: a boost whose live yield already covers the need does
+            # not wait for its measurement window. The captures are taken
+            # now, so the evidence outlives the boost, and `ready` (which
+            # judges est = max(live, evidence)) leaves shore after its own
+            # 30 s confirm -- the bank fills at full sun for that half
+            # minute, not for the whole boost (owner, 2026-09-15: "we
+            # shouldn't wait the full probe time").
+            if (boosting and not windowOpen and needW is not None
+                    and pvNow >= needW * t["SOLAR_MARGIN"]):
+                st["cap6"] = capture(st["cap6"], m6, y6)
+                st["cap7"] = capture(st["cap7"], m7, y7)
             # Signed measured Quattro DC voltage * current is authoritative.
             # Missing metering is never reconstructed from mixed-age totals.
             quattroW = inp.quattro_w.v

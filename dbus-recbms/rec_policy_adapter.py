@@ -6,7 +6,7 @@ import time
 
 from control_inputs import DemandModel, SourceRegistry, LoadServiceEvidence, TimedMean, finite, normalize_bus_snapshot, selected_battery_matches
 from energy_accounting import EnergyLedger
-from policy_contract import PolicyContract, TransferSupervisor, dumps, resolve_shore_input
+from policy_contract import PolicyContract, TransferSupervisor, dumps, resolve_shore_input, prefer_renewable_wanted
 from rec_control_config import ControlConfig
 from policy_telemetry import PolicyTelemetry
 
@@ -54,6 +54,15 @@ class RecPolicyAdapter:
         self.shore_input_reason = 'restored' if self.shore_input else ''
         self.gx_input_types = (None, None)
         self.gx_types_at = None
+        # 3.5.0: the Quattro's "Prefer renewable energy" toggle, managed
+        # daily. daylight: True/False/None (not yet known).
+        self.daylight = None
+        self.light_since = None
+        self.dark_since = None
+        self.prefer_wanted = None
+        self.prefer_last = None
+        self.prefer_reason = ''
+        self.prefer_written_at = None
         self.discovery_at = None
         self.discovery_names = None
         self.read_issued = {}
@@ -189,6 +198,7 @@ class RecPolicyAdapter:
                          '/Connected', '/Ac/ActiveIn/ActiveInput', '/Ac/ActiveIn/Connected',
                          '/Ac/State/AcIn1Available', '/Ac/State/AcIn2Available',
                          '/Ac/State/IgnoreAcIn1', '/Ac/State/IgnoreAcIn2',
+                         '/Dc/0/PreferRenewableEnergy',
                          '/Ac/Out/L1/P', '/Dc/0/Power', '/Dc/0/Current',
                          '/Dc/0/Voltage', '/BatteryOperationalLimits/MaxChargeCurrent',
                          '/BatteryOperationalLimits/MaxChargeVoltage', '/Dc/0/MaxChargeCurrent')
@@ -260,6 +270,63 @@ class RecPolicyAdapter:
             self.ledger.save()
         self.shore_input_reason = reason
         return new
+
+    def _daylight(self, now):
+        """True once PV current has been at least dawn_pv_a for dawn_s,
+        False once it has been under the floor's pv_min_a for dusk_s, None
+        until either has happened. Two timers with a gap between their
+        thresholds, so a passing cloud changes nothing and each edge comes
+        once a day."""
+        cfg = self.driver.cfg
+        pv = self.driver._fresh_pv(now)
+        if pv is None:
+            self.light_since = self.dark_since = None
+        elif pv >= cfg.policy_dawn_pv_a:
+            self.dark_since = None
+            self.light_since = now if self.light_since is None else self.light_since
+            if now - self.light_since >= cfg.policy_dawn_s:
+                self.daylight = True
+        elif pv < cfg.sustain_pv_min_a:
+            self.light_since = None
+            self.dark_since = now if self.dark_since is None else self.dark_since
+            if now - self.dark_since >= cfg.sustain_dusk_s:
+                self.daylight = False
+        return self.daylight
+
+    def _prefer_renewable(self, now, mode, soc, target):
+        """Own the Quattro's "Prefer renewable energy" toggle the way the
+        relay is owned: decide (policy_contract.prefer_renewable_wanted),
+        compare with the read-back value, write only on a difference and at
+        most once a minute, and publish wanted / actual / reason."""
+        cfg = self.driver.cfg
+        actual = self._value('vebus', '/Dc/0/PreferRenewableEnergy', now)
+        actual = int(actual) if actual in (0, 1) else None
+        if getattr(cfg, 'policy_prefer_renewable', 'auto') != 'auto':
+            self.prefer_wanted, self.prefer_reason = None, 'not managed (policy prefer_renewable = off)'
+            return actual
+        hold = self.driver.sustain
+        reference = target
+        if mode == 'CHARGE' and hold.get('active') and hold.get('mode') == 1 and hold.get('soc') is not None:
+            reference = hold['soc']
+        wanted, reason = prefer_renewable_wanted(mode, self._daylight(now), soc, reference,
+                                                 cfg.policy_day_deficit_pct, self.prefer_last)
+        self.prefer_wanted, self.prefer_reason = wanted, reason
+        if wanted is None:
+            return actual
+        self.prefer_last = wanted
+        name = self.sources_names.get('vebus')
+        if actual is None or not name:
+            self.prefer_reason = reason + ' (toggle not readable)'
+            return actual
+        if actual != wanted and (self.prefer_written_at is None or now - self.prefer_written_at >= 60):
+            self.prefer_written_at = now
+            try:
+                code = self.driver.sbus.call_blocking(name, '/Dc/0/PreferRenewableEnergy', BUSITEM,
+                                                      'SetValue', 'v', [wanted], timeout=2)
+            except Exception as exc:
+                code = exc
+            log.info('prefer renewable energy %d -> %d (%s; write %s)', actual, wanted, reason, code)
+        return actual
 
     def _release_input(self, number, now):
         state = self._value('vebus', '/Ac/State/IgnoreAcIn%d' % number, now)
@@ -659,6 +726,9 @@ class RecPolicyAdapter:
                        protect=False, limited_by='', overhead_category=None,
                        actuator={})
         self.control = control
+        prefer_actual = self._prefer_renewable(now, mode, soc if raw_valid else None, target)
+        prefer = {'wanted': self.prefer_wanted, 'actual': prefer_actual,
+                  'reason': self.prefer_reason, 'daylight': self.daylight}
         actual_load_service, load_service_proven = self._update_load_service(
             now, pv_w, voltage * current,
             raw_valid and selected and connected is False and demand.get('valid') and actuators['coherent'])
@@ -719,6 +789,19 @@ class RecPolicyAdapter:
                 grace = False
             if protective and not urgent:
                 intent, protective = 'connected', False
+            boost_cleared = False
+            if intent != 'island' and connected is False and self.driver.boost['active']:
+                # 3.5.0: a return closes the relay on the prepared pair AND
+                # the current cap. A solar boost lifts that cap for its
+                # whole length (240 s now), and a return that starts inside
+                # one would otherwise be "prepared" against a raw limit
+                # (fixture: closures at 200 A). The measurement is over the
+                # moment the island is being left: clear it here, and hold
+                # this tick's readiness back -- the limit the driver computed
+                # this tick is still the lifted one -- so the cap is what the
+                # readback has to confirm before the relay moves.
+                self.driver._boost_clear('return to shore')
+                boost_cleared = True
             # Exact command readbacks gate new departures. Once islanded,
             # changed setpoints and missing MPPT telemetry do not fabricate a
             # battery deficit; the engine owns its observed-power decision
@@ -740,7 +823,7 @@ class RecPolicyAdapter:
             if connected is False and intent == 'island':
                 transfer_ready = envelope_ok if grace else safe
             elif intent == 'connected':
-                transfer_ready = bool(voltage_ready and current_ready and protected)
+                transfer_ready = bool(voltage_ready and current_ready and protected and not boost_cleared)
             else:
                 transfer_ready = ready
             command = self.transfer.step(intent, now, wall, ready=transfer_ready,
@@ -754,6 +837,7 @@ class RecPolicyAdapter:
         status.update(mode=control['mode'], ready=ready, lease_valid=lease,
                       source_valid=source_valid, departure_allowed=departure_allowed,
                       shore_ac_input=self.shore_input, shore_ac_input_reason=self.shore_input_reason,
+                      prefer_renewable=prefer,
                       request_current=lease, sources_coherent=actuators['coherent'],
                       departure_available=bool(connected is True and not self.transfer.departure_reason(now, wall)),
                       actuator_settled=bool(control.get('actuator', {}).get('settled', False)), limits={k: control[k] for k in ('quattro_v', 'solar_v', 'ccl_a')},
@@ -761,8 +845,9 @@ class RecPolicyAdapter:
         ledger = self.ledger.snapshot(compact=True)
         public_ledger = {k: ledger[k] for k in ('total', 'overhead', 'references', 'budget', 'reverse', 'buffer',
                                                'net_wh', 'net_ah', 'gap_count', 'complete_history', 'capacity_version', 'calendar_days', 'recovery')}
-        snapshot = {'version': 2, 'implementation_version': '3.4.0',
+        snapshot = {'version': 2, 'implementation_version': '3.5.0',
                     'configuration_id': self.configuration_id, 'shore_ac_input': self.shore_input,
+                    'prefer_renewable': prefer,
                     'shore_ac_input_reason': self.shore_input_reason,
                     'shore_ac_input_configured': self.driver.cfg.policy_ac_input,
                     'wall_s': wall, 'sample_monotonic_s': stamp,

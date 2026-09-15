@@ -672,6 +672,64 @@ class RestoredPlantTests(unittest.TestCase):
                              {'/Ac/Control/IgnoreAcIn2'})
             self.assertEqual([c for c in sim.plant.commands if c['kind'] == 'ignore_wrong_input'], [])
 
+    def prefer_status(self, sim):
+        """What REC says about the Quattro's renewable preference, or {}."""
+        raw = sim.rec.batt.values.get('/RecBms/Policy/Status')
+        return ((json.loads(raw) if raw else {}).get('prefer_renewable') or {})
+
+    def prefer_applied(self, sim):
+        """The preference values the plant actually took, in order. Only a
+        CHANGE is published and applied, so the list is the edges themselves."""
+        return [c['value'] for c in sim.plant.commands if c['kind'] == 'prefer_renewable']
+
+    def test_prefer_renewable_is_solar_by_day_and_charge_now_by_night(self):
+        # The boat runs with "Prefer renewable energy" set (2026-09-15): while
+        # it is 1 and shore is connected the Quattro does not charge the bank
+        # at all -- the charger sits in sustain and the DC loads drain the
+        # bank on shore (measured: zero amps for an hour at 0.8 A of drain).
+        # REC owns that toggle the way it owns the relay: prefer solar by day,
+        # charge now at night, one edge each way, and the night is still the
+        # hold's -- the Quattro covers the loads at the hold voltage.
+        from solar_priority_plant import PREFER, PlantConfig
+        with self.simulation(target=60,
+                             plant_config=PlantConfig(prefer_renewable=1, initial_soc=60)) as sim:
+            sim.set_load(ac_w=300, dc_w=160)
+            sim.set_sun([700, 700])
+            sim.run(4 * 3600)
+            self.assertEqual(sim.solar.last_request['mode'], 'HOLD')
+            self.assertEqual(sim.vebus[PREFER], 1)
+            self.assertEqual(sim.plant.q_w, 0.0, 'the charger charged while in sustain')
+            self.assertEqual(self.prefer_status(sim).get('wanted'), 1)
+            self.assertEqual(self.prefer_applied(sim), [], 'the day was not left preferred')
+            # Dusk is the floor's own rule: PV under pv_min_a for dusk_s.
+            dark_at = sim.clock.elapsed
+            sim.set_sun([0, 0])
+            self.until(sim, lambda: sim.vebus[PREFER] == 0,
+                       timeout=int(sim.rec.cfg.sustain_dusk_s) + 300)
+            status = self.prefer_status(sim)
+            self.assertEqual(status.get('wanted'), 0)
+            self.assertRegex(status.get('reason', ''), 'dusk|night')
+            # The published actual is a read-back, one poll behind the write.
+            sim.run(30)
+            self.assertEqual(self.prefer_status(sim).get('actual'), 0)
+            self.assertEqual(sim.rec.batt.values.get('/RecBms/Policy/Telemetry/PreferRenewable'), 0)
+            sim.run(4 * 3600 - (sim.clock.elapsed - dark_at))
+            self.assertTrue(sim.plant.connected)
+            self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 3)
+            self.assertAlmostEqual(sim.plant.soc, 60.0, delta=0.5)
+            # Dawn: PV current back over the dawn threshold for dawn_s.
+            light_at = sim.clock.elapsed
+            sim.set_sun([700, 700])
+            self.until(sim, lambda: sim.vebus[PREFER] == 1, timeout=900)
+            self.assertEqual(self.prefer_status(sim).get('wanted'), 1)
+            sim.run(3600 - (sim.clock.elapsed - light_at))
+            self.assertAlmostEqual(sim.plant.soc, 60.0, delta=0.5)
+            # Exactly one edge each way over the whole scenario; the plant
+            # started out preferred.
+            applied = [1] + self.prefer_applied(sim)
+            self.assertEqual([(was, now) for was, now in zip(applied, applied[1:]) if was != now],
+                             [(1, 0), (0, 1)])
+
 
 if __name__ == '__main__':
     unittest.main()
