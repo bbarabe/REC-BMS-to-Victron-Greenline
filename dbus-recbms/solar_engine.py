@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.26"
+ENGINE_VERSION = "4.27"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -459,6 +459,13 @@ class Engine:
             p6, p7 = c6["w"] / t["MDL_SHARE6"], c7["w"] / t["MDL_SHARE7"]
             balance = (min(p6, p7) / max(p6, p7)) if max(p6, p7) > 0 else None
         shaded = balance is not None and balance < t["SHADE_BALANCE_MIN"]
+        # 4.26/4.27: dbus-recbms' hold (Sustain/Active) and an array at its
+        # limit under it. REC 3.7 holds the chargers at the bank's own
+        # notch, so an MPPT reporting "limited" (mode 1) under the hold is
+        # curtailed by that notch, not by the sun: it has more to give.
+        held = inp.sustain_active is not None and inp.sustain_active.v == 1
+        limited_any = any(m is not None and m.v == 1 for m in (m6, m7))
+        curtailed = held and limited_any
         if st["vocRef"] is None or now - st["vocRef"]["ts"] >= t["MDL_VOC_TAU_MS"]:
             st["vocRef"] = {"v": vocMax, "ts": now}
         vocRising = vocMax > st["vocRef"]["v"] + t["VOC_RISE_V"]
@@ -782,13 +789,12 @@ class Engine:
                 # not dark, and its yield says nothing, as under the cap.
                 # The floor keeps its say under a dim sky (a dusk or a
                 # marina light at 55-65 V), which is where it earned it.
-                held = inp.sustain_active is not None and inp.sustain_active.v == 1
-                curtailed = capped or (held and throttled_any and vocMax >= t["VOC_EXPLORE_V"])
+                blind = capped or (curtailed and vocMax >= t["VOC_EXPLORE_V"])
                 # 4.22: never a boost where it has no room (a charge target
                 # within BOOST_V of the installation's limit): the blind
                 # probe measures there instead.
                 if (not boosting and dayOk and vocMax >= t["VOC_DAY_V"] and not vocRising
-                        and (pvNow >= t["BOOST_MIN_PV_W"] or curtailed) and not unthrottled
+                        and (pvNow >= t["BOOST_MIN_PV_W"] or blind) and not unthrottled
                         and not aboveCvl and not shoreMissing and soc.v >= minSoc
                         and quattroW <= t["SURPLUS_QUIET_W"] and not owd and not noBoostRoom
                         and inp.departure_allowed
@@ -1015,9 +1021,23 @@ class Engine:
                 # surplus repays, never below zero.
                 if st["drawdownTs"]:
                     hours = max(0.0, now - st["drawdownTs"]) / 3600000.0
-                    st["drawdownWh"] = max(0.0, st["drawdownWh"] - batt.v * hours)
+                    # 4.27: a drain under the hold with an array at its
+                    # limit is the REC shedding SOC it holds above target
+                    # (boat 2026-09-16 22:27 UTC: its SOC servo stepped the
+                    # notch under the bank, 1 kW of sun, both MPPTs limited,
+                    # the bank at -5 A, and the budget was counting it as a
+                    # solar deficit -- a return to shore in full sun, then
+                    # the next departure, then the same again). The arrays
+                    # have more to give, so it is no deficit and does not
+                    # accrue; a surplus still repays. The SOC floor and the
+                    # drift exit stay as the backstops.
+                    delta = -batt.v * hours
+                    if delta > 0 and curtailed:
+                        delta = 0.0
+                    st["drawdownWh"] = max(0.0, st["drawdownWh"] + delta)
                 st["drawdownTs"] = now
                 drawdown = st["drawdownWh"]
+                holdDrain = " [hold drain]" if (curtailed and batt.v < 0) else ""
                 budget = t["ISLAND_DEFICIT_WH"]
 
                 if loadNow.v >= t["SUSPEND_LOAD_W"]:
@@ -1068,12 +1088,12 @@ class Engine:
                 elif drawdown > 0:
                     status[0] = "yellow" if drawdown >= budget / 2 else "green"
                     status[1] = "SOLAR | PV %.0fW batt %s%.0fW load %.0fW SOC %.1f%% [drawdown %.0f/%.0f Wh]" % (
-                        pvNow, "+" if batt.v >= 0 else "", batt.v, loadNow.v, soc.v, drawdown, budget)
+                        pvNow, "+" if batt.v >= 0 else "", batt.v, loadNow.v, soc.v, drawdown, budget) + holdDrain
                 else:
                     status[0] = "green"
                     status[1] = ("SOLAR drain +%.2fV | PV " % (battV.v - effCvl) if draining else "SOLAR | PV ") + \
                         "%.0fW batt %s%.0fW load %.0fW SOC %.1f%%" % (
-                            pvNow, "+" if batt.v >= 0 else "", batt.v, loadNow.v, soc.v)
+                            pvNow, "+" if batt.v >= 0 else "", batt.v, loadNow.v, soc.v) + holdDrain
 
         if oneway and status[1] and not status[1].startswith("->"):
             status[1] = "%s %s->%.0f%% | %s" % (

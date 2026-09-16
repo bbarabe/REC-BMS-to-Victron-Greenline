@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.26")
+check("engine version bumped", SP.ENGINE_VERSION == "4.27")
 Val = SP.Val
 
 
@@ -533,6 +533,44 @@ check("4.26: no boost on a trickle without a hold or a cap", s.boosts == [], str
 s = Sim()
 s.tick(400, soc=60, pv=2.0, m=2, voc=75.0, load=1000.0, batt_v=56.4, sustain_active=1)   # held, tracker live: unthrottled (4.9)
 check("4.26: no boost while a held array tracks unthrottled", s.boosts == [], str(s.boosts))
+
+# ---- 4.27: a drain under the hold's notch is not a solar deficit ----
+# Boat 2026-09-16 22:27 UTC: islanded under 1 kW of sun, the REC's SOC servo
+# stepped the notch under the bank (SOC 0.4 over target), both MPPTs limited,
+# the bank at -5 A -- and the drawdown budget counted it toward a return.
+def held_island():
+    s = Sim()
+    s.tick(1, soc=60, target=80, batt_v=56.4)
+    s.tick(340)
+    s.tick(95, batt=160.0, cvl=59.49)                    # on solar with a surplus
+    return s
+s = held_island()
+s.tick(1200, batt=-300.0, load=340.0, pv=150.0, m=1, sustain_active=1)   # 20 min at -300 W, arrays limited
+check("4.27: a drain under the hold with a limited array does not accrue",
+      s.state == "solar" and s.eng.st["drawdownWh"] == 0.0, "%s %.1f" % (s.state, s.eng.st["drawdownWh"]))
+check("4.27: the status names the hold's drain", "[hold drain]" in s.out.status_text, s.out.status_text)
+s = held_island()
+s.tick(1200, batt=-300.0, load=340.0, pv=150.0, m=2, sustain_active=1)   # arrays tracking: a real deficit
+check("4.27: the same drain with the arrays tracking is a deficit and returns",
+      s.state == "shore" and any(tr.startswith("-> SHORE (deficit: ") for tr in s.transitions), str(s.transitions[-1:]))
+s = held_island()
+s.tick(1200, batt=-300.0, load=340.0, pv=0.0, m=0, sustain_active=1)     # night under the hold: a deficit
+check("4.27: a drain at night under the hold still returns", s.state == "shore", s.state)
+s = held_island()
+s.tick(1200, batt=-300.0, load=340.0, pv=150.0, m=1, sustain_active=0)   # no hold: 4.17 unchanged
+check("4.27: without a hold a limited array does not excuse the drain",
+      any(tr.startswith("-> SHORE (deficit: ") for tr in s.transitions), str(s.transitions))
+s = held_island()
+s.tick(130, batt=-1100.0, load=1700.0)                                   # a 40 Wh heater burst on record
+s.tick(1000, batt=160.0, load=300.0, m=1, sustain_active=1)              # a surplus under the hold still repays
+check("4.27: a surplus under the hold repays the drawdown", s.eng.st["drawdownWh"] == 0.0 and s.state == "solar",
+      "%s %.1f" % (s.state, s.eng.st["drawdownWh"]))
+s = held_island()
+for k in range(1, 61):                                                   # the drift exit stays: SOC falls 2.5 %
+    s.tick(20, batt=-300.0, load=340.0, pv=150.0, m=1, sustain_active=1, soc=60 - k * 0.05)
+check("4.27: the SOC drift exit still guards a hold drain",
+      any(tr.startswith("-> SHORE (SOC ") for tr in s.transitions) and s.eng.st["drawdownWh"] == 0.0,
+      "%s %.1f" % (str(s.transitions), s.eng.st["drawdownWh"]))
 
 # ---- the SOC floor still wins ----
 s = Sim()
