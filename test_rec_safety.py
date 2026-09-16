@@ -275,9 +275,7 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.assertAlmostEqual(self.plant.base, hold_v, places=2)
         # At the destination (3.6.0) the band closes: the lead in force is
         # nothing, every charger is commanded the hold voltage and the bank
-        # is regulated by that voltage. The charge limit stays the floor's
-        # PV + charge_limit_a -- a real constraint, never the near-zero
-        # figure that had DVCC switch an MPPT off (boat, 2026-09-15).
+        # is regulated by that voltage alone.
         self.driver.settings['chargeslider'] = 60
         self.tick()
         self.assertEqual(self.driver.lead_v, 0.0)
@@ -723,12 +721,15 @@ class SustainPrimitiveTests(unittest.TestCase):
                         R.sustain_hold(self.HOLD, 60.0, soc, charging, sun), 60.0,
                         (soc, charging, sun))
 
-    def test_hold_servo_answers_a_drain_up_and_anything_above_target_down(self):
+    def test_hold_servo_answers_a_drain_up_and_nothing_at_the_destination(self):
+        # 3.6.1: sustain_servo serves a two-sided hold only while its band is
+        # open. The arrival latch hands the bank at or above its destination
+        # to hold_current_servo, so nothing here may step a hold down.
         db = .1
         servo = lambda err, charging, draining, filling=False: R.sustain_servo(
             self.HOLD, err, charging, db, draining, filling)
-        # Clearly under the destination: up, draining or not -- the Quattro
-        # is capped at charge_limit_a under a hold, so the step fills gently.
+        # Clearly under the destination: up, draining or not -- every charger
+        # sits on the hold voltage there, so the step fills gently.
         self.assertEqual(servo(-.5, False, True), 1)
         self.assertEqual(servo(-.5, False, False), 1)
         self.assertEqual(servo(-.5, False, False, True), 1)
@@ -740,13 +741,11 @@ class SustainPrimitiveTests(unittest.TestCase):
         self.assertEqual(servo(-.15, False, False), 0)
         self.assertEqual(servo(-.15, True, False), 0)
         self.assertEqual(servo(-.11, False, False, True), 0)
-        # Above it (3.6.0): down while anything fills it, the Quattro or the
-        # sun -- the hold regulates by voltage at its destination and a fill
-        # means the hold voltage sits over the bank. A bank sitting still or
-        # draining above is left to the loads, never answered by starving
-        # the MPPTs of voltage.
-        self.assertEqual(servo(.5, True, False), -1)
-        self.assertEqual(servo(.5, False, False, True), -1)
+        # At or above the destination: nothing, whatever is happening. The
+        # 3.6.0 rule "down while anything fills it" went with the SOC landing
+        # it served; hold_current_servo owns the bank from the arrival on.
+        self.assertEqual(servo(.5, True, False), 0)
+        self.assertEqual(servo(.5, False, False, True), 0)
         self.assertEqual(servo(.5, False, False), 0)
         self.assertEqual(servo(.5, False, True), 0)
         # Inside the deadband nothing moves either way.

@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.22")
+check("engine version bumped", SP.ENGINE_VERSION == "4.23")
 Val = SP.Val
 
 
@@ -50,7 +50,6 @@ class Sim:
         self.eng.st["cooldownFrom"] = self.now
         self.inp = SP.Inputs()
         self.inp.enabled = True
-        self.inp.feed_shore = 0
         self.v = dict(soc=60.0, batt=0.0, load=300.0, pv=500.0, m=2, voc=60.0,
                       batt_v=56.6, cvl=56.62, target=None, ac_available="auto")
         self.cmd, self.sustain = 0, 0

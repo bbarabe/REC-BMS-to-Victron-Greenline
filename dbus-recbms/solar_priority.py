@@ -24,8 +24,8 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.5.4"
-ENGINE_VERSION = "4.22-restored"
+VERSION = "3.5.5"
+ENGINE_VERSION = "4.23-restored"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -213,12 +213,9 @@ class SolarPriorityDriver:
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self.now0 = time.time()
         self.inp = Inputs()
         self.shore_input = cfg.ac_in if cfg.ac_in in (1, 2) else None
         self.shore_input_reason = "configured" if self.shore_input else ""
-        self.inp.feed_shore = (self.shore_input or 1) - 1
-        self.last_status = None
         self.engine = Engine(cfg.engine, self._ms(), self._engine_log)
         self.generation = None
         self.request_id = 0
@@ -295,7 +292,6 @@ class SolarPriorityDriver:
             log.info("shore AC input %s -> %d (%s)", self.shore_input, new, reason)
             self.shore_input = new
         self.shore_input_reason = reason
-        i.feed_shore = new - 1
         i.ac_available = i.ac1_available if new == 1 else i.ac2_available
 
     def _engine_log(self, msg):

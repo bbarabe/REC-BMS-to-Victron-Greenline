@@ -352,7 +352,7 @@ class PlantService(stubs.FakeService):
 class DelayedMonitor:
     def __init__(self, bus, tree, valueChangedCallback=None,
                  deviceAddedCallback=None, deviceRemovedCallback=None, **kwargs):
-        self.bus, self.tree = bus, tree
+        self.bus = bus
         self.changed, self.added, self.removed = (
             valueChangedCallback, deviceAddedCallback, deviceRemovedCallback)
         self.cache = {(name, path): value for name, service in bus.services.items()
@@ -596,7 +596,7 @@ class ChargerPlant:
         self.current = self.battery_w = 0.0
         self.ac_w, self.dc_w = 300.0, 60.0
         self.sun_w, self.pv_w = [500.0, 900.0], [0.0, 0.0]
-        self.q_w = self.smoothed_pv_w = 0.0
+        self.q_w = 0.0
         self.q_permission_a = 0.0
         self.base_v, self.offset_v = config.initial_base_v, config.initial_offset_v
         self.pv_voltage_v = self.solar_v
@@ -693,7 +693,6 @@ class ChargerPlant:
         self.dvcc.update(self.elapsed_s, self.voltage, self.pv_w, self.q_w - inverter_w,
                          self.dc_w, self.ccl_a, self.base_v, self.solar_v)
         self.q_permission_a = self.dvcc.quattro_a
-        self.smoothed_pv_w = sum(self.dvcc.pv_a) * self.voltage
         shore_capacity = max(0.0, c.shore_max_w - self.ac_w) * c.charger_efficiency
         hardware_cap = min(c.quattro_max_w, shore_capacity)
         q_voltage = self.quattro.voltage_v + c.quattro_voltage_bias_v
@@ -777,7 +776,6 @@ class CoupledSimulation:
         self.bus = DelayedBus(self.clock, self.latency)
         self.tempdir = tempfile.TemporaryDirectory(prefix="solar-priority-plant-")
         self._patches = ExitStack()
-        self.bus_factory_calls = []
         self.rec_running = self.solar_running = True
         self.missing_can = set()
         self.trace = []
@@ -801,8 +799,7 @@ class CoupledSimulation:
         # Patch dependency factories rather than inventing driver helpers. Missing
         # startup functions/imports must fail exactly as they would on the boat.
         for name in ('SystemBus', 'SessionBus'):
-            def connect(private=False, factory=name):
-                self.bus_factory_calls.append({'factory': factory, 'private': bool(private)})
+            def connect(private=False):
                 return self.bus
             self._patches.enter_context(patch.object(stubs.dbus, name, connect))
         # These are public dbus-python types absent from the minimal shared stub.
@@ -866,9 +863,7 @@ class CoupledSimulation:
         self.solar_cfg = self.solar_module.Config(str(solar_config_dir / "solar_priority.ini"))
         if configure_solar:
             configure_solar(self.solar_cfg)
-        before_solar = len(self.bus_factory_calls)
         self.solar = self.solar_module.SolarPriorityDriver(self.solar_cfg)
-        self.solar_bus_calls = self.bus_factory_calls[before_solar:]
         self.publish_measurements()
         self.bus.drain()
 
@@ -926,7 +921,7 @@ class CoupledSimulation:
         # localsettings is a service like any other here: the GX's AC input
         # types are read over the bus AND watched on a DbusMonitor tree, so
         # the same two values the store answers GetValue with are published.
-        self.gx_settings = self._source(SETTINGS, 0,
+        self._source(SETTINGS, 0,
             {GX_INPUT % n: self.bus.settings[GX_INPUT % n] for n in (1, 2)})
         self.arrays = [self._source(name, instance, {"/Pv/V": 70.0,
             "/Yield/Power": 0.0, "/MppOperationMode": 2, "/Dc/0/Current": 0.0,
@@ -1124,18 +1119,6 @@ class CoupledSimulation:
 
     def set_enabled(self, enabled):
         self.solar._set_enabled(bool(enabled), persist=True)
-
-    def stop_rec(self, stalled=False):
-        """Kill or stall the whole publisher, including its D-Bus callbacks."""
-        self.rec_running = False
-        names = [self.rec.batt.name]
-        if hasattr(self.rec, 'sw'):
-            names.append(self.rec.sw.name)
-        for name in names:
-            if stalled:
-                self.bus.unresponsive.add(name)
-            else:
-                self.bus.remove(name)
 
     def stop_solar(self, stalled=False):
         self.solar_running = False

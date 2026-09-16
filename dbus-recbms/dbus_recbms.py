@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.7.0"
+VERSION = "3.7.1"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -654,14 +654,14 @@ def sustain_servo(mode, err, charging, deadband, draining=True, filling=False):
     a sunny plateau with PV carrying the loads at the ceiling -- is not
     filling and is left alone (SP38).
 
-    Hold (mode 3, v3.2.0): two-sided. Under its destination and still
-    draining -> up, exactly as the floor. Above it -> down whatever is
-    responsible: the sun, the Quattro, or simply a bank the loads should
-    be allowed to bring down at night. (The old release left the slider
-    curve with the 0.15 V standing lead under it, the Quattro sat below
-    the bank and a steady -49 W drained 1.448 points in 24 h: E04/D03.)
-    A bank still under its destination that solar is raising is left
-    alone -- finishing the last bit is the band's job.
+    Hold (mode 3, v3.2.0): two-sided, and since 3.6.1 this function
+    serves it only while its band is still open -- the bank more than a
+    servo deadband under its destination. Under it and still draining
+    -> up, exactly as the floor. A bank still under its destination that
+    solar is raising is left alone -- finishing the last bit is the
+    band's job. At or above the destination the arrival latch
+    (_sustain_destination) hands regulation to hold_current_servo, so
+    nothing here answers a bank above its target.
 
     3.3.2: the unconditional lift ("up whenever under, draining or not")
     applies only while the bank is clearly under -- more than two
@@ -672,19 +672,11 @@ def sustain_servo(mode, err, charging, deadband, draining=True, filling=False):
     took the whole offset away, loads included, so the bank drained
     again: a 30-minute limit cycle at the band's edge.
 
-    3.6.0: above its destination the hold answers a fill from ANY source
-    with a step down, as the ceiling does. The hold now regulates its
-    destination by voltage -- every charger on the hold voltage, no
-    solar band, a current limit that is a real constraint and never
-    near zero -- so the sun CAN fill the bank there when the hold
-    voltage sits over it, and a fill is the sign that it does. A bank
-    sitting still above the destination (0 A, the chargers carrying the
-    loads at its own rest voltage) is left alone, as a ceiling's sunny
-    plateau is (SP38): nothing charges it further, and the loads take it
-    down whenever they exceed what the chargers give at that voltage.
-    3.6.1: this function serves the hold only while the band is open
-    (the bank under its destination); at the destination the finer
-    current servo takes over (hold_current_servo).
+    3.6.1: the 3.6.0 rule "above its destination, down while ANYTHING
+    fills the bank" is gone with the SOC landing it served. The arrival
+    latch means a hold at or above its destination never reaches this
+    function at all, and hold_current_servo lands the chargers on the
+    loads in finer steps from the bank's own current instead.
     """
     if mode == SUSTAIN_FLOOR:
         if err < -deadband and draining:
@@ -698,19 +690,11 @@ def sustain_servo(mode, err, charging, deadband, draining=True, filling=False):
         # (and, with charge_limit_a set, under the floor's PV +
         # charge_limit_a brake), so a step up fills gently instead of
         # winding the command ahead of a 200 A charger (the v1.8.1 case);
-        # within two deadbands only while draining (3.3.2).
-        # Down while anything fills the bank above its destination: the
-        # Quattro's bias over its command, or the sun through a hold
-        # voltage that ended up over the bank (3.6.0). Never on a bank
-        # merely sitting above: stepping down on a resting bank would only
-        # starve every charger of voltage (a hold servoed under the bank
-        # left the MPPTs at 0 W for four sunny hours in the fixture,
-        # 2026-09-14) without bringing it down any faster -- the loads set
-        # that pace.
+        # within two deadbands only while draining (3.3.2). Nothing on a
+        # bank at or above its destination: the arrival latch hands that
+        # to hold_current_servo (3.6.1), so the band is always open here.
         if err < -deadband:
             return 1 if (draining or err < -2 * deadband) else 0
-        if err > deadband and (charging or filling):
-            return -1
         return 0
     if mode == SUSTAIN_CEILING and (charging or filling):
         return -1
@@ -839,8 +823,6 @@ class RecBmsDriver:
         # expires on its own, so a restart always comes up on the real slider.
         self.sustain = self._sustain_idle()
         self.last_target = None
-        self._last_offset_warn = 0.0
-        self.eff_cv = None                  # (volts or None, ts) from systemcalc
         self.pv_current = None              # (amps or None, ts) from systemcalc
         self.charge_guard_reason = ""
         self.applied_reason = ""            # why _voltage_applied last said no
@@ -2043,7 +2025,6 @@ class RecBmsDriver:
                 v = None
         except Exception:
             v = None
-        self.eff_cv = (v, time.monotonic())
         self._pub["/RecBms/DvccEffectiveChargeVoltage"] = v
         # v1.7.0: is Solar Priority on? Its setting; absent (driver not
         # installed) reads as off, and then no lead is applied.
@@ -2599,9 +2580,8 @@ class RecBmsDriver:
             s["/RecBms/Raw/" + name] = raw if health[group]["valid"] else None
         s["/RecBms/SafeChargeVoltage"] = safe_voltage
         s["/RecBms/Phase"] = phase_name
-        policy_control = self.policy_adapter.tick(
-            live, slider, soc, volts, amps, self._slider_cvl(slider), safe_voltage,
-            ccl)
+        self.policy_adapter.tick(
+            live, slider, soc, volts, amps, safe_voltage, ccl)
         s["/RecBms/EqStatus"] = eq_label
         s["/RecBms/TimeToFull"] = _q(ttf, c.time_step)
         force = (1 if bms.get("forceCharge") else 0) if live else 0

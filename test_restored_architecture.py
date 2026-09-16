@@ -222,14 +222,13 @@ class RestoredPlantTests(unittest.TestCase):
             self.assertEqual((request['mode'], request['requested_limits']['sustain'],
                               request['transfer_intent']), ('CHARGE', 1, 'connected'))
             self.assertIn('No data: QuattroDC', sim.solar.sw['/SolarPriority/Status'])
-            self.assertGreater(sim.rec.batt[CCL], 100)            # 3.7.0: the BMS's own limit, no brake
+            # 3.7.0: no charge-limit modulation under any hold -- what goes
+            # out IS the BMS's own limit. The bank is held by the command on
+            # it, asserted next; the fixture's adversarial Quattro (0.08 V
+            # over its command through 3 mOhm) is answered by the floor's
+            # servo, not by a current cap.
+            self.assertEqual(sim.rec.batt[CCL], sim.plant.rec_ccl)
             self.assertLessEqual(sim.rec.batt[BASE], sim.plant.voltage + .1)
-            # 3.7.0: with no charge-limit brake the fixture's adversarial
-            # Quattro (0.08 V over its command through 3 mOhm) puts 1.4 kW
-            # into the bank at the hold voltage until the floor's servo
-            # steps it back; the old 400 W bound was the brake's. What is
-            # guaranteed is the command on the bank, asserted above; the
-            # boat's charge-now nights show the real charger's figure.
             sim.bus.invalid.discard((VEBUS, '/Dc/0/Current'))
             sim.run(10)
             self.assertNotIn('No data', sim.solar.sw['/SolarPriority/Status'])
@@ -249,12 +248,13 @@ class RestoredPlantTests(unittest.TestCase):
                               request['transfer_intent']), ('CHARGE', 1, 'connected'))
             sim.run(30)
             self.assertLessEqual(sim.rec.batt[BASE], sim.plant.voltage + .1)
-            self.assertGreater(sim.rec.batt[CCL], 100)            # 3.7.0: the BMS's own limit, no brake
+            self.assertEqual(sim.rec.batt[CCL], sim.plant.rec_ccl)   # 3.7.0: no modulation
             # Stage A: the source-loss return is prepared like any other --
-            # the hold and its cap were applied before the AC input was accepted.
+            # the hold's voltage was applied before the AC input was accepted,
+            # and the limit that closed with it is the BMS's own.
             self.assertTrue(closure, 'the return never closed the relay')
             self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
-            self.assertGreater(closure['ccl_a'], 100)             # 3.7.0: the BMS's own limit, no brake
+            self.assertEqual(closure['ccl_a'], sim.plant.rec_ccl)
             self.assertTrue(json.loads(sim.rec.batt['/RecBms/Policy/Status'])['transfer']['prepared'])
 
     def ignore_offset(self, sim):
@@ -309,7 +309,7 @@ class RestoredPlantTests(unittest.TestCase):
             # own limit (3.7.0), and the Quattro is still commanded the hold
             # voltage, not a band under it
             self.assertEqual(sim.solar.last_request['mode'], 'CHARGE')
-            self.assertGreater(sim.rec.batt[CCL], 100)
+            self.assertEqual(sim.rec.batt[CCL], sim.plant.rec_ccl)
             hold = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
             self.assertAlmostEqual(sim.rec.batt['/RecBms/Voltage/RequestedQuattro'], hold, delta=.011)
             self.assertAlmostEqual(sim.rec.batt['/RecBms/Voltage/RequestedSolar'], hold + .3, delta=.011)
@@ -444,7 +444,7 @@ class RestoredPlantTests(unittest.TestCase):
             self.assertEqual((request['mode'], request['transfer_intent'],
                               request['requested_limits']['sustain']), ('CHARGE', 'connected', 1))
             self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
-            self.assertGreater(closure['ccl_a'], 100)             # 3.7.0: the BMS's own limit, no brake
+            self.assertEqual(closure['ccl_a'], sim.plant.rec_ccl)  # 3.7.0: no modulation
             status = json.loads(sim.rec.batt['/RecBms/Policy/Status'])
             self.assertTrue(status['transfer']['prepared'])
             self.assertIsNone(status['transfer']['last_fault'])
@@ -616,7 +616,7 @@ class RestoredPlantTests(unittest.TestCase):
             self.assertTrue(closure)
             self.assertEqual(closure['request']['requested_limits']['sustain'], 3)
             self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
-            self.assertGreater(closure['ccl_a'], 100)             # 3.7.0: the BMS's own limit, no brake
+            self.assertEqual(closure['ccl_a'], sim.plant.rec_ccl)  # 3.7.0: no modulation
             shore_before = sim.plant.energy.shore_charge_wh
             sim.run(3600)
             self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 3)

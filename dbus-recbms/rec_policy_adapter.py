@@ -72,15 +72,12 @@ class RecPolicyAdapter:
         self.last_measurement_stamp = None
         self.measurement_was_valid = None
         self.control = {}
-        self.last_snapshot = {}
-        self.last_connected = None
         self.settle_since = None
         self.settle_last = None
         self.unpermitted_since = None
         self.attribution_observation = None
         self.attribution_island_since = None
         self.attribution_last_now = None
-        self.recovery_since = None
         self.load_service = LoadServiceEvidence(self.config.stable_admission_s,
             self.config.reverse_response_s, self.config.reverse_power_w, self.config.source_gap_s)
         self.pv_activity = TimedMean(self.config.stable_admission_s)
@@ -657,7 +654,7 @@ class RecPolicyAdapter:
             self.driver._set_boost(limits['boost_v'])
             self.last_boost_id = request['request_id']
 
-    def tick(self, raw_valid, target, soc, voltage, current, target_voltage, safe_voltage, ccl):
+    def tick(self, raw_valid, target, soc, voltage, current, safe_voltage, ccl):
         now, wall = self.clock.monotonic(), self.clock.time()
         self._poll(now)
         own_name = 'com.victronenergy.battery.' + self.driver.cfg.batt_suffix
@@ -707,12 +704,10 @@ class RecPolicyAdapter:
             voltage, current, pv_w)
         actuators['support_coherent'] = bool(actuators['support_coherent'] and raw_valid and selected
                                              and connected is not None)
-        actuators['solar_attribution_valid'] = solar_surplus is not None and solar_surplus > 0
-        interval = {'charge_wh': 0.0, 'discharge_wh': 0.0}
         if measurement_valid and stamp is not None and stamp != self.last_measurement_stamp:
             if self.measurement_was_valid is False:
                 self.ledger.mark_gap('battery_measurement_recovered')
-            interval = self.ledger.sample(
+            self.ledger.sample(
                 stamp, wall, self.driver.bms['current'], self.driver.bms['voltage'], valid=True,
                 soc=soc if raw_valid else None,
                 overhead_category=self.control.get('overhead_category'),
@@ -737,10 +732,9 @@ class RecPolicyAdapter:
         prefer_actual = self._prefer_renewable(now, mode, soc if raw_valid else None, target)
         prefer = {'wanted': self.prefer_wanted, 'actual': prefer_actual,
                   'reason': self.prefer_reason, 'daylight': self.daylight}
-        actual_load_service, load_service_proven = self._update_load_service(
+        _, load_service_proven = self._update_load_service(
             now, pv_w, voltage * current,
             raw_valid and selected and connected is False and demand.get('valid') and actuators['coherent'])
-        self.last_connected = connected
         discharge_permitted = (raw_valid and self.driver.bms.get('dcl', 0) > 0 and
             not self.driver.bms.get('modulesBlockingDischarge') and not self.driver.bms.get('modulesOffline'))
         source_valid = bool(raw_valid and selected and connected is not None and
@@ -800,14 +794,15 @@ class RecPolicyAdapter:
             boost_cleared = False
             if intent != 'island' and connected is False and self.driver.boost['active']:
                 # 3.5.0: a return closes the relay on the prepared pair AND
-                # the current cap. A solar boost lifts that cap for its
-                # whole length (240 s now), and a return that starts inside
-                # one would otherwise be "prepared" against a raw limit
-                # (fixture: closures at 200 A). The measurement is over the
-                # moment the island is being left: clear it here, and hold
-                # this tick's readiness back -- the limit the driver computed
-                # this tick is still the lifted one -- so the cap is what the
-                # readback has to confirm before the relay moves.
+                # whatever current cap is configured. A solar boost lifts
+                # that cap for its whole length (240 s now), and a return
+                # that starts inside one would otherwise be "prepared"
+                # against a raw limit (fixture: closures at 200 A). The
+                # measurement is over the moment the island is being
+                # left: clear it here, and hold this tick's readiness back
+                # -- the limit the driver computed this tick is still the
+                # lifted one -- so the cap is what the readback has to
+                # confirm before the relay moves.
                 self.driver._boost_clear('return to shore')
                 boost_cleared = True
             # Exact command readbacks gate new departures. Once islanded,
@@ -874,7 +869,6 @@ class RecPolicyAdapter:
                           'required_dc_w': demand.get('admission_w')}
         self.telemetry.publish(self.driver._pub, status, snapshot, ledger=ledger,
             solar_evidence=solar_evidence, sources=self.sources, source_names=self.sources_names, now=now)
-        self.last_snapshot = snapshot
         return control
 
     def shutdown(self):

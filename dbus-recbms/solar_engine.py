@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.22"
+ENGINE_VERSION = "4.23"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -119,9 +119,11 @@ ENGINE_DEFAULTS = {
     # dbus-recbms' sustain charge-current cap for two minutes for nothing.
     "BOOST_MIN_PV_W": 20,
     # 4.19: under a charge current limit this small the yield says nothing
-    # about the sun (the hold curtails PV by current at its destination:
-    # 0.1 A / 6 W under a 75 V sky, boat 2026-09-15), so the boost, which
-    # lifts that limit, is gated on daylight alone.
+    # about the sun (the 3.5.x hold curtailed PV by current at its
+    # destination: 0.1 A / 6 W under a 75 V sky, boat 2026-09-15; REC 3.7.0
+    # runs with no charge-limit modulation, but any real limit does the
+    # same to the yield), so the boost, which lifts that limit, is gated
+    # on daylight alone.
     "BOOST_CAPPED_A": 3,
     # 4.21: once a boost shows the sun covering the need, the boost is kept
     # alive (re-requested this often) until the departure, so the charge
@@ -203,9 +205,8 @@ class Inputs:
               # never read as absent.
               "ac_available",
               # 4.18: the consumer keeps both inputs' availability and the
-              # GX's AC input types and derives ac_available / feed_shore
-              # from the resolved shore input each tick. The engine reads
-              # only the derived pair.
+              # GX's AC input types and derives ac_available from the
+              # resolved shore input each tick. The engine reads only that.
               "ac1_available", "ac2_available", "ac1_type", "ac2_type",
               # 4.19: the charge current limit in force (/Info/MaxChargeCurrent)
               "ccl_a")
@@ -217,7 +218,6 @@ class Inputs:
         self.departure_allowed = True
         self.lead_fault = ""
         self.p_rated = 1800.0
-        self.feed_shore = 0      # ActiveInput value meaning "shore present"
 
 
 class Outputs:
@@ -330,7 +330,7 @@ class Engine:
                     and math.isfinite(item.v) and math.isfinite(item.ts)
                     and 0 <= now - item.ts < t["HB_STALE_MS"]):
                 setattr(fresh, name, item)
-        for name in ("enabled", "lead_fault", "p_rated", "feed_shore", "departure_allowed"):
+        for name in ("enabled", "lead_fault", "p_rated", "departure_allowed"):
             setattr(fresh, name, getattr(inp, name))
         inp = fresh
 
@@ -344,7 +344,6 @@ class Engine:
         boosting = boostAct is not None and boostAct.v == 1
         leadFault = inp.lead_fault or ""
         windowOpen = boostWin is not None and boostWin.v == 1
-        FEED_SHORE = inp.feed_shore
 
         pRated = inp.p_rated
         if not (isinstance(pRated, (int, float)) and math.isfinite(pRated)
@@ -662,7 +661,6 @@ class Engine:
             status[0] = "red"
 
         else:
-            discharge = -batt.v
             sinceTrans = now - st["lastTransition"]
             cooling = (st["cooldownFrom"] is not None
                        and now - st["cooldownFrom"] < t["COOLDOWN_MS"])
@@ -749,8 +747,8 @@ class Engine:
                 # 4.9: no boost while the arrays already run unthrottled --
                 # no producing array at its ceiling (mode 1) and at least
                 # one in tracker mode (2) with a fresh capture. The live
-                # capture is the measurement, and every boost lifts the
-                # floor's charge-current cap for two minutes.
+                # capture is the measurement, and every boost lifts whatever
+                # charge-current cap the floor has for two minutes.
                 def cap_fresh(cap):
                     return cap is not None and (now - cap["ts"]) <= t["CAP_FRESH_MS"]
                 throttled_any = any(m is not None and m.v == 1 for m in (m6, m7))
