@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.27")
+check("engine version bumped", SP.ENGINE_VERSION == "4.28")
 Val = SP.Val
 
 
@@ -571,6 +571,20 @@ for k in range(1, 61):                                                   # the d
 check("4.27: the SOC drift exit still guards a hold drain",
       any(tr.startswith("-> SHORE (SOC ") for tr in s.transitions) and s.eng.st["drawdownWh"] == 0.0,
       "%s %.1f" % (str(s.transitions), s.eng.st["drawdownWh"]))
+
+# ---- 4.28: only the coverable part of a hold drain is excused ----
+# Boat 2026-09-16 23:52 UTC: a 1.7 kW heater under the island, the MPPTs at
+# 720 W and still "limited" (they limit on their own terminals), the bank at
+# -1.2 kW -- a real deficit that 4.27 excused entirely.
+s = held_island()                                        # plant evidence 500 W (the unthrottled capture)
+s.tick(300, batt=-1100.0, load=1747.0, pv=700.0, m=1, sustain_active=1)
+check("4.28: a drain beyond what the plant could add is a deficit and returns",
+      any(tr.startswith("-> SHORE (deficit: ") for tr in s.transitions), str(s.transitions[-1:]))
+s = held_island()
+s.tick(600, batt=-450.0, load=600.0, pv=150.0, m=1, sustain_active=1)   # plant 500: 350 W coverable, 100 W real
+check("4.28: the uncoverable part accrues (100 W for 10 min is ~17 Wh)",
+      s.state == "solar" and 14 <= s.eng.st["drawdownWh"] <= 20, "%s %.1f" % (s.state, s.eng.st["drawdownWh"]))
+check("4.28: a partly real drain is not labelled a hold drain", "[hold drain]" not in s.out.status_text, s.out.status_text)
 
 # ---- the SOC floor still wins ----
 s = Sim()

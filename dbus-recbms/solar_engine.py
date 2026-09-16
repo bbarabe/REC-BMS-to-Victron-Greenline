@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.27"
+ENGINE_VERSION = "4.28"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -1031,13 +1031,25 @@ class Engine:
                     # have more to give, so it is no deficit and does not
                     # accrue; a surplus still repays. The SOC floor and the
                     # drift exit stay as the backstops.
-                    delta = -batt.v * hours
-                    if delta > 0 and curtailed:
-                        delta = 0.0
+                    # 4.28: only the part of the drain the arrays could
+                    # have covered is the hold's. At 23:52 UTC the same
+                    # day a 1.7 kW heater came on under the island: the
+                    # MPPTs still read "limited" (they limit on their own
+                    # terminals, a cable's drop above the bank) at 720 W,
+                    # the best the sun had shown all hour, and the bank
+                    # drained 1.2 kW that 4.27 excused entirely. What the
+                    # plant could add if uncurtailed is est - pvNow; a
+                    # drain beyond that is a real deficit and accrues.
+                    coverable = max(0.0, est - pvNow) if curtailed else 0.0
+                    deficit_w = max(0.0, -batt.v - coverable)
+                    delta = (deficit_w if batt.v < 0 else -batt.v) * hours
                     st["drawdownWh"] = max(0.0, st["drawdownWh"] + delta)
+                else:
+                    coverable = max(0.0, est - pvNow) if curtailed else 0.0
+                    deficit_w = max(0.0, -batt.v - coverable)
                 st["drawdownTs"] = now
                 drawdown = st["drawdownWh"]
-                holdDrain = " [hold drain]" if (curtailed and batt.v < 0) else ""
+                holdDrain = " [hold drain]" if (curtailed and batt.v < 0 and deficit_w <= 0) else ""
                 budget = t["ISLAND_DEFICIT_WH"]
 
                 if loadNow.v >= t["SUSPEND_LOAD_W"]:
