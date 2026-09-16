@@ -495,29 +495,45 @@ class RecDriverSafetyTests(unittest.TestCase):
             period(49.8, -5.0)
         self.assertAlmostEqual(su['servo_v'], self.cfg.sustain_hold_servo_up, places=4)
 
-    def test_the_island_edge_folds_the_hold_servo(self):
-        # 3.7.4: the island regulates from the anchor. Whatever the servo
-        # carried for the shore side (+0.06 V over a bank the parked
-        # Quattro would not cover, 2026-09-16 18:41 UTC) is dropped once,
-        # for the two-sided hold only.
+    def test_the_island_edge_re_anchors_the_hold_on_the_bank_as_it_is(self):
+        # 3.7.5. Boat, 2026-09-16 19:38 UTC: the probe assist had filled
+        # the bank at +10 A, its terminal voltage sat 0.02 V over the
+        # anchor the restart had measured, and a fold alone (3.7.4) left
+        # the MPPTs at 0 W under a 1 kW sun while the loads drained the
+        # bank at 7 A. The island edge re-anchors on the present voltage
+        # less R * I and folds the servo, for a hold at its destination.
         self.driver.settings['chargeslider'] = 50
         self.driver.sp_enabled = True
         self.tick()
         self.assertTrue(self.driver._set_sustain(3))
         su = self.driver.sustain
-        self.driver._sustain_anchor(50.2, 55.65, 0.0, 'test')
-        su['servo_v'] = 0.06
-        self.assertTrue(self.driver._sustain_servo_fold('islanded'))
-        self.assertEqual(su['servo_v'], 0.0)
-        self.assertFalse(self.driver._sustain_servo_fold('islanded'))   # nothing to fold
+        self.driver._sustain_anchor(50.2, 55.64, 0.0, 'test')
         self.now += 1
-        self.driver._service_sustain(self.now, 50.2, 50.0, 55.65, 0.0)
+        self.driver._service_sustain(self.now, 50.2, 50.0, 55.64, 0.0)
+        self.assertIs(su['at_dest'], True)
+        su['servo_v'] = 0.06
+        r = self.cfg.sustain_anchor_r
+        self.assertTrue(self.driver._sustain_island_edge(55.69, 10.5, 'islanded'))
+        self.assertAlmostEqual(su['anchor_v'], round(55.69 - 10.5 * r, 2), places=2)
+        self.assertEqual(su['servo_v'], 0.0)
+        self.now += 1
+        self.driver._service_sustain(self.now, 50.2, 50.0, 55.69, 10.5)
         self.assertAlmostEqual(self.driver.batt['/RecBms/Sustain/HoldVoltage'], su['anchor_v'], places=2)
+        self.assertFalse(self.driver._sustain_island_edge(None, 10.5, 'islanded'))   # no reading, no anchor
+        # A hold whose band is still open is not re-anchored: arrival does that.
         self.driver.sustain = self.driver._sustain_idle()
-        self.assertTrue(self.driver._set_sustain(1))                    # a floor keeps its servo
+        self.assertTrue(self.driver._set_sustain(3))
+        self.driver._sustain_anchor(49.5, 55.4, -1.0, 'test')
+        self.now += 1
+        self.driver._service_sustain(self.now, 49.5, 50.0, 55.4, -1.0)
+        self.assertFalse(self.driver.sustain['at_dest'])
+        self.assertFalse(self.driver._sustain_island_edge(55.4, -1.0, 'islanded'))
+        # A floor keeps its anchor and its servo.
+        self.driver.sustain = self.driver._sustain_idle()
+        self.assertTrue(self.driver._set_sustain(1))
         self.driver._sustain_anchor(60.0, 55.9, 0.0, 'test')
         self.driver.sustain['servo_v'] = 0.06
-        self.assertFalse(self.driver._sustain_servo_fold('islanded'))
+        self.assertFalse(self.driver._sustain_island_edge(55.95, 5.0, 'islanded'))
         self.assertEqual(self.driver.sustain['servo_v'], 0.06)
 
     def test_a_hold_stands_still_while_a_boost_measures(self):

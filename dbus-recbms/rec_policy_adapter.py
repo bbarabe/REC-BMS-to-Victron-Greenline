@@ -826,10 +826,11 @@ class RecPolicyAdapter:
                          (mode != 'OFF' or connected is not False or hold_mode is not None))
             if connected is False and intent == 'island':
                 if not self.island_folded:
-                    # 3.7.4: the hold regulates from its anchor on the island;
-                    # whatever the servo carried for the shore side is dropped.
+                    # 3.7.5: the hold at its destination re-anchors on the
+                    # bank as it islands (its present voltage less R * I) and
+                    # drops whatever its servo carried for the shore side.
                     self.island_folded = True
-                    self.driver._sustain_servo_fold('islanded, the hold regulates from its anchor')
+                    self.driver._sustain_island_edge(voltage, current, 'islanded: the hold regulates from the bank as it is')
             elif connected:
                 self.island_folded = False
             if connected is False and intent == 'island':

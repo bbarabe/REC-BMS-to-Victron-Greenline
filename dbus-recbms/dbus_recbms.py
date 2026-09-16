@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.7.4"
+VERSION = "3.7.5"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1659,19 +1659,29 @@ class RecBmsDriver:
                  "unless re-asserted)", name, soc,
                  su["anchor_v"], why, self.cfg.sustain_hold_s)
 
-    def _sustain_servo_fold(self, why):
-        """3.7.4: drop whatever the destination servo carries and hold the
-        bank on its anchor, the rest voltage the arrival fold measured. At
-        the island's edge the servo carries what the shore side needed --
-        the +0.06 V that lifted the arrays over a bank the parked Quattro
-        would not cover, on the boat's first island 2026-09-16 -- and on
-        the island that is a standing fill for nothing."""
+    def _sustain_island_edge(self, volts, amps, why):
+        """3.7.5: a two-sided hold at its destination re-anchors when the
+        boat islands -- on the bank's present voltage less the drop across
+        its resistance -- and the servo it carried for the shore side is
+        folded with it. 3.7.4 only folded the servo and kept the anchor
+        the restart or the arrival had measured, and the first island on
+        it (boat 2026-09-16 19:38 UTC) showed why that is not enough: the
+        probe assist had just filled the bank at +10 A for 90 s, its
+        terminal voltage sat 0.02 V over that anchor, and the MPPTs,
+        seeing the sense over their setpoint, gave 0 W under a 1 kW sun
+        while the loads drained the bank at 7 A -- for as long as the
+        polarisation took to relax, with the engine's drawdown budget
+        counting toward a return. Anchoring on the compensated present
+        voltage puts the setpoint a notch or two over the true rest at
+        worst, the arrays carry the loads from the first minute, and the
+        SOC rule trims those notches away as the bank fills past its band.
+        Nothing for a floor or a ceiling, nor for a hold whose band is
+        still open: those regulate on their own terms."""
         su = self.sustain
-        if su.get("mode") != SUSTAIN_HOLD or not su.get("servo_v"):
+        if (su.get("mode") != SUSTAIN_HOLD or not su.get("active") or not su.get("at_dest")
+                or volts is None):
             return False
-        log.info("sustain servo %+.2fV folded: %s", su["servo_v"], why)
-        su["servo_v"] = 0.0
-        su["servo_ts"] = time.monotonic()
+        self._sustain_reanchor(volts, amps, why)
         return True
 
     def _sustain_reanchor(self, volts, amps, why):
