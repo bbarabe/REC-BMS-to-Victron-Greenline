@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.21"
+ENGINE_VERSION = "4.22"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -22,8 +22,19 @@ ENGINE_DEFAULTS = {
     "HB_STALE_MS": 20000, "ASSERT_MS": 30000, "FEEDBACK_GRACE_MS": 90000,
     "CAP_SMOOTH": 0.3, "CAP_FRESH_MS": 900000, "CAP_ZERO_MS": 5400000,
     "VOC_DAY_V": 55, "VOC_EXPLORE_V": 65, "CVL_MARGIN_V": 0.05, "WAKE_MS": 60000,
-    "SURPLUS_QUIET_W": 100, "BOOST_V": 0.30, "BOOST_INTERVAL_MS": 900000,
+    "SURPLUS_QUIET_W": 100, "BOOST_V": 0.30,
+    # 4.22 (owner, 2026-09-16): boosts every 10 min, not 15. At the hold's
+    # destination the arrays are voltage-limited to the loads, so only a
+    # boost can show a surplus; the interval is the sampling delay before
+    # the engine can see the sun has become enough. The 240 s length stays
+    # (array B took three minutes to sweep to its maximum that evening).
+    "BOOST_INTERVAL_MS": 600000,
     "BOOST_RETRY_MS": 180000,
+    # 4.22: the installation's charge voltage limit. A boost lifts the
+    # MPPTs BOOST_V over the charge target, so at a target within BOOST_V
+    # of this there is no room for one -- and only then is a blind probe
+    # (explore) the way to measure the arrays.
+    "FULL_CVL_V": 61.96,
     # 4.15 (Stage B, plan B2; master SP26, D06, E07): HOLD asks dbus-recbms to
     # hold the bank instead of releasing sustain, so nothing deliberately
     # fills a band and burns it into the loads any more. The burn-down state
@@ -232,6 +243,10 @@ def fresh_state(now, t):
     return {
         "state": "shore", "desired": 0, "lastSent": None, "lastAssert": 0,
         "lastTransition": now, "probeStart": 0, "probeRamp": 0, "probeEst": 0,
+        # 4.22: the cooldown gate counts from the last TRANSITION, never
+        # from a restart (a consumer restart at 22:15 UTC on 2026-09-15
+        # gated the departure through the one boost that saw coverage).
+        "cooldownFrom": None,
         "evalPv": [], "evalBatt": [],
         "readySince": 0, "surgeStart": 0, "drawdownWh": 0.0, "drawdownTs": 0,
         "backoffMs": t["COOLDOWN_MS"], "backoffUntil": 0,
@@ -451,6 +466,11 @@ class Engine:
 
         effCvl = boostEff.v if boostEff is not None else (cvl.v if cvl is not None else None)
         aboveCvl = (battV is not None and effCvl is not None) and (battV.v > effCvl + t["CVL_MARGIN_V"])
+        # 4.22 (owner, 2026-09-16): a boost lifts the MPPTs BOOST_V over the
+        # charge target; within BOOST_V of the installation's limit (61.66 V
+        # and up) there is no room for one -- not the measurement boost, not
+        # the probe assist, not the re-ramp assist.
+        noBoostRoom = cvl is not None and cvl.v + t["BOOST_V"] > t["FULL_CVL_V"] + 1e-6
 
         transition = [None]
         boostMsg = [None]
@@ -460,6 +480,7 @@ class Engine:
             st["desired"] = 0
             st["state"] = "shore"
             st["lastTransition"] = now
+            st["cooldownFrom"] = now
             st["readySince"] = 0
             st["surgeStart"] = 0
             st["drawdownWh"] = 0.0
@@ -501,10 +522,12 @@ class Engine:
             st["evalPv"] = []
             st["evalBatt"] = []
             st["lastTransition"] = now
+            st["cooldownFrom"] = now
             st["surgeStart"] = 0
             st["readySince"] = 0
             st["lastBoostTs"] = now
-            boostMsg[0] = t["BOOST_V"]       # probe assist (v3.5)
+            if not noBoostRoom:
+                boostMsg[0] = t["BOOST_V"]   # probe assist (v3.5)
             transition[0] = "-> PROBE (" + reason + ")"
             status[0] = "yellow"
             status[1] = transition[0]
@@ -519,6 +542,7 @@ class Engine:
             st["socEntry"] = soc.v
             st["solarSince"] = now
             st["lastTransition"] = now
+            st["cooldownFrom"] = now
             st["surgeStart"] = 0
             st["drawdownWh"] = 0.0
             st["drawdownTs"] = now
@@ -534,6 +558,7 @@ class Engine:
             st["desired"] = 0
             st["suspendStart"] = now
             st["lastTransition"] = now
+            st["cooldownFrom"] = now
             st["suspendTrigStart"] = 0
             st["resumeStart"] = 0
             st["surgeStart"] = 0
@@ -639,6 +664,8 @@ class Engine:
         else:
             discharge = -batt.v
             sinceTrans = now - st["lastTransition"]
+            cooling = (st["cooldownFrom"] is not None
+                       and now - st["cooldownFrom"] < t["COOLDOWN_MS"])
             loadSlow = inp.load_slow
             loadJudge = max(loadAvg.v, loadSlow.v) if loadSlow is not None else loadAvg.v
             # The need, in DC-bus watts, in this order: the consumer's 60 s
@@ -683,8 +710,17 @@ class Engine:
                         st["backoffMs"] = t["COOLDOWN_MS"]
 
                 dim = plantConf is not None and needW is not None and plantConf < needW
+                # 4.22 (owner, 2026-09-16): a boost lifts the MPPTs BOOST_V
+                # over the charge target -- some 40 A of headroom on this
+                # bank, more than both arrays can make -- so it IS the
+                # measurement, and islanding to measure adds nothing (the
+                # explore probe of 01:24 UTC cut a boost off at 190 W to
+                # find 190 W). The blind probe stays only where a boost has
+                # no room: a charge target within BOOST_V of the
+                # installation's limit (61.66 V and up).
                 explore = (needW is not None and dayOk and not vocRising
-                           and vocMax >= t["VOC_EXPLORE_V"] and capSum <= 0 and not dim)
+                           and vocMax >= t["VOC_EXPLORE_V"] and capSum <= 0 and not dim
+                           and noBoostRoom)
 
                 if owd:
                     # Discharging: leave shore as soon as the charger is quiet
@@ -726,16 +762,19 @@ class Engine:
                 # under a 75 V sky and no boost ever fired, so the engine
                 # could not measure the arrays it needed to leave shore.
                 capped = inp.ccl_a is not None and inp.ccl_a.v <= t["BOOST_CAPPED_A"]
+                # 4.22: never a boost where it has no room (a charge target
+                # within BOOST_V of the installation's limit): the blind
+                # probe measures there instead.
                 if (not boosting and dayOk and vocMax >= t["VOC_DAY_V"] and not vocRising
                         and (pvNow >= t["BOOST_MIN_PV_W"] or capped) and not unthrottled
                         and not aboveCvl and not shoreMissing and soc.v >= minSoc
-                        and quattroW <= t["SURPLUS_QUIET_W"] and not owd
+                        and quattroW <= t["SURPLUS_QUIET_W"] and not owd and not noBoostRoom
                         and (now - st["lastBoostTs"]) >=
                         (t["BOOST_RETRY_MS"] if capSum <= 0 else t["BOOST_INTERVAL_MS"])):
                     st["lastBoostTs"] = now
                     boostMsg[0] = t["BOOST_V"]
 
-                gateOk = (sinceTrans >= t["COOLDOWN_MS"] and now >= st["backoffUntil"]
+                gateOk = (not cooling and now >= st["backoffUntil"]
                           and now >= st["lockoutUntil"])
                 if (ready and gateOk and boosting
                         and (now - st["boostKeepTs"]) >= t["BOOST_KEEPALIVE_MS"]):
@@ -799,8 +838,8 @@ class Engine:
                         s += " [LOCKOUT %dm]" % math.ceil((st["lockoutUntil"] - now) / 60000)
                     elif now < st["backoffUntil"]:
                         s += " [backoff %dm]" % math.ceil((st["backoffUntil"] - now) / 60000)
-                    elif sinceTrans < t["COOLDOWN_MS"]:
-                        s += " [cd %ds]" % math.ceil((t["COOLDOWN_MS"] - sinceTrans) / 1000)
+                    elif cooling:
+                        s += " [cd %ds]" % math.ceil((t["COOLDOWN_MS"] - (now - st["cooldownFrom"])) / 1000)
                     elif ready:
                         s += " [confirm %ds]" % math.ceil((t["READY_MS"] - (now - st["readySince"])) / 1000)
                     status[1] = s
@@ -905,6 +944,7 @@ class Engine:
                         st["resumeStart"] = 0
                         st["desired"] = 1
                         st["lastTransition"] = now
+                        st["cooldownFrom"] = now
                         st["surgeStart"] = 0
                         # 4.15: a suspend always resumes into solar -- the
                         # burn-down it could come back into is gone (SP26).
@@ -913,7 +953,7 @@ class Engine:
                         st["socEntry"] = soc.v
                         st["drawdownWh"] = 0.0
                         st["drawdownTs"] = now
-                        if not owd:
+                        if not owd and not noBoostRoom:
                             st["lastBoostTs"] = now
                             boostMsg[0] = t["BOOST_V"]     # re-ramp assist
                         transition[0] = "-> SOLAR (resumed after suspend)"

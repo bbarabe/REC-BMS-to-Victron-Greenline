@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.21")
+check("engine version bumped", SP.ENGINE_VERSION == "4.22")
 Val = SP.Val
 
 
@@ -41,6 +41,13 @@ class Sim:
         self.now = 1_800_000_000_000
         self.logs = []
         self.eng = SP.Engine(self.t, self.now, logger=self.logs.append)
+        # 4.22 dropped the cooldown after a RESTART (the gate counts from the
+        # last transition only). Every scenario below was written against
+        # the 300 s gate, and a fresh engine on a real boat rarely departs
+        # within five minutes of its last transition, so the harness starts
+        # each scenario "five minutes into a cooldown"; the 4.22 checks clear
+        # cooldownFrom themselves to exercise the bare restart.
+        self.eng.st["cooldownFrom"] = self.now
         self.inp = SP.Inputs()
         self.inp.enabled = True
         self.inp.feed_shore = 0
@@ -453,6 +460,30 @@ s.eng.st["lockoutUntil"] = s.now + 3600000
 before = len(s.boosts)
 s.tick(120, boost_active=1, pv=1300.0, m=2)
 check("4.21: no keepalive while the departure is gated", len(s.boosts) == before and s.state == "shore", (s.boosts, s.state))
+
+# ---- 4.22: the boost IS the measurement; explore only where it has no room ----
+s = Sim()
+s.eng.st["cooldownFrom"] = None                    # a bare restart: no cooldown at all
+s.tick(60, soc=60, target=80, pv=30.0, m=1, voc=75.0, load=300.0, batt_v=56.4, cvl=56.62)
+check("4.22: no blind probe while a boost has room", s.state == "shore" and s.eng.st["cap6"] is None, (s.state, s.eng.st["cap6"]))
+check("4.22: ... the boost is asked for instead", s.boosts and s.boosts[-1] == s.t["BOOST_V"], s.boosts)
+s = Sim()
+s.eng.st["cooldownFrom"] = None
+s.tick(60, soc=99.0, target=100, pv=30.0, m=1, voc=75.0, load=300.0, batt_v=61.7, cvl=61.7)
+check("4.22: at a target within boost_v of the limit the blind probe stands", s.state in ("probe", "solar"), s.state)
+check("4.22: ... and no boost is asked for there", s.boosts == [], s.boosts)
+s = Sim()
+s.eng.st["cooldownFrom"] = None
+s.tick(1, soc=60, target=80, pv=500.0, m=2, voc=60.0, load=300.0, batt_v=56.4)
+s.tick(45)
+check("4.22: a fresh engine departs after its 30 s confirm, no restart cooldown", s.state in ("probe", "solar"), s.state)
+s.tick(200)
+s.tick(760, pv=0.0, m=1, batt=-363.0)              # the sun goes: the deficit drawdown returns it
+cf = s.eng.st["cooldownFrom"]
+check("4.22: a return starts the cooldown", s.state == "shore" and cf is not None and 0 <= s.now - cf < 760000, (s.state, cf, s.now))
+s.tick(60, pv=500.0, m=2, batt=0.0)
+check("4.22: ... which still gates the next departure", s.state == "shore", s.state)
+check("4.22: boosts every ten minutes", s.t["BOOST_INTERVAL_MS"] == 600000 and s.t["FULL_CVL_V"] == 61.96, s.t["BOOST_INTERVAL_MS"])
 
 # ---- 4.19: a current cap makes the yield meaningless; boost on daylight ----
 s = Sim()
