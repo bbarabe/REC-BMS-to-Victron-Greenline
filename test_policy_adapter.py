@@ -637,7 +637,10 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.hold_for(sim, 3600, sample=sample, **self.request_hold(sim))
             net = (sim.plant.energy.charge_ah - sim.plant.energy.discharge_ah) - before
             self.assertTrue(sim.plant.connected)
-            self.assertLessEqual(max(socs), 60.3)
+            # 3.7.4: the servo answers SOC only -- one notch down once the bank
+            # is hold_soc_band_pct (0.3 %) over its target and still filling --
+            # so the peak is the band plus one period of the Quattro's fill.
+            self.assertLessEqual(max(socs), 60.4)
             self.assertGreaterEqual(min(socs), 59.7)
             self.assertLessEqual(abs(net), .5)
             self.assertEqual(sim.rec.batt['/RecBms/Sustain/Mode'], 3)
@@ -775,6 +778,9 @@ class AdapterBoundaryTests(unittest.TestCase):
         with self.simulation(target=80) as sim:
             self.wait_for(sim, lambda: not sim.plant.connected)
             sim.run(60)
+            # 3.7.4: the island edge folds the two-sided hold's servo once;
+            # this CHARGE floor keeps its own, and the flag is set either way.
+            self.assertTrue(sim.rec.policy_adapter.island_folded)
             edges = len(sim.plant.relay_edges)
             sim.set_target(70)
             sim.run(30)

@@ -561,7 +561,10 @@ class RestoredPlantTests(unittest.TestCase):
                 lowest, highest = min(lowest, sim.plant.soc), max(highest, sim.plant.soc)
             net = sim.plant.energy.charge_ah - sim.plant.energy.discharge_ah - before
             self.assertGreaterEqual(lowest, 59.7)
-            self.assertLessEqual(highest, 60.3)
+            # 3.7.4: the servo answers SOC only -- one notch down once the bank is
+            # hold_soc_band_pct (0.3 %) over its target and still filling -- so the
+            # peak is the band plus one period of the Quattro's fill.
+            self.assertLessEqual(highest, 60.4)
             self.assertLess(abs(net), 3.0, 'net %.2f Ah over five hours' % net)
             self.assertAlmostEqual(sim.rec.batt['/RecBms/Voltage/RequestedQuattro'],
                                    sim.rec.batt['/RecBms/Sustain/HoldVoltage'], delta=0.011)

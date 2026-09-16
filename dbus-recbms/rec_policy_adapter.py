@@ -78,6 +78,7 @@ class RecPolicyAdapter:
         self.attribution_observation = None
         self.attribution_island_since = None
         self.attribution_last_now = None
+        self.island_folded = False      # 3.7.4: the servo fold at the island edge, once per island
         self.load_service = LoadServiceEvidence(self.config.stable_admission_s,
             self.config.reverse_response_s, self.config.reverse_power_w, self.config.source_gap_s)
         self.pv_activity = TimedMean(self.config.stable_admission_s)
@@ -823,6 +824,14 @@ class RecPolicyAdapter:
                          (mode != 'DISCHARGE' or hold_mode == 2) and
                          (mode != 'HOLD' or hold_mode == 3) and
                          (mode != 'OFF' or connected is not False or hold_mode is not None))
+            if connected is False and intent == 'island':
+                if not self.island_folded:
+                    # 3.7.4: the hold regulates from its anchor on the island;
+                    # whatever the servo carried for the shore side is dropped.
+                    self.island_folded = True
+                    self.driver._sustain_servo_fold('islanded, the hold regulates from its anchor')
+            elif connected:
+                self.island_folded = False
             if connected is False and intent == 'island':
                 transfer_ready = envelope_ok if grace else safe
             elif intent == 'connected':

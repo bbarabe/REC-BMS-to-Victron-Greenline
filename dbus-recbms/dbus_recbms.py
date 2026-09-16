@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.7.3"
+VERSION = "3.7.4"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -258,13 +258,12 @@ class Config:
         # 15:44-16:36 UTC, 74 steps between boosts, the bank still moving
         # at 73 of them, PV 0 W 16 % of the time, bank draining 27 %.
         self.sustain_hold_servo_s = self._number(su.get("hold_servo_period_s", 90))
-        # 3.7.3: the bank current the destination servo leaves alone either
-        # way. One 0.01 V step swings the bank by a whole step of current
-        # (about 1.5 A on the Quattro, 3.7 A islanded on the MPPTs), so a
-        # band narrower than a step has no reachable state inside it and
-        # the servo fights the chargers' own regulation forever (boat
-        # 2026-09-16 18:45-18:58 UTC: -4.5..+3 A every four minutes).
-        self.sustain_hold_drift_a = max(0.0, self._number(su.get("hold_drift_a", 2.5)))
+        # 3.7.4: how far over its target the held SOC may drift before the
+        # destination servo moves the hold voltage one notch down. The
+        # chargers regulate the bank on their own; the servo never answers
+        # a current, only an SOC that has left this band (owner, 2026-09-16:
+        # "they don't need our help; the servo should not hunt, period").
+        self.sustain_hold_band = max(0.0, self._number(su.get("hold_soc_band_pct", 0.3)))
         self.sustain_servo_db = max(0.0, self._number(su.get("servo_deadband_pct", 0.1)))
         self.sustain_servo_up = max(0.0, self._number(su.get("servo_max_up_v", 0.5)))
         self.sustain_servo_down = max(0.0, self._number(su.get("servo_max_down_v", 2.0)))
@@ -715,7 +714,7 @@ def sustain_servo(mode, err, charging, deadband, draining=True, filling=False):
     return 0
 
 
-def hold_current_servo(err, amps, deadband, drain_a, drift_a):
+def hold_current_servo(err, amps, band_up, deadband, drain_a):
     """The two-sided hold's servo AT its destination (3.6.1): which way to
     move the hold voltage this period, +1 up, -1 down, 0 leave it.
 
@@ -738,35 +737,35 @@ def hold_current_servo(err, amps, deadband, drain_a, drift_a):
     to bring it 0.2 % down. The bank takes about 1.5 A per 0.01 V here,
     so the finer step lands the chargers on the loads within an amp.
 
-    3.7.3: "within an amp" was the wrong yardstick. The chargers regulate
-    on a sense quantised to 0.01 V, so one step of the hold voltage swings
-    the bank by a whole step of current -- about 1.5 A with the Quattro,
-    3.7 A islanded with the MPPTs the only source -- and a band narrower
-    than that step has no reachable state inside it: the servo alternated
-    between "a step too high" and "a step too low" for as long as the
-    island lasted (boat 2026-09-16 18:45-18:58 UTC, -4.5..+3 A every four
-    minutes, the arrays cut to 150 W on every low step). Inside the SOC
-    deadband the bank may now sit anywhere within drift_a either way --
-    the chargers' own loops keep up with the loads there and the servo
-    does not fight them; above the target a drift out of up to two
-    drift_a is welcome and any fill over drain_a is answered; under it
-    any drain over drain_a is answered. What is left is a slow triangle
-    of the SOC across its deadband, a step every half hour or so, and
-    never a 0 W array. Pure, so it can be tested off the boat.
+    3.7.4: the servo never answers a current. The chargers regulate the
+    bank on their own -- an MPPT cranks up the moment the sensed voltage
+    drops under its setpoint and throttles the moment it rises over it --
+    and a servo that stepped on the bank's current only fought their
+    loops: the chargers regulate on a sense quantised to 0.01 V, so one
+    notch of the hold voltage swings the bank by a whole notch of current
+    (about 1.5 A with the Quattro, 3.7 A islanded with the MPPTs the only
+    source), a band narrower than that notch had no reachable state
+    inside it, and the first island of 3.7.1 alternated -4.5..+3 A every
+    four minutes with the arrays cut to 150 W on every low step (boat
+    2026-09-16 18:45-19:06 UTC). Owner: "they don't need our help; the
+    servo should not hunt, period."
+
+    The one thing the chargers cannot do is choose which notch their
+    setpoint sits on relative to the bank's true rest voltage, and a
+    notch is a standing current of up to half a notch either way, so a
+    held SOC drifts -- slowly, for hours. That is all the servo answers:
+    an SOC that has drifted past band_up over its target while the bank
+    is still filling gets one notch down; one under the deadband while
+    the bank is still draining gets one notch up. A bank already heading
+    back is left alone, and inside the band nothing moves whatever the
+    current. A notch or two an hour at most. Pure, so it can be tested
+    off the boat.
     """
     if amps is None:
         return 0
-    if err > deadband:
-        if amps > drain_a:
-            return -1
-        if amps < -2 * drift_a:
-            return 1
-        return 0
-    if err < -deadband:
-        return 1 if amps < -drain_a else 0
-    if amps > drift_a:
+    if err > band_up and amps > drain_a:
         return -1
-    if amps < -drift_a:
+    if err < -deadband and amps < -drain_a:
         return 1
     return 0
 
@@ -1660,6 +1659,21 @@ class RecBmsDriver:
                  "unless re-asserted)", name, soc,
                  su["anchor_v"], why, self.cfg.sustain_hold_s)
 
+    def _sustain_servo_fold(self, why):
+        """3.7.4: drop whatever the destination servo carries and hold the
+        bank on its anchor, the rest voltage the arrival fold measured. At
+        the island's edge the servo carries what the shore side needed --
+        the +0.06 V that lifted the arrays over a bank the parked Quattro
+        would not cover, on the boat's first island 2026-09-16 -- and on
+        the island that is a standing fill for nothing."""
+        su = self.sustain
+        if su.get("mode") != SUSTAIN_HOLD or not su.get("servo_v"):
+            return False
+        log.info("sustain servo %+.2fV folded: %s", su["servo_v"], why)
+        su["servo_v"] = 0.0
+        su["servo_ts"] = time.monotonic()
+        return True
+
     def _sustain_reanchor(self, volts, amps, why):
         """The bank moved a full step the hold's way: the hold voltage
         follows it -- a floor up and never down, a ceiling down and never
@@ -1867,8 +1881,8 @@ class RecBmsDriver:
                     # either way (the arrival fold put the anchor on the
                     # bank's own rest voltage; the servo only has to land
                     # the chargers on the loads from there).
-                    d = hold_current_servo(soc - held_eff, amps, c.sustain_servo_db,
-                                           c.sustain_drain_a, c.sustain_hold_drift_a)
+                    d = hold_current_servo(soc - held_eff, amps, c.sustain_hold_band,
+                                           c.sustain_servo_db, c.sustain_drain_a)
                     if d:
                         su["servo_v"] = max(-c.sustain_hold_servo_down, min(
                             c.sustain_hold_servo_up, su["servo_v"] + d * c.sustain_hold_step_v))
