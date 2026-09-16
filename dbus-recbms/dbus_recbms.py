@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.7.5"
+VERSION = "3.7.6"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -264,6 +264,13 @@ class Config:
         # a current, only an SOC that has left this band (owner, 2026-09-16:
         # "they don't need our help; the servo should not hunt, period").
         self.sustain_hold_band = max(0.0, self._number(su.get("hold_soc_band_pct", 0.3)))
+        # 3.7.6: what the island edge adds to the compensated bank voltage
+        # when it re-anchors: the slow part of the polarisation the probe
+        # assist's fill leaves behind, which R * I does not see. Boat
+        # 2026-09-16 19:54 UTC: at +18 A the bank read 55.69 V, R * I put
+        # the rest at 55.64, and with the fill gone it read 55.66-55.68 for
+        # many minutes -- over the anchor, so the MPPTs gave nothing.
+        self.sustain_island_edge_v = max(0.0, min(0.10, self._number(su.get("island_edge_v", 0.03))))
         self.sustain_servo_db = max(0.0, self._number(su.get("servo_deadband_pct", 0.1)))
         self.sustain_servo_up = max(0.0, self._number(su.get("servo_max_up_v", 0.5)))
         self.sustain_servo_down = max(0.0, self._number(su.get("servo_max_down_v", 2.0)))
@@ -1676,12 +1683,21 @@ class RecBmsDriver:
         worst, the arrays carry the loads from the first minute, and the
         SOC rule trims those notches away as the bank fills past its band.
         Nothing for a floor or a ceiling, nor for a hold whose band is
-        still open: those regulate on their own terms."""
+        still open: those regulate on their own terms.
+
+        3.7.6: plus island_edge_v. The ohmic compensation alone landed the
+        anchor back on the pre-fill rest (boat 2026-09-16 19:54 UTC:
+        55.69 V at +18 A -> 55.64 V), and the fill's slow polarisation
+        kept the bank 0.02-0.04 V over that for many minutes once the
+        assist was gone -- the same 0 W arrays as 3.7.4. Anchoring that
+        much higher puts the setpoint on the bank as it will read once
+        the current stops; the SOC rule trims the notches away as the
+        polarisation relaxes and the bank fills past its band."""
         su = self.sustain
         if (su.get("mode") != SUSTAIN_HOLD or not su.get("active") or not su.get("at_dest")
                 or volts is None):
             return False
-        self._sustain_reanchor(volts, amps, why)
+        self._sustain_reanchor(volts + self.cfg.sustain_island_edge_v, amps, why)
         return True
 
     def _sustain_reanchor(self, volts, amps, why):

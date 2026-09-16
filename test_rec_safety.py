@@ -514,7 +514,9 @@ class RecDriverSafetyTests(unittest.TestCase):
         su['servo_v'] = 0.06
         r = self.cfg.sustain_anchor_r
         self.assertTrue(self.driver._sustain_island_edge(55.69, 10.5, 'islanded'))
-        self.assertAlmostEqual(su['anchor_v'], round(55.69 - 10.5 * r, 2), places=2)
+        # 3.7.6: plus island_edge_v for the slow polarisation the fill leaves
+        self.assertGreater(self.cfg.sustain_island_edge_v, 0.0)
+        self.assertAlmostEqual(su['anchor_v'], round(55.69 + self.cfg.sustain_island_edge_v - 10.5 * r, 2), places=2)
         self.assertEqual(su['servo_v'], 0.0)
         self.now += 1
         self.driver._service_sustain(self.now, 50.2, 50.0, 55.69, 10.5)
