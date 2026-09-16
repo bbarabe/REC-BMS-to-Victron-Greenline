@@ -99,6 +99,7 @@
     "hold_servo_up_v": "0.10",
     "hold_servo_down_v": "0.30",
     "hold_servo_period_s": "90",
+    "hold_drift_a": "2.5",
     "servo_drain_a": "0.3",
     "arrival_fold_v": "0.25",
     "dusk_s": "300"

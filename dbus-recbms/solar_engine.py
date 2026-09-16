@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.23"
+ENGINE_VERSION = "4.24"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -922,6 +922,14 @@ class Engine:
                         toShore("FAULT: AC control ineffective")
                         status[0] = "red"
                     elif battAvg > -(t["ONEWAY_DEFICIT_W"] if owc else t["DISCHARGE_TOL_W"]):
+                        # 4.24: the probe assist ends with the probe. Its
+                        # +BOOST_V lift is for the arrays' ramp into the
+                        # island; once the island is proven the hold
+                        # voltage regulates and the arrays throttle to the
+                        # loads. Left to expire, the lift ran 150 s into
+                        # the island at up to +8 A into a held bank (boat
+                        # 2026-09-16 18:42-18:45 UTC): a fill for nothing.
+                        boostMsg[0] = 0
                         enter_solar("PV %.0fW, batt %.0fW" % (pvAvg, battAvg))
                     else:
                         escalateBackoff()

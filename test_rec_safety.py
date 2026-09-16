@@ -472,15 +472,19 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.assertAlmostEqual(su['servo_v'], -step, places=4)
         period(50.2, 2.0)                                   # still filling: down
         self.assertAlmostEqual(su['servo_v'], -2 * step, places=4)
-        period(50.2, -0.4)                                  # a gentle drift out: welcome above target
+        period(50.2, -0.4)                                  # a drift out: welcome above target
         self.assertAlmostEqual(su['servo_v'], -2 * step, places=4)
-        period(50.2, -1.0)                                  # the chargers starved: up, whatever the SOC
+        period(50.2, -4.0)                                  # still welcome (3.7.3: up to two drift_a)
+        self.assertAlmostEqual(su['servo_v'], -2 * step, places=4)
+        period(50.2, -6.0)                                  # the chargers starved: up, whatever the SOC
         self.assertAlmostEqual(su['servo_v'], -1 * step, places=4)
         period(50.2, 0.0)                                   # landed: still
         self.assertAlmostEqual(su['servo_v'], -1 * step, places=4)
-        period(50.05, -0.4)                                 # inside the deadband a drain is answered
+        period(50.05, -2.0)                                 # inside the deadband, within the drift band: still (3.7.3)
+        self.assertAlmostEqual(su['servo_v'], -1 * step, places=4)
+        period(50.05, -3.0)                                 # a drain past it is answered
         self.assertAlmostEqual(su['servo_v'], 0.0, places=4)
-        period(50.05, 0.4)                                  # and a fill
+        period(50.05, 3.0)                                  # and a fill
         self.assertAlmostEqual(su['servo_v'], -1 * step, places=4)
         period(49.85, 0.5)                                  # under target: a fill is the plan
         self.assertAlmostEqual(su['servo_v'], -1 * step, places=4)
@@ -798,16 +802,23 @@ class SustainPrimitiveTests(unittest.TestCase):
 
     def test_hold_current_servo_lands_the_chargers_on_the_loads(self):
         # 3.6.1: at the destination the bank's current is the error signal.
-        servo = lambda err, amps: R.hold_current_servo(err, amps, .1, .3)
-        # inside the deadband: neither way
+        # 3.7.3: inside the SOC deadband the bank may sit anywhere within
+        # drift_a (one step of the hold voltage swings it by a whole step
+        # of current, 3.7 A islanded), above the target a drift out of up
+        # to two drift_a is welcome.
+        servo = lambda err, amps: R.hold_current_servo(err, amps, .1, .3, 2.5)
+        # inside the deadband: neither way within the drift band
         self.assertEqual(servo(0.0, 0.2), 0)
-        self.assertEqual(servo(0.05, 0.4), -1)
-        self.assertEqual(servo(-0.05, -0.4), 1)
-        # above target: nothing into the bank, a gentle drift out is welcome
+        self.assertEqual(servo(0.05, 2.4), 0)
+        self.assertEqual(servo(-0.05, -2.4), 0)
+        self.assertEqual(servo(0.05, 2.6), -1)
+        self.assertEqual(servo(-0.05, -2.6), 1)
+        # above target: nothing into the bank, a drift out is welcome
         self.assertEqual(servo(0.3, 0.4), -1)
         self.assertEqual(servo(0.3, 0.0), 0)
         self.assertEqual(servo(0.3, -0.5), 0)
-        self.assertEqual(servo(0.3, -0.7), 1)
+        self.assertEqual(servo(0.3, -4.9), 0)
+        self.assertEqual(servo(0.3, -5.1), 1)
         # under target: a fill is the plan, a drain is answered
         self.assertEqual(servo(-0.3, 5.0), 0)
         self.assertEqual(servo(-0.3, 0.0), 0)

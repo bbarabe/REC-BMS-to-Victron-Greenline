@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.23")
+check("engine version bumped", SP.ENGINE_VERSION == "4.24")
 Val = SP.Val
 
 
@@ -126,6 +126,19 @@ s = Sim()
 s.tick(335, soc=60)
 check("no target: normal probe path", s.state == "probe" and s.oneway is None)
 check("no target: sustain never written", s.sustains == [])
+# 4.24: the probe assist (+BOOST_V for the arrays' ramp into the island) is
+# released the tick the probe passes; left to expire it filled the held bank
+# for 150 s of island (boat 2026-09-16 18:42-18:45 UTC).
+released = None
+for _ in range(200):
+    s.tick(1, soc=60, batt=20.0, batt_v=56.4)       # headroom under the CVL: the ramp clock runs
+    if s.state == "solar":
+        released = s.out.boost_v
+        break
+check("4.24: the probe assist is released the tick the probe passes",
+      s.state == "solar" and released == 0, (s.state, released))
+s.tick(1, soc=60, batt=20.0, batt_v=56.4)
+check("4.24: and not re-requested on the island", s.out.boost_v is None)
 
 # ---- charge one-way: 60 % -> 80 % ----
 s = Sim()
