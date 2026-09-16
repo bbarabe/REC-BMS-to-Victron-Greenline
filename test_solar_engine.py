@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.24")
+check("engine version bumped", SP.ENGINE_VERSION == "4.25")
 Val = SP.Val
 
 
@@ -533,6 +533,17 @@ s.inp.departure_allowed = False
 s.tick(700, target=80)
 check("readiness veto keeps shore with floor", s.state == "shore" and s.out.charge_intent == "floor")
 check("readiness veto does not start probe clock", s.eng.st["probeStart"] == 0)
+# 4.25: under the REC's veto no measurement boost starts, a running boost is
+# released the tick the departure is refused, and the keep-alive stays quiet
+# (boat 2026-09-16 20:10-20:37 UTC: the hourly departure budget closed and the
+# keep-alive filled a held bank at +19 A for the whole wait).
+check("4.25: no measurement boost under the readiness veto", s.boosts == [], s.boosts)
+s.tick(1, boost_active=1)
+check("4.25: a running boost is released when the departure is refused", s.out.boost_v == 0, s.out.boost_v)
+before = len(s.boosts)
+s.tick(130, boost_active=1)
+check("4.25: and the keep-alive does not re-request it", len(s.boosts) == before, s.boosts[before:])
+s.tick(1, boost_active=0)
 s.inp.departure_allowed = True
 s.tick()
 check("readiness release admits waiting probe", s.state == "probe")

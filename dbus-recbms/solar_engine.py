@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.24"
+ENGINE_VERSION = "4.25"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -510,6 +510,15 @@ class Engine:
 
         def enter_probe(reason):
             if st["state"] in ("shore", "suspend") and not inp.departure_allowed:
+                # 4.25: a departure the REC refuses (its departure budget,
+                # dwell or backoff) is not imminent: the boost that was
+                # kept alive for it is released, not held. Boat 2026-09-16
+                # 20:10-20:37 UTC: three departures in the hour (two of
+                # them re-departures after deploy restarts) closed the
+                # hourly budget, and the keep-alive filled a held bank at
+                # +19 A for the whole wait.
+                if boosting:
+                    boostMsg[0] = 0
                 status[:] = ["yellow", "SHORE | waiting for transfer readiness"]
                 return
             st["state"] = "probe"
@@ -767,6 +776,7 @@ class Engine:
                         and (pvNow >= t["BOOST_MIN_PV_W"] or capped) and not unthrottled
                         and not aboveCvl and not shoreMissing and soc.v >= minSoc
                         and quattroW <= t["SURPLUS_QUIET_W"] and not owd and not noBoostRoom
+                        and inp.departure_allowed
                         and (now - st["lastBoostTs"]) >=
                         (t["BOOST_RETRY_MS"] if capSum <= 0 else t["BOOST_INTERVAL_MS"])):
                     st["lastBoostTs"] = now
@@ -774,13 +784,15 @@ class Engine:
 
                 gateOk = (not cooling and now >= st["backoffUntil"]
                           and now >= st["lockoutUntil"])
-                if (ready and gateOk and boosting
+                if (ready and gateOk and boosting and inp.departure_allowed
                         and (now - st["boostKeepTs"]) >= t["BOOST_KEEPALIVE_MS"]):
                     # 4.21: the departure is imminent (ready, nothing gating
                     # it): re-request the boost so it cannot expire during
                     # the confirm. A gated engine (cooldown, backoff) lets
                     # it expire -- a lifted limit is a bank filling at full
-                    # sun, not something to hold through a backoff.
+                    # sun, not something to hold through a backoff. 4.25:
+                    # the REC's own gate (departure_allowed) counts as
+                    # gating too, and no measurement boost starts under it.
                     boostMsg[0] = t["BOOST_V"]
                     st["boostKeepTs"] = now
 
