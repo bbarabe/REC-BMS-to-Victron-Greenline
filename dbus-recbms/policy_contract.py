@@ -464,7 +464,8 @@ class TransferSupervisor:
                 # a fault and no lockout -- dbus-recbms already raises the
                 # unverified pair as a regulation fault after lead_verify_s,
                 # and REC's own guards still decide the current (CCL 0 outside
-                # the envelope, PV + charge_limit_a under a hold).
+                # the envelope; the BMS's own limit under a hold since 3.7.0,
+                # PV + charge_limit_a only with that brake configured).
                 self.prepared = False
                 self.limited_by = 'unprepared return after %.0fs' % waited
                 return self._issue(0, now, wall, urgent=True)

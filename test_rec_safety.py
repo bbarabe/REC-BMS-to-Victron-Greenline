@@ -288,9 +288,10 @@ class RecDriverSafetyTests(unittest.TestCase):
         # the new pair verifies on the next ticks; the limit is then the floor's
         self.tick()
         self.tick()
-        self.assertGreaterEqual(batt['/Info/MaxChargeCurrent'], self.cfg.sustain_ccl_a)
-        self.assertGreaterEqual(batt['/RecBms/Sustain/ChargeLimit'] or self.cfg.sustain_ccl_a,
-                                self.cfg.sustain_ccl_a)
+        # 3.7.0 (owner, 2026-09-16): no charge limit modulation at all -- the
+        # BMS's own limit goes out and the hold's cap telemetry reads None.
+        self.assertEqual(batt['/Info/MaxChargeCurrent'], 200.0)
+        self.assertIsNone(batt['/RecBms/Sustain/ChargeLimit'])
 
     def test_a_hold_arriving_at_its_destination_folds_its_servo_into_a_fresh_anchor(self):
         # Boat, 2026-09-14 22:25-23:40 UTC: the first HOLD (50 %) was taken

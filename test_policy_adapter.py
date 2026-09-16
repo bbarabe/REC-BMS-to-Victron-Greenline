@@ -484,8 +484,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertTrue(closure, 'the return never closed the relay')
             self.assertLessEqual(closure['quattro_v'],
                                  max(closure['voltage'], closure['ocv']) + .01)
-            self.assertLessEqual(closure['ccl_a'],
-                                 closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
+            self.assertGreater(closure['ccl_a'], 100)          # 3.7.0: the BMS's own limit, no brake
             self.assertTrue(self.status(sim)['transfer']['prepared'])
             self.assertLessEqual(closure['time_s'] - started,
                                  sim.rec.policy_adapter.config.return_prepare_s + 5)
@@ -650,7 +649,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertEqual(sim.rec.lead_v, 0.0)
             self.assertAlmostEqual(sim.plant.dvcc.quattro_v, hold_v, delta=.03)
             self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v, delta=.03)
-            self.assertGreaterEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_ccl_a)
+            self.assertGreater(sim.rec.batt['/Info/MaxChargeCurrent'], 100)   # 3.7.0: no brake
 
     def test_a_hold_at_its_target_curtails_surplus_pv_instead_of_filling(self):
         # SP15/SP23/SP28 and plan B2: at the destination the band closes and
@@ -679,7 +678,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             hold_v = sim.rec.batt['/RecBms/Sustain/HoldVoltage']
             self.assertEqual(sim.rec.lead_v, 0.0)
             self.assertAlmostEqual(sim.plant.dvcc.solar_v, hold_v, delta=.03)
-            self.assertGreaterEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_ccl_a)
+            self.assertGreater(sim.rec.batt['/Info/MaxChargeCurrent'], 100)   # 3.7.0: no brake
             self.assertGreater(sum(sim.plant.pv_w), 20)
 
     def test_a_hold_below_target_opens_the_band_and_closes_it_on_arrival(self):
@@ -699,7 +698,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertAlmostEqual(sim.plant.solar_v,
                                    hold_v + sim.rec.cfg.sustain_band_v, delta=.03)
             self.assertGreater(sum(sim.plant.pv_w), 1000)
-            self.assertGreater(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_ccl_a)
+            self.assertGreater(sim.rec.batt['/Info/MaxChargeCurrent'], 100)   # 3.7.0: no brake
             socs = []
             self.hold_for(sim, 2100, sample=lambda: socs.append(sim.plant.soc),
                           **self.request_hold(sim))
@@ -710,7 +709,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertEqual(sim.rec.lead_v, 0.0)
             self.assertAlmostEqual(sim.plant.dvcc.solar_v,
                                    sim.rec.batt['/RecBms/Sustain/HoldVoltage'], delta=.03)
-            self.assertGreaterEqual(sim.rec.batt['/Info/MaxChargeCurrent'], sim.rec.cfg.sustain_ccl_a)
+            self.assertGreater(sim.rec.batt['/Info/MaxChargeCurrent'], 100)   # 3.7.0: no brake
 
     def test_a_descent_answers_a_refill_from_any_source(self):
         # E08/D07/SP40: alternating an hour of darkness and an hour of
@@ -762,7 +761,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.wait_for(sim, lambda: sim.plant.connected, timeout_s=90)
             self.assertTrue(closure)
             self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
-            self.assertLessEqual(closure['ccl_a'], closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
+            self.assertGreater(closure['ccl_a'], 100)          # 3.7.0: the BMS's own limit, no brake
             self.assertTrue(self.status(sim)['transfer']['prepared'])
 
     def test_a_target_change_on_the_island_does_not_move_the_relay(self):
@@ -798,7 +797,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertTrue(closure)
             self.assertEqual(closure['hold_mode'], 1)
             self.assertLessEqual(closure['quattro_v'], max(closure['voltage'], closure['ocv']) + .01)
-            self.assertLessEqual(closure['ccl_a'], closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
+            self.assertGreater(closure['ccl_a'], 100)          # 3.7.0: the BMS's own limit, no brake
             sim.run(10)
             self.assertEqual(sim.rec.batt['/RecBms/Sustain/Active'], 0)
             self.assertEqual(sim.rec.policy_adapter.control['mode'], 'OFF')
@@ -838,8 +837,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertAlmostEqual(closure['quattro_v'], closure['hold_v'], places=2)
             self.assertLessEqual(closure['quattro_v'],
                                  max(closure['voltage'], closure['ocv']) + .01)
-            self.assertLessEqual(closure['ccl_a'],
-                                 closure['pv_a'] + sim.rec.cfg.sustain_ccl_a + 1)
+            self.assertGreater(closure['ccl_a'], 100)          # 3.7.0: the BMS's own limit, no brake
             self.assertTrue(self.status(sim)['transfer']['prepared'])
             self.assertIsNone(self.status(sim)['transfer']['last_fault'])
 

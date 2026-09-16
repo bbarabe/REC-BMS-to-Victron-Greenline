@@ -82,7 +82,7 @@
     "enabled": "true",
     "hold_s": "120",
     "step_pct": "1",
-    "charge_limit_a": "5",
+    "charge_limit_a": "0",
     "servo_step_v": "0.02",
     "servo_period_s": "30",
     "servo_deadband_pct": "0.1",

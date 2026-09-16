@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.6.2"
+VERSION = "3.7.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -244,7 +244,11 @@ class Config:
         self.sustain_enabled = str(su.get("enabled", "true")).lower() != "false"
         self.sustain_hold_s = self._number(su.get("hold_s", 120))
         self.sustain_step = max(0.0, self._number(su.get("step_pct", 1)))
-        self.sustain_ccl_a = max(0.0, self._number(su.get("charge_limit_a", 5)))
+        # 3.7.0: 0 by default -- no charge limit modulation under a hold at
+        # all, not even on an AC re-accept (owner, 2026-09-16, with the
+        # Quattro's own solar priority in force). A positive figure brings
+        # the floor's PV + charge_limit_a brake back.
+        self.sustain_ccl_a = max(0.0, self._number(su.get("charge_limit_a", 0)))
         # v1.8.0: the voltage anchor's SOC servo and the band-absorbed step
         self.sustain_servo_v = max(0.0, self._number(su.get("servo_step_v", 0.02)))
         self.sustain_servo_s = self._number(su.get("servo_period_s", 30))
@@ -690,10 +694,11 @@ def sustain_servo(mode, err, charging, deadband, draining=True, filling=False):
         return 0
     if mode == SUSTAIN_HOLD:
         # Up whenever the bank sits clearly under its destination, draining
-        # or not: under the hold every charger is capped at PV +
-        # charge_limit_a (the floor's brake), so a step up fills gently
-        # instead of winding the command ahead of a 200 A charger (the
-        # v1.8.1 case); within two deadbands only while draining (3.3.2).
+        # or not: under the hold every charger sits on the hold voltage
+        # (and, with charge_limit_a set, under the floor's PV +
+        # charge_limit_a brake), so a step up fills gently instead of
+        # winding the command ahead of a 200 A charger (the v1.8.1 case);
+        # within two deadbands only while draining (3.3.2).
         # Down while anything fills the bank above its destination: the
         # Quattro's bias over its command, or the sun through a hold
         # voltage that ended up over the bank (3.6.0). Never on a bank
@@ -1261,9 +1266,13 @@ class RecBmsDriver:
             self.applied_reason = "systemcalc /Control/EffectiveChargeVoltage unavailable (DVCC off or systemcalc down?)"
             return False
         if effective > safe + 1e-8 or abs(effective - (base + offset)) > 0.015:
-            if offset > 0.005 and abs(effective - base) <= 0.015:
+            if offset > 0.005 and abs(effective - base) <= 0.025:
                 # the base went through and the offset did not: the access
-                # level gate (see _check_access_level)
+                # level gate (see _check_access_level). Within one servo
+                # step (0.02 V) of the base: the effective figure can lag a
+                # step the servo just took (3.7.0, fixture: the base moved
+                # 56.42 -> 56.40 while the fault was being timed and the
+                # actionable reason was lost to the generic one).
                 self.applied_reason = ("systemcalc ignores the solar offset: MPPTs get %.2fV, "
                                        "expected %.2fV" % (effective, base + offset))
             else:
@@ -2080,7 +2089,19 @@ class RecBmsDriver:
         (_sustain_band, _sustain_destination) and the current limit stays
         what it is everywhere else: a genuine constraint, at least
         charge_limit_a over what the arrays already make, never a way to
-        make a charger stop."""
+        make a charger stop.
+
+        3.7.0: off by default (charge_limit_a = 0). With the hold on the
+        bank's own voltage the Quattro has nowhere to push -- the boat's
+        two re-accepts of 2026-09-15 (23:00 and 01:01 UTC) were 5 and 8 A
+        for ten seconds, the voltage doing the stopping, the cap overshot
+        anyway -- and by day the Quattro's own solar priority parks the
+        charger altogether, so all the cap did was ration the arrays' ramp
+        to 5 A per DVCC cycle on shore. The owner chose to run without
+        any charge limit modulation, re-accepts included (2026-09-16);
+        the BMS's own limit goes out and a positive charge_limit_a is the
+        way back if a charge-now re-accept ever shows the 2026-09-02
+        burst again."""
         c = self.cfg
         if held is None or c.sustain_ccl_a <= 0 or self.boost["active"]:
             return ccl, None
