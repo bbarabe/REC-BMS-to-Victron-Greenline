@@ -6,7 +6,7 @@ Quattro DC power. See reviews/solar-engine-baseline-deviations.md.
 """
 import math
 
-ENGINE_VERSION = "4.25"
+ENGINE_VERSION = "4.26"
 
 ENGINE_DEFAULTS = {
     # 4.13 (issue #5): the need is dbus-recbms' complete DC-bus demand (AC
@@ -769,11 +769,26 @@ class Engine:
                 # under a 75 V sky and no boost ever fired, so the engine
                 # could not measure the arrays it needed to leave shore.
                 capped = inp.ccl_a is not None and inp.ccl_a.v <= t["BOOST_CAPPED_A"]
+                # 4.26: the hold curtails by voltage as well. REC 3.7 holds
+                # both chargers at the bank's own notch with no current cap
+                # (charge_limit_a 0), so at the destination the arrays sit
+                # at their limit with nothing flowing -- 2 W under a 75 V
+                # sky for the whole half hour after the 21:10 UTC reconnect,
+                # boat 2026-09-16 -- and the boost, the only measurement
+                # there is, never fired: every boost of that day on shore
+                # had waited for the trickle to creep over the 4.7 floor by
+                # luck (20.4 W at 20:17, 21.5 W at 14:40). An array at its
+                # limit under an active hold and a bright sky is curtailed,
+                # not dark, and its yield says nothing, as under the cap.
+                # The floor keeps its say under a dim sky (a dusk or a
+                # marina light at 55-65 V), which is where it earned it.
+                held = inp.sustain_active is not None and inp.sustain_active.v == 1
+                curtailed = capped or (held and throttled_any and vocMax >= t["VOC_EXPLORE_V"])
                 # 4.22: never a boost where it has no room (a charge target
                 # within BOOST_V of the installation's limit): the blind
                 # probe measures there instead.
                 if (not boosting and dayOk and vocMax >= t["VOC_DAY_V"] and not vocRising
-                        and (pvNow >= t["BOOST_MIN_PV_W"] or capped) and not unthrottled
+                        and (pvNow >= t["BOOST_MIN_PV_W"] or curtailed) and not unthrottled
                         and not aboveCvl and not shoreMissing and soc.v >= minSoc
                         and quattroW <= t["SURPLUS_QUIET_W"] and not owd and not noBoostRoom
                         and inp.departure_allowed

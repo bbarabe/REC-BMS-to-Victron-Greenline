@@ -24,8 +24,8 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.5.7"
-ENGINE_VERSION = "4.25-restored"
+VERSION = "3.5.8"
+ENGINE_VERSION = "4.26-restored"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

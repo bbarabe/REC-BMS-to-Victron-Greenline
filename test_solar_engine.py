@@ -18,7 +18,7 @@ check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5 and scfg.engine["ONEWAY_FULL_PCT"] == 100 and
       scfg.engine["ONEWAY_MIN_SOC"] == 25 and scfg.engine["ONEWAY_DEFICIT_W"] == 50 and
       scfg.engine["ONEWAY_DEFICIT_MS"] == 180000)
-check("engine version bumped", SP.ENGINE_VERSION == "4.25")
+check("engine version bumped", SP.ENGINE_VERSION == "4.26")
 Val = SP.Val
 
 
@@ -103,6 +103,10 @@ class Sim:
             inp.target_soc = Val(v["target"], n) if v["target"] is not None else None
             inp.boost_active = Val(v.get("boost_active", 0), n)
             inp.boost_window = Val(v.get("boost_window", 0), n)
+            # 4.26: dbus-recbms' hold flag (/RecBms/Sustain/Active); None
+            # unless a scenario sets it, so the older checks model no hold.
+            sa = v.get("sustain_active")
+            inp.sustain_active = None if sa is None else Val(sa, n)
             out = self.eng.tick(n, inp)
             if out.cmd is not None:
                 self.cmd = out.cmd
@@ -509,6 +513,26 @@ s = Sim()
 s.inp.ccl_a = SP.Val(0.1, s.now)
 s.tick(400, soc=60, target=80, pv=0.0, m=0, voc=20.0, batt_v=56.4)   # night under the same cap
 check("4.19: no boost at night under a cap", s.boosts == [], str(s.boosts))
+
+# ---- 4.26: the hold's voltage notch curtails like a cap; boost on daylight ----
+# Boat 2026-09-16 21:10-21:30 UTC: REC 3.7 holds both chargers at the bank's own
+# notch with no current cap, both arrays at their limit giving 2 W under a
+# 75 V sky, and no boost ever fired -- the engine sat on shore in full sun.
+s = Sim()
+s.tick(60, soc=60, target=80, pv=30.0, m=2, voc=75.0, load=1000.0, batt_v=56.4)   # a dim capture
+s.tick(400, pv=2.0, m=1, sustain_active=1)                                        # held at the notch, 2 W, 75 V
+check("4.26: boost on a held trickle under a bright sky", s.boosts and s.boosts[-1] == s.t["BOOST_V"] and s.state == "shore", (str(s.boosts), s.state))
+s = Sim()
+s.tick(60, soc=60, target=80, pv=30.0, m=2, voc=75.0, load=1000.0, batt_v=56.4)
+s.tick(400, pv=2.0, m=1, sustain_active=1, voc=62.0)                              # held, but a dim sky: the 4.7 floor holds
+check("4.26: no boost on a held trickle under a dim sky", s.boosts == [], str(s.boosts))
+s = Sim()
+s.tick(60, soc=60, target=80, pv=30.0, m=2, voc=75.0, load=1000.0, batt_v=56.4)
+s.tick(400, pv=2.0, m=1, sustain_active=0)                                        # no hold: 4.19's rule, unchanged
+check("4.26: no boost on a trickle without a hold or a cap", s.boosts == [], str(s.boosts))
+s = Sim()
+s.tick(400, soc=60, pv=2.0, m=2, voc=75.0, load=1000.0, batt_v=56.4, sustain_active=1)   # held, tracker live: unthrottled (4.9)
+check("4.26: no boost while a held array tracks unthrottled", s.boosts == [], str(s.boosts))
 
 # ---- the SOC floor still wins ----
 s = Sim()
