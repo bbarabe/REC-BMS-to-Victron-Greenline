@@ -36,7 +36,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "3.7.1"
+VERSION = "3.7.2"
 BUSITEM = "com.victronenergy.BusItem"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -252,6 +252,12 @@ class Config:
         # v1.8.0: the voltage anchor's SOC servo and the band-absorbed step
         self.sustain_servo_v = max(0.0, self._number(su.get("servo_step_v", 0.02)))
         self.sustain_servo_s = self._number(su.get("servo_period_s", 30))
+        # 3.7.2: the destination servo's own, longer period. The chargers
+        # need 60-90 s to settle after a 0.01 V step (and to restart from
+        # 0 W), so 30 s steps overshoot them both ways: boat 2026-09-16
+        # 15:44-16:36 UTC, 74 steps between boosts, the bank still moving
+        # at 73 of them, PV 0 W 16 % of the time, bank draining 27 %.
+        self.sustain_hold_servo_s = self._number(su.get("hold_servo_period_s", 90))
         self.sustain_servo_db = max(0.0, self._number(su.get("servo_deadband_pct", 0.1)))
         self.sustain_servo_up = max(0.0, self._number(su.get("servo_max_up_v", 0.5)))
         self.sustain_servo_down = max(0.0, self._number(su.get("servo_max_down_v", 2.0)))
@@ -293,7 +299,8 @@ class Config:
             'lead_verify_s', 'live_timeout', 'alert_timeout', 'restrict_timeout',
             'startup_grace', 'safe_cvl', 'safe_voltage', 'extv_max_age', 'extv_poll_s',
             'boost_hold_s', 'boost_measure_start_s', 'boost_measure_len_s',
-            'sustain_hold_s', 'sustain_servo_s', 'sustain_taper_s', 'sustain_dusk_s')
+            'sustain_hold_s', 'sustain_servo_s', 'sustain_hold_servo_s',
+            'sustain_taper_s', 'sustain_dusk_s')
         for key in positive:
             if getattr(self, key) <= 0:
                 raise ValueError('configuration parameter must be positive: ' + key)
@@ -1824,7 +1831,12 @@ class RecBmsDriver:
                 # answered the fill still decaying from +7.5 A and cut the
                 # arrays to 0 W, boat 2026-09-15 23:16 UTC).
                 su["servo_ts"] = now
-            elif now - su["servo_ts"] >= c.sustain_servo_s:
+            elif now - su["servo_ts"] >= (c.sustain_hold_servo_s if (hold and su["at_dest"])
+                                          else c.sustain_servo_s):
+                # 3.7.2: at the destination the period is the chargers'
+                # settling time, not the SOC servo's 30 s -- a step judged
+                # on a current still answering the previous one overshoots
+                # (see sustain_hold_servo_s).
                 su["servo_ts"] = now
                 if hold and su["at_dest"]:
                     # 3.6.1: at the destination the hold voltage is the

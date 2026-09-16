@@ -344,10 +344,10 @@ class RecDriverSafetyTests(unittest.TestCase):
         # bank touches 49.9 % again -- folding them re-anchored the hold
         # every 30 s all night on the boat.
         for _ in range(3):
-            self.now += self.cfg.sustain_servo_s
+            self.now += self.cfg.sustain_hold_servo_s      # 3.7.2: the destination's own period
             drive(49.89, 55.6, -0.9)
         self.assertAlmostEqual(su['servo_v'], 3 * self.cfg.sustain_hold_step_v, places=4)
-        self.now += self.cfg.sustain_servo_s
+        self.now += self.cfg.sustain_hold_servo_s
         drive(49.89, 55.6, 0.0)                            # covered: still
         self.assertAlmostEqual(su['servo_v'], 3 * self.cfg.sustain_hold_step_v, places=4)
         for soc in (49.9, 49.89, 49.9, 50.0):
@@ -462,7 +462,7 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.driver._sustain_anchor(50.2, 55.65, 0.0, 'test')
 
         def period(soc, amps):
-            self.now += self.cfg.sustain_servo_s
+            self.now += self.cfg.sustain_hold_servo_s              # 3.7.2: the destination's own period
             self.driver._set_sustain(3)
             self.driver._service_sustain(self.now, soc, 50.0, 55.6, amps)
 
@@ -511,7 +511,7 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.driver._sustain_anchor(50.0, 55.6, 0.0, 'test')
 
         def period(soc, amps):
-            self.now += self.cfg.sustain_servo_s
+            self.now += self.cfg.sustain_hold_servo_s
             self.driver._set_sustain(3)
             self.driver._service_sustain(self.now, soc, 50.0, 55.6, amps)
 
@@ -529,9 +529,53 @@ class RecDriverSafetyTests(unittest.TestCase):
         self.now += 10
         self.driver._service_sustain(self.now, 50.2, 50.0, 55.6, 5.0)
         self.assertEqual(su['servo_v'], 0.0)
-        self.now += 20
-        self.driver._service_sustain(self.now, 50.2, 50.0, 55.6, 6.0)   # the same fill, boost over: the servo answers
+        self.now += 20                                                   # the SOC servo's 30 s: not the destination's period (3.7.2)
+        self.driver._service_sustain(self.now, 50.2, 50.0, 55.6, 6.0)
+        self.assertEqual(su['servo_v'], 0.0)
+        self.now += self.cfg.sustain_hold_servo_s - 30
+        self.driver._service_sustain(self.now, 50.2, 50.0, 55.6, 6.0)   # the same fill, a full period after the boost: the servo answers
         self.assertAlmostEqual(su['servo_v'], -self.cfg.sustain_hold_step_v, places=4)
+
+    def test_the_destination_servo_waits_the_chargers_settling_time(self):
+        # 3.7.2. Boat, 2026-09-16 15:44-16:36 UTC: between boosts the
+        # destination servo stepped 74 times at 30 s and the bank's current
+        # was still answering the previous step at 73 of them -- an MPPT
+        # needs 60-90 s to settle after a 0.01 V step and as long to restart
+        # from 0 W -- so every landing overshot 2-4 steps each way: PV 0 W
+        # 16 % of the time, the bank draining 27 %. At the destination the
+        # period is hold_servo_period_s; the SOC servo keeps servo_period_s
+        # while the band is open.
+        self.assertGreater(self.cfg.sustain_hold_servo_s, self.cfg.sustain_servo_s)
+        self.driver.settings['chargeslider'] = 50
+        self.driver.sp_enabled = True
+        self.tick()
+        self.assertTrue(self.driver._set_sustain(3))
+        su = self.driver.sustain
+        self.driver._sustain_anchor(50.1, 55.65, 0.0, 'test')
+
+        def after(seconds, soc, amps):
+            self.now += seconds
+            self.driver._set_sustain(3)
+            self.driver._service_sustain(self.now, soc, 50.0, 55.6, amps)
+
+        after(self.cfg.sustain_servo_s, 50.1, 3.0)                    # filling at the destination, 30 s: no step yet
+        self.assertIs(su['at_dest'], True)
+        self.assertEqual(su['servo_v'], 0.0)
+        after(self.cfg.sustain_hold_servo_s - self.cfg.sustain_servo_s, 50.1, 3.0)
+        self.assertAlmostEqual(su['servo_v'], -self.cfg.sustain_hold_step_v, places=4)
+        after(self.cfg.sustain_servo_s, 50.1, 3.0)                    # and again only a full period later
+        self.assertAlmostEqual(su['servo_v'], -self.cfg.sustain_hold_step_v, places=4)
+        after(self.cfg.sustain_hold_servo_s - self.cfg.sustain_servo_s, 50.1, 3.0)
+        self.assertAlmostEqual(su['servo_v'], -2 * self.cfg.sustain_hold_step_v, places=4)
+        # The band open (the bank well under its destination), the SOC
+        # servo answers a drain on its own 30 s period, as before.
+        self.driver.sustain = self.driver._sustain_idle()
+        self.assertTrue(self.driver._set_sustain(3))
+        su = self.driver.sustain
+        self.driver._sustain_anchor(49.5, 55.4, -1.0, 'test')
+        after(self.cfg.sustain_servo_s, 49.5, -1.0)
+        self.assertFalse(su['at_dest'])
+        self.assertAlmostEqual(su['servo_v'], self.cfg.sustain_servo_v, places=4)
 
     def test_a_re_asserted_hold_keeps_its_anchor_and_refreshes_expiry(self):
         self.driver.settings['chargeslider'] = 80
