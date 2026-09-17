@@ -458,7 +458,9 @@ The Max Charge slider is a destination, and while it is far from the SOC the
 bank is only allowed to move **toward** it — every watt-hour of solar goes
 into the move, shore never fights it.
 
-**Charging** (target more than `oneway_enter_pct` = 5 % above the SOC): the
+**Charging** (target more than `oneway_enter_pct` = 1 % above the SOC; 5 %
+until engine 4.3.1, which a single slider step from the present SOC never
+reached): the
 normal shore → probe → solar cycle does the charging — whenever the sun
 carries the loads, shore is dropped and the surplus fills the bank up to the
 real target. Whenever shore is connected (shore, suspend) the engine asks
@@ -479,7 +481,7 @@ deficit, surge, SOC-drift and ceiling-stall exits are off — the bank draining
 (suspend, on shore under the ceiling, resume without the re-ramp boost), and
 the AC-control faults. No measurement boosts are requested.
 
-Both stand down within `oneway_exit_pct` = 1 % of the target and the normal
+Both stand down within `oneway_exit_pct` = 0.5 % of the target and the normal
 engine finishes the last bit (the charger tops up to the slider, or a
 burn-down spends the band). Moving the slider re-evaluates on the next tick,
 including flipping direction. `oneway_enter_pct = 0` turns the feature off.

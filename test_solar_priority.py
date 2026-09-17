@@ -201,8 +201,8 @@ check("ratchet: floor without SOC keeps and clips",
 print("\n=== solar priority engine: one-way ===")
 SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priority")
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
-check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 5 and
-      scfg.engine["ONEWAY_EXIT_PCT"] == 1)
+check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
+      scfg.engine["ONEWAY_EXIT_PCT"] == 0.5)
 check("engine version bumped", SP.ENGINE_VERSION == "4.3.1")
 Val = SP.Val
 
@@ -322,12 +322,15 @@ check("charge: done within EXIT of the target", s.oneway is None and s.sustain =
 
 # ---- hysteresis and re-targeting ----
 s = Sim()
-s.tick(1, soc=77, target=80)
-check("77 -> 80 is inside ENTER: normal engine", s.oneway is None)
-s.tick(1, soc=74)
-check("74 -> 80 engages", s.oneway == "charge")
-s.tick(1, soc=78)
-check("78 -> 80 stays engaged (EXIT is 1)", s.oneway == "charge")
+s.tick(1, soc=79.2, target=80)
+check("79.2 -> 80 is inside ENTER (1): normal engine", s.oneway is None)
+s.tick(1, soc=77)
+check("77 -> 80 engages: a slider step from the present SOC is a direction", s.oneway == "charge")
+s.tick(1, soc=79.3)
+check("79.3 -> 80 stays engaged (EXIT is 0.5)", s.oneway == "charge")
+b = Sim()
+b.tick(1, soc=50.3, target=55)
+check("the boat, 2026-09-17: 50.3 -> 55 engages (4.7 points never did at ENTER 5)", b.oneway == "charge")
 s.tick(1, target=50)
 check("slider moved the other way: flips to discharge", s.oneway == "discharge" and s.sustain == 2)
 s.inp.enabled = False
@@ -364,7 +367,7 @@ check("discharge: ceiling kept through suspend", s.sustain == 2)
 s.tick(15, load=300.0, batt=-300.0)
 check("discharge: resumes to solar without a boost", s.state == "solar" and s.cmd == 1 and
       s.boosts == [])
-s.tick(1, soc=70.9)
+s.tick(1, soc=70.4)
 check("discharge: done within EXIT of the target", s.oneway is None and s.sustain == 0)
 s.tick(20)
 check("discharge done: the normal deficit exit takes over", s.state == "shore" and s.cmd == 0)

@@ -123,7 +123,12 @@ ENGINE_DEFAULTS = {
     "BURN_CALM_GATE_MS": 45000, "LOAD_AVG_MS": 60000,
     # one-way charge / discharge (4.3): engage when the Max Charge target is
     # further than ENTER from the SOC, stand down within EXIT of it. 0 = off.
-    "ONEWAY_ENTER_PCT": 5, "ONEWAY_EXIT_PCT": 1,
+    # 4.3.1 (owner, 2026-09-17): 1 / 0.5, was 5 / 1. At 5 a whole slider
+    # step from the present SOC (50.3 -> 55) never engaged one-way, and the
+    # normal engine lets the shore charger fill that gap whenever the
+    # Quattro is set to charge. One SOC point is the step dbus-recbms itself
+    # treats as real movement (sustain step_pct).
+    "ONEWAY_ENTER_PCT": 1, "ONEWAY_EXIT_PCT": 0.5,
 }
 
 
