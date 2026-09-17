@@ -25,8 +25,13 @@ def _number(value, low, high, name):
 
 
 class PolicyContract:
-    def __init__(self, state=None, generation=None):
+    # max_boost_v: the largest boost a request may carry. dbus-recbms passes
+    # its configured [solarboost] max_boost_v so the two bounds agree; a
+    # request above it is rejected whole (SetValue 2), as the 0.50 V boost of
+    # 2026-09-17 00:30 UTC was, silently, by the 0.30 that used to live here.
+    def __init__(self, state=None, generation=None, max_boost_v=0.30):
         self.state = state if state is not None else {}
+        self.max_boost_v = float(max_boost_v)
         self.generation = generation or uuid.uuid4().hex
         self.accepted_id = 0
         self.request = None
@@ -59,7 +64,7 @@ class PolicyContract:
             limits = request['requested_limits']
             if not isinstance(limits, dict) or set(limits) - {'boost_v', 'purpose', 'sustain'}:
                 raise ValueError('unknown requested limits')
-            _number(limits.get('boost_v', 0), 0, 0.30, 'boost_v')
+            _number(limits.get('boost_v', 0), 0, self.max_boost_v, 'boost_v')
             if type(limits.get('sustain')) is not int or limits['sustain'] not in (0, 1, 2, 3):
                 raise ValueError('sustain must be release (0), floor (1), ceiling (2) or hold (3)')
             if request['mode'] in ('OFF', 'COMPLETE_FULL') and limits['sustain'] != 0:

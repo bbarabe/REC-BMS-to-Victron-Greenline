@@ -29,7 +29,8 @@ class RecPolicyAdapter:
                                    max_overhead_efc=self.config.ordinary_overhead_efc,
                                    reverse_event_wh=self.config.reverse_event_wh,
                                    reverse_day_wh=self.config.reverse_day_wh)
-        self.contract = PolicyContract(self.ledger.controller_state.setdefault('contract', {}))
+        self.contract = PolicyContract(self.ledger.controller_state.setdefault('contract', {}),
+                                       max_boost_v=getattr(cfg, 'boost_max_v', 0.30))
         self.transfer = TransferSupervisor(self.ledger.controller_state.setdefault('transfer', {}),
             connected_dwell_s=self.config.connected_dwell_s, timeout_s=self.config.transfer_timeout_s,
             hourly_departures=int(self.config.hourly_departures), daily_departures=int(self.config.daily_departures),

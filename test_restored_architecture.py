@@ -40,6 +40,22 @@ class RestoredBoundaryTests(unittest.TestCase):
             self.assertFalse(contract.accept(candidate, 101, 80))
             self.assertEqual(contract.accepted_id, 1)
 
+    def test_boost_bound_follows_the_configured_maximum(self):
+        # REC 3.7.7: the protocol's boost bound is dbus-recbms' max_boost_v,
+        # not a constant. 2026-09-17 00:30 UTC: config raised to 0.50, the
+        # engine asked for 0.50, and the contract's 0.30 rejected every
+        # request that carried it (SetValue 2 every 180 s, no boost, no log
+        # line naming the reason).
+        contract = PolicyContract(generation='test', max_boost_v=0.50)
+        self.assertTrue(contract.accept(request(contract), 100, 80, consumer_ready=True))
+        accepted = request(contract, 2)
+        accepted['requested_limits'] = {'sustain': 3, 'boost_v': .5, 'purpose': 'solar'}
+        self.assertTrue(contract.accept(accepted, 101, 80))
+        rejected = request(contract, 3)
+        rejected['requested_limits'] = {'sustain': 3, 'boost_v': .51, 'purpose': 'solar'}
+        self.assertFalse(contract.accept(rejected, 102, 80))
+        self.assertEqual(contract.accepted_id, 2)
+
     def test_missing_feedback_aborts_pending_departure_without_spending_another_edge(self):
         relay = TransferSupervisor()
         relay.observe(True, 0, 1000)
