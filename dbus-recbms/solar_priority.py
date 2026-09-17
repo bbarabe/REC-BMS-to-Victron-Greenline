@@ -40,7 +40,10 @@ What it does (see README.md "Solar Priority driver"):
     over the target; it returns when the island has drawn 0.5 % of the bank
     below its best point (an energy: deficit adds, surplus repays). The only
     probe is a dbus-recbms boost when an array reports "limited" on shore.
-    HOLD_RULES = 0 leaves the 4.3 engine in charge there.
+    4.5: the same rules run at any distance UNDER the target (charging is
+    about harvesting the sun on the way up, with few relay cycles), and a
+    Charge now clicked on the GX by day is honoured as the owner's.
+    HOLD_RULES = 0 leaves the 4.3 engine in charge of all of it.
 
 Differences from the flow (all deliberate):
   - inputs come from a velib DbusMonitor (signal-driven cache). Values stay
@@ -78,8 +81,8 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "4.2.0"
-ENGINE_VERSION = "4.4.0"
+VERSION = "4.3.0"
+ENGINE_VERSION = "4.5.0"
 BUSITEM = "com.victronenergy.BusItem"
 _CLOCK_BASE_MS = 10 ** 12      # see SolarPriorityDriver._ms
 
@@ -295,6 +298,7 @@ def fresh_state(now, t):
         "oneway": None, "sustainSent": 0, "sustainAssert": 0,
         # 4.4
         "daylight": None, "lightSince": 0, "darkSince": 0, "safety": False, "wasHold": False,
+        "preferWanted": None, "preSeen": False, "ownerCharge": False,
         "predWin": [], "holdProbe": 0, "probeRef": None,
         "drawdownWh": 0.0, "drawdownTs": 0, "predW": None, "predCheckAt": 0,
     }
@@ -687,9 +691,40 @@ class Engine:
             elif soc.v >= t["SAFETY_EXIT_SOC"] and st["safety"]:
                 st["safety"] = False
                 self.log("safety over at SOC %.1f%%" % soc.v)
-        # HOLD: within ENTER of the target (no one-way direction), decided on
-        # the SOC and on measured power
-        hold = bool(t["HOLD_RULES"]) and enabled and not missing and tgt is not None and oneway is None
+        # HOLD rules: decided on the SOC and on measured power. 4.5 (owner,
+        # 2026-09-17): they run at ANY distance under the target, not only
+        # within ENTER of it -- charging under Solar Priority is about taking
+        # as many kWh from the sun as it offers on the way up, with few relay
+        # cycles; "one-way charge" is now only the name on the status line.
+        # Only a one-way DISCHARGE (bank over the target) keeps its own rules.
+        hold = (bool(t["HOLD_RULES"]) and enabled and not missing and tgt is not None
+                and oneway != "discharge")
+
+        # The owner's "Charge now". The toggle is ours to set at dawn and dusk,
+        # but a Charge now clicked on the GX by day is the owner in a hurry:
+        # once our own "prefer solar" has been seen to land, a toggle that
+        # reads otherwise by day is theirs. Until the bank is at the target
+        # (or they flip it back, or switch Solar Priority off) the toggle is
+        # left alone, shore charges with no floor in its way, and the boat
+        # stays on shore, through the night if need be.
+        pre = inp.pre.v if inp.pre is not None else None
+        wanted = prefer_wanted(enabled, st["safety"], st["daylight"], bool(t["HOLD_RULES"]))
+        if wanted != st["preferWanted"]:
+            st["preferWanted"] = wanted
+            st["preSeen"] = False
+        if wanted is not None and pre == wanted:
+            st["preSeen"] = True
+        under = soc is not None and tgt is not None and soc.v < tgt.v - t["HOLD_FLOOR_GAP_PCT"]
+        if st["ownerCharge"]:
+            if not hold or not under or pre == 1:
+                st["ownerCharge"] = False
+                self.log("owner's charge now over (%s)" % (
+                    "toggle back on prefer solar" if pre == 1 else
+                    "bank at the target" if (hold and not under) else "rules not in force"))
+        elif hold and under and wanted == 1 and st["preSeen"] and pre in (0, 2):
+            st["ownerCharge"] = True
+            self.log("OWNER'S CHARGE NOW: the toggle reads %d by day -- shore charges to %.0f%%, "
+                     "toggle and relay left alone" % (pre, tgt.v))
         if hold and not st["wasHold"] and st["state"] == "solar":
             # HOLD takes over an island another mode started (a one-way drain
             # that reached its target): its budget and its backstop start here
@@ -777,7 +812,8 @@ class Engine:
                 r2 = (solarM is not None and soc.v >= tgt.v + t["HOLD_MID_PCT"]
                       and solarM >= t["HOLD_FRAC"] * needM)
                 go = (light and not shoreMissing and soc.v >= t["MIN_SOC"]
-                      and loadNow.v < t["SUSPEND_LOAD_W"] and (r1 or r2))
+                      and loadNow.v < t["SUSPEND_LOAD_W"] and (r1 or r2)
+                      and not st["ownerCharge"])
                 if go:
                     st["readySince"] = st["readySince"] or now
                 else:
@@ -810,7 +846,7 @@ class Engine:
                         self.log("hold probe done in %ds: solar %.0fW of need %.0fW -- staying"
                                  % (age / 1000, solarM or 0, needM or 0))
                 elif (light and limited and not go and not boosting and gateOk and not shoreMissing
-                      and not leadFault and soc.v >= t["MIN_SOC"]
+                      and not leadFault and soc.v >= t["MIN_SOC"] and not st["ownerCharge"]
                       and loadNow.v < t["SUSPEND_LOAD_W"]
                       and (needM is None or needM <= pRated)     # a need no sun can meet: nothing to learn
                       and now - st["lastBoostTs"] >= t["PROBE_INTERVAL_MS"]):
@@ -841,6 +877,8 @@ class Engine:
                     sx += " [day]" if light else (" [night]" if st["daylight"] is False else " [light?]")
                     if limited:
                         sx += " [limited]"
+                    if st["ownerCharge"]:
+                        sx += " [CHARGE NOW: owner]"
                     if st["holdProbe"]:
                         sx += " [probe %ds]" % ((now - st["holdProbe"]) / 1000)
                     if now < st["lockoutUntil"]:
@@ -1181,7 +1219,10 @@ class Engine:
                     # SOC drift from the departure stays as the backstop
                     st["loadExceedStart"] = 0
                     st["surgeStart"] = 0
-                    if soc.v < st["socEntry"] - t["SOC_DRIFT_MAX"]:
+                    if st["ownerCharge"]:
+                        toShore("owner's charge now")
+                        status[0] = "blue"
+                    elif soc.v < st["socEntry"] - t["SOC_DRIFT_MAX"]:
                         escalateBackoff()
                         toShore("SOC %.1f%% (entry %.1f%%)" % (soc.v, st["socEntry"]))
                         status[0] = "blue"
@@ -1261,17 +1302,20 @@ class Engine:
         # "at dusk hold the lower of now and the target" is this floor:
         # dbus-recbms pins it at min(present SOC, slider).
         # The safety (SOC under SAFETY_SOC) overrides every hold: charge.
-        pre = inp.pre.v if inp.pre is not None else None
-        if st["safety"]:
+        # 4.5: the same floor rule while charging toward a far target -- by
+        # day under "prefer solar" there is no floor, so the MPPTs' ceiling is
+        # the target's band and not the present SOC's; the owner's Charge now
+        # lifts it too.
+        if st["safety"] or st["ownerCharge"]:
             want = SUSTAIN_OFF
-        elif owc:
-            want = SUSTAIN_FLOOR if st["state"] in ("shore", "suspend") else SUSTAIN_OFF
         elif owd:
             want = SUSTAIN_CEILING
-        elif (hold and st["state"] in ("shore", "suspend")
-              and soc.v < tgt.v - t["HOLD_FLOOR_GAP_PCT"]
-              and not (st["daylight"] is True and pre == 1)):
-            want = SUSTAIN_FLOOR
+        elif hold:
+            want = (SUSTAIN_FLOOR if (st["state"] in ("shore", "suspend") and under
+                                      and not (st["daylight"] is True and pre == 1))
+                    else SUSTAIN_OFF)
+        elif owc:                       # hold_rules = 0: the 4.3 one-way charge
+            want = SUSTAIN_FLOOR if st["state"] in ("shore", "suspend") else SUSTAIN_OFF
         else:
             want = SUSTAIN_OFF
         if st["sustainSent"] != want or (want and now - st["sustainAssert"] >= t["ASSERT_MS"]):
@@ -1284,7 +1328,7 @@ class Engine:
         out.oneway = oneway or ""
         out.hold = hold
         out.daylight = st["daylight"]
-        out.prefer = prefer_wanted(enabled, st["safety"], st["daylight"], bool(t["HOLD_RULES"]))
+        out.prefer = None if st["ownerCharge"] else wanted
         out.pred_w = predM if (hold and st["state"] == "shore") else None
         out.deficit_wh = st["drawdownWh"]
         out.status_fill, out.status_text = status

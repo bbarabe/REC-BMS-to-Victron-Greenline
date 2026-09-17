@@ -519,10 +519,19 @@ The status line is prefixed `1-WAY CHARGE 62->80% |` / `1-WAY DISCHARGE 90->70% 
 the discharge stint reads `DRAIN | …`, and engagement, completion and the
 sustain requests are logged.
 
-### HOLD rules (engine 4.4)
+### HOLD rules (engine 4.4; since 4.5 also while charging)
 
-Within `oneway_enter_pct` (now 2) of the Max Charge target the bank is **held**,
-and the relay is decided on the SOC and on measured power instead of voltages.
+At or under the Max Charge target -- within `oneway_enter_pct` (now 2) of it,
+and since engine 4.5 at **any distance under it** -- the relay is decided on
+the SOC and on measured power instead of voltages. Charging under Solar
+Priority is about taking as many kWh from the sun as it offers on the way up,
+with few relay cycles: the 4.3 one-way-charge machinery (estimate, 90 s trial
+on the island, -50 W exit; 153 trials and 33 departures to go 50 -> 65 % on
+eight recorded days) is replaced by the same rules (8 departures, every watt
+of sun used, about +0.8 %/day on those days' sun). "1-WAY CHARGE 50->80% |"
+is now only the name on the status line; a one-way **discharge** (bank over
+the target) keeps its own rules. In a hurry, the owner switches Solar Priority
+off and/or clicks *Charge now* on the GX (see below).
 Needs dbus-recbms >= 4.1.0 with `solar_gain_pct` (the band over the target).
 `hold_rules = 0` puts the 4.3 engine (probe / harvest / burn-down) back, with
 no safety override and the Quattro's toggle left to the owner; going back also
@@ -556,6 +565,15 @@ assumes the MPPTs at the target and the Quattro below it.
   dbus-recbms boost lifts the MPPTs' target, at most every 30 min. It ends the
   moment the rules are met (and the boat leaves), or once no array is limited
   and the output has been flat for 20 s, or at dbus-recbms's 120 s cap.
+
+- **The owner's Charge now.** The toggle is the engine's to set at dawn and
+  dusk, but once its own *prefer solar* has been seen to land, a toggle that
+  reads otherwise by day is the owner's click: until the bank is at the
+  target (or they flip it back, or switch Solar Priority off) the toggle is
+  left alone, no floor is asked for, and the boat stays on (or returns to)
+  shore so the charger can work -- through the night if need be. A dawn write
+  that never landed is not mistaken for it. A click at night cannot be told
+  from the engine's own night setting: switch Solar Priority off instead.
 
 Diagnostics: `/SolarPriority/Hold`, `/Daylight`, `/PreferRenewable`,
 `/PredictedW`, `/DeficitWh`; the status line is prefixed `HOLD 50% |`.

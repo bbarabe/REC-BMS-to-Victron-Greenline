@@ -204,7 +204,7 @@ SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priorit
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 2 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5)
-check("engine version bumped", SP.ENGINE_VERSION == "4.4.0")
+check("engine version bumped", SP.ENGINE_VERSION == "4.5.0")
 Val = SP.Val
 
 
@@ -299,8 +299,8 @@ s = Sim()
 s.tick(335, soc=50, batt=350.0)                # a vebus without /Dc/0/Power
 check("no Quattro DC power published: the bank's power decides, as in 4.3", s.state == "shore", s.state)
 
-# ---- charge one-way: 60 % -> 80 % ----
-s = Sim()
+# ---- charge one-way: 60 % -> 80 %, the 4.3 algorithm (hold_rules = 0) ----
+s = Sim(HOLD_RULES=0)
 # a freshly solar-charged bank sits above the sustain CVL (surplus in 4.2 terms)
 s.tick(1, soc=60, target=80, batt_v=56.9, cvl=56.62)
 check("charge: engaged", s.oneway == "charge" and s.out.oneway == "charge")
@@ -329,12 +329,12 @@ check("charge: still engaged at 68 %", s.oneway == "charge")
 s.tick(1, soc=79.5, batt=0.0)
 check("charge: done within EXIT of the target", s.oneway is None and
       any("ONE-WAY charge done (SOC 79.5% at target 80%)" in l for l in s.logs))
-check("... and HOLD keeps the floor (day/night not known yet): the last half point is the sun's",
-      s.sustain == 1 and s.out.hold, "sustain %s" % s.sustain)
-h = Sim(HOLD_RULES=0)
+check("hold_rules = 0: the 4.3 engine finishes the last bit from shore", s.sustain == 0 and not s.out.hold)
+h = Sim()
 h.tick(1, soc=60, target=80)
 h.tick(1, soc=79.5)
-check("hold_rules = 0: the 4.3 engine finishes the last bit from shore", h.oneway is None and h.sustain == 0)
+check("the HOLD rules keep the floor (day/night not known yet): the last half point is the sun's",
+      h.oneway is None and h.sustain == 1 and h.out.hold, "sustain %s" % h.sustain)
 
 # ---- hysteresis and re-targeting ----
 s = Sim()
@@ -570,8 +570,54 @@ check("safety under 25 %: charge now by day, and no floor in the charger's way",
       s.oneway == "charge" and s.prefers[-1] == 0 and s.sustain == 0)
 s.tick(2, soc=26.0)
 check("safety holds until 27 %", s.prefers[-1] == 0 and s.sustain == 0)
-s.tick(2, soc=27.5)
-check("safety over: one-way charge has its floor back, prefer solar by day", s.prefers[-1] == 1 and s.sustain == 1)
+s.tick(2, soc=27.5, pre=0)                      # the toggle still reads the safety's own "charge now"
+check("safety over: prefer solar wanted again, the floor back until the toggle reads it",
+      s.prefers[-1] == 1 and s.sustain == 1 and not s.eng.st["ownerCharge"])
+s.tick(2, pre=1)
+check("... and by day under prefer solar the sun charges with no floor in its way", s.sustain == 0)
+
+# ---- 4.5: charging toward a far target runs the same rules ----
+print("\n=== solar priority engine: charging under the HOLD rules (4.5) ===")
+s = Sim(); day(s, soc=50.0, target=80, batt=600.0); s.tick(700)
+check("charge 50 -> 80: leaves shore when the sun covers the need -- no trial, no boost",
+      s.state == "solar" and "probe" not in s.states and s.boost_cmds == [], "%s %s" % (s.state, s.boost_cmds))
+check("... the status line still names the direction", s.out.status_text.startswith("1-WAY CHARGE 50->80% | SOLAR"), s.out.status_text)
+check("... the floor stood only until the day was established, then prefer solar made it needless",
+      s.sustains[-1][1] == 0 and s.sustains[-1][0] - s.sustains[0][0] == 600000 and s.sustain == 0, str(s.sustains[-2:]))
+s.tick(200, batt=-65.0)
+check("charge: -65 W for 200 s is a cloud, not a reason to come back (4.3 came back after 105 s)", s.state == "solar")
+s.tick(6000, batt=-300.0)
+check("charge: the deficit budget brings it back", s.state == "shore" and "deficit:" in s.transitions[-1], str(s.transitions[-1:]))
+s = Sim(); day(s, soc=50.0, target=80, batt=300.0); s.tick(700)
+check("charge: 81 % of the need is not enough under the target -- no deliberate deficit while charging", s.state == "shore")
+s = Sim(); day(s, soc=50.0, target=80, batt=-50.0, voc=10.0, m=0, pre=0); s.tick(320)
+check("charge at night: floor -- shore holds the bank, the sun does the charging", s.sustain == 1 and s.prefers[-1] == 0)
+s = Sim(); day(s, soc=30.0, target=80, batt=600.0); s.tick(700)
+check("charge under MIN_SOC: stays on shore, the sun still charges with no floor", s.state == "shore" and s.sustain == 0)
+
+# ---- the owner's Charge now ----
+s = Sim(); day(s, soc=50.0, target=80, batt=100.0); s.tick(640)
+check("before: prefer solar wanted and read", s.prefers[-1] == 1 and not s.eng.st["ownerCharge"])
+s.tick(2, pre=0, batt=2600.0, qdc=2000.0)
+check("owner clicks Charge now by day: the toggle is left alone, no floor",
+      s.eng.st["ownerCharge"] and s.prefers[-1] is None and s.sustain == 0
+      and any(l.startswith("OWNER'S CHARGE NOW") for l in s.logs))
+s.tick(400, batt=2600.0, qdc=1500.0)              # the sun alone covers the need: 1150 W vs 433 W
+check("... and the boat stays on shore so the charger can work", s.state == "shore" and "[CHARGE NOW: owner]" in s.out.status_text, s.out.status_text)
+s.tick(320, voc=10.0, m=0, batt=2000.0, qdc=2000.0)
+check("... through the night, still with no floor", s.out.daylight is False and s.sustain == 0 and s.eng.st["ownerCharge"])
+s.tick(2, soc=79.96)
+check("... until the bank is at the target: then the toggle is ours again", not s.eng.st["ownerCharge"] and s.prefers[-1] == 0)
+s = Sim(); day(s, soc=50.0, target=80, batt=100.0); s.tick(640)
+s.tick(2, pre=2); s.tick(2, pre=1)
+check("owner flips it back to prefer solar: over", not s.eng.st["ownerCharge"] and s.prefers[-1] == 1
+      and any(l.startswith("owner's charge now over (toggle back") for l in s.logs))
+s = Sim(); day(s, soc=50.0, target=80, batt=600.0); s.tick(700)
+s.tick(2, pre=0)
+check("clicked while on the island: back to shore for the charger", s.state == "shore" and s.transitions[-1] == "-> SHORE (owner's charge now)")
+s = Sim(); day(s, soc=50.0, target=80, batt=100.0, pre=0); s.tick(700)
+check("a dawn write that never landed is not the owner: floor kept, prefer solar still wanted",
+      not s.eng.st["ownerCharge"] and s.sustain == 1 and s.prefers[-1] == 1)
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:

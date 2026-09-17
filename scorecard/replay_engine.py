@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Replay recorded days through the REAL Solar Priority engine (HOLD rules).
 
-    python3 scorecard/replay_engine.py <grid5p.json> [curve_error_v]
+    python3 scorecard/replay_engine.py <grid5p.json> [curve_error_v [start_soc target_soc]]
+
+With a start under the target it replays a CHARGE (engine 4.5 runs the same
+rules at any distance under the target) and reports when the target is reached.
 
 grid5p.json comes from pull_5min.py -> grid.py -> potential.py (Home Assistant
 five-minute statistics with the PV potential filled in). A small plant model
@@ -26,13 +29,15 @@ T = 50.0
 GAIN_PCT = 1.0
 
 
-def replay(rows, days, err_v=0.0, tun=None):
+def replay(rows, days, err_v=0.0, tun=None, start=T, target=T):
     t = dict(SP.ENGINE_DEFAULTS); t.update(tun or {})
     now = 1_800_000_000_000
     logs = []
     eng = SP.Engine(t, now, logger=logs.append)
     inp = SP.Inputs(); inp.enabled = True; inp.feed_shore = 1
-    soc, cmd, pre, floor, boost_until = T, 0, 1, None, 0
+    T = target
+    soc, cmd, pre, floor, boost_until = start, 0, 1, None, 0
+    reached = start >= target - 0.5
     lwin = []
     res = {}
     for r in rows:
@@ -88,6 +93,9 @@ def replay(rows, days, err_v=0.0, tun=None):
             out = eng.tick(n, inp)
             if out.cmd is not None:
                 cmd = out.cmd
+            if not reached and soc >= target - 0.5:
+                reached = True
+                logs.append('REACHED %.0f %% on %s at %04.1f h' % (target, r['day'], r['slot'] / 12.0))
             if out.transition:
                 logs.append('%s +%05.2fh soc %.2f  %s' % (r['day'], r['slot'] / 12.0, soc, out.transition))
                 d['dep'] += out.transition.startswith('-> SOLAR (hold')
@@ -105,9 +113,10 @@ def replay(rows, days, err_v=0.0, tun=None):
 if __name__ == '__main__':
     rows = json.load(open(sys.argv[1]))
     errs = [float(sys.argv[2])] if len(sys.argv) > 2 else [-0.03, 0.0, 0.02]
+    start, target = (float(sys.argv[3]), float(sys.argv[4])) if len(sys.argv) > 4 else (T, T)
     DAYS = ['2026-09-%02d' % n for n in range(9, 17)]
     for err in errs:
-        res, logs = replay(rows, DAYS, err)
+        res, logs = replay(rows, DAYS, err, None, start, target)
         print('\n== real engine %s, curve error %+.2f V' % (SP.ENGINE_VERSION, err))
         print('day          PVused  potential   shore  dep probes islandH  limited-on-shore h  SOC lo..hi  variation')
         for day, d in sorted(res.items()):
@@ -115,6 +124,9 @@ if __name__ == '__main__':
                 day, d['pv'] / 1000, d['pot'] / 1000, d['shore'] / 1000, d['dep'], d['probes'], d['isl_s'] / 3600,
                 d['lim_s'] / 3600, d['lo'], d['hi'], d['hi'] - d['lo']))
         n = len(res); s = lambda k: sum(x.get(k, 0) for x in res.values())
+        for l in logs:
+            if l.startswith('REACHED'):
+                print(l)
         print('hold probes: %d, suspends: %d' % (sum(l.startswith('hold probe:') for l in logs), s('susp')))
         print('mean: PV %.2f kWh/d (%.0f%% of potential), shore %.2f, departures %.1f/d, probes %.1f/d, daily SOC variation %.2f %%' % (
             s('pv') / n / 1000, 100 * s('pv') / s('pot'), s('shore') / n / 1000, s('dep') / n, s('probes') / n,
