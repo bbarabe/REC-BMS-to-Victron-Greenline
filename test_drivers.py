@@ -84,15 +84,16 @@ check("engine battery has NO /Soc and NO /Dc/0/Current",
       "/Soc" not in porteng.values and "/Dc/0/Current" not in porteng.values)
 check("house voltage 14.20", house.values["/Dc/0/Voltage"] == 14.2,
       str(house.values["/Dc/0/Voltage"]))
-check("house current 0.3", house.values["/Dc/0/Current"] == 0.3)
-check("house power 4.3 (1 dp, as the flow did)", house.values["/Dc/0/Power"] == 4.3,
+check("house current 0.3 -> 0.4 (0.2 A steps)", house.values["/Dc/0/Current"] == 0.4,
+      str(house.values["/Dc/0/Current"]))
+check("house power 4.3 -> 5 (5 W steps)", house.values["/Dc/0/Power"] == 5,
       str(house.values["/Dc/0/Power"]))
 check("house SOC 100", house.values["/Soc"] == 100)
 check("house capacity 130Ah -> /Capacity 130.0, consumed -0.0",
       house.values["/Capacity"] == 130.0 and house.values["/ConsumedAmphours"] == 0.0,
       "%s %s" % (house.values["/Capacity"], house.values["/ConsumedAmphours"]))
 check("house connected", house.values["/Connected"] == 1)
-check("port engine 13.42 V", porteng.values["/Dc/0/Voltage"] == 13.42,
+check("port engine 13.42 V -> 13.4 (0.05 V steps)", porteng.values["/Dc/0/Voltage"] == 13.4,
       str(porteng.values["/Dc/0/Voltage"]))
 check("stbd engine absent from dbus, still in the catalog",
       "com.victronenergy.battery.n2kbat_stbdeng" not in FakeBus.names and
@@ -279,27 +280,27 @@ edrv._tick()
 check("port connected", port.values["/Connected"] == 1)
 check("port rpm 422", port.values["/Motor/RPM"] == 422)
 check("port voltage 52.3", port.values["/Dc/0/Voltage"] == 52.3)
-check("port DC current 52.87 A (61452 preferred)",
-      port.values["/Dc/0/Current"] == 52.87, str(port.values["/Dc/0/Current"]))
-check("port power = V x I", port.values["/Dc/0/Power"] == round(52.3 * 52.87),
+check("port DC current 52.87 A -> 53.0 (61452 preferred)",
+      port.values["/Dc/0/Current"] == 53.0, str(port.values["/Dc/0/Current"]))
+check("port power = V x I, 10 W steps", port.values["/Dc/0/Power"] == E._q(52.3 * 52.87, 10),
       str(port.values["/Dc/0/Power"]))
 check("Motor/Temperature = drive temp 13.5 (0x28x f2)",
       port.values["/Motor/Temperature"] == 13.5, str(port.values["/Motor/Temperature"]))
-check("Coolant/Temperature = MOSFET 18.7 (0x28x f1 preferred over 61453 w0)",
-      port.values["/Coolant/Temperature"] == 18.7,
+check("Coolant/Temperature = MOSFET 18.7 -> 18.5 (0x28x f1 preferred over 61453 w0)",
+      port.values["/Coolant/Temperature"] == 18.5,
       str(port.values["/Coolant/Temperature"]))
 check("Controller/Temperature = MCU 41.0 (61453 w2 only)",
       port.values["/Controller/Temperature"] == 41.0,
       str(port.values["/Controller/Temperature"]))
 check("direction forward", port.values["/Motor/Direction"] == E.DIR_FORWARD)
-check("torque 45.6 Nm", port.values["/EDrive/TorqueNm"] == 45.6)
+check("torque 45.6 Nm -> 45.5", port.values["/EDrive/TorqueNm"] == 45.5)
 check("torque 28 %", port.values["/EDrive/TorquePercent"] == 28)
-check("throttle 8.08 %", port.values["/EDrive/ThrottlePercent"] == 8.08,
+check("throttle 8.08 % -> 8.0", port.values["/EDrive/ThrottlePercent"] == 8.0,
       str(port.values["/EDrive/ThrottlePercent"]))
-check("phase peak 279.8 A", port.values["/EDrive/PhaseCurrentPeak"] == 279.8,
+check("phase peak 279.8 A -> 280", port.values["/EDrive/PhaseCurrentPeak"] == 280,
       str(port.values["/EDrive/PhaseCurrentPeak"]))
-check("mech power T*w", port.values["/EDrive/MechanicalPower"] ==
-      int(round(45.6 * 422.0 * 3.141592653589793 / 30)),
+check("mech power T*w, 10 W steps", port.values["/EDrive/MechanicalPower"] ==
+      E._q(45.6 * 422.0 * 3.141592653589793 / 30, 10),
       str(port.values["/EDrive/MechanicalPower"]))
 check("running", port.values["/EDrive/Running"] == 1)
 check("HCU 0x64 landed on STARBOARD, not port",

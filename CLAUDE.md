@@ -20,12 +20,51 @@ All helper scripts (`cerbo_ssh.py`, `nmea_capture.py`, `verify_pinning.py`,
 `edrive_temps.py`) read those two variables. `cerbo_ssh.py` is the read-only
 command runner: `python cerbo_ssh.py "svstat /service/dbus-recbms"`.
 
-**Use one SSH session and keep it alive.** The Cerbo is a small armv7l box with
-little SSH headroom: opening a connection per command — or polling port 22 — exhausts
-it, and it then stops answering *entirely* for a good while. Connect once, run every
-command of the task over that one transport (each `exec_command` is a cheap extra
-channel; open SFTP from the same client), and set a 30s keepalive. A failed connect
-means stop and wait, never retry in a loop — the retries are what cause the outage.
+**Use one SSH session and keep it alive — always through `./cerbo`.** The Cerbo is
+a small armv7l box with little SSH headroom: opening a connection per command — or
+polling port 22 — exhausts it, and it then stops answering *entirely* for a good
+while. `./cerbo` is the only sanctioned way in. It starts a local daemon
+(`cerbo_daemon.py`) that holds **one** paramiko transport and runs every command as
+a cheap extra channel on it; SFTP for `get`/`put` rides the same transport. Only
+`./cerbo up` costs a handshake.
+
+```sh
+export CERBO_HOST=<cerbo-ip>      # not stored here: this repo is public
+export CERBO_PASS=<root-password>
+
+./cerbo up                                  # open the session (idempotent)
+./cerbo 'uptime'                            # shorthand for `run`
+./cerbo run 'svstat /service/dbus-recbms' 120   # optional timeout in seconds
+./cerbo batch cmds.txt                      # one command per line, own shell each
+./cerbo script setup.sh                     # whole file as ONE shell (vars persist)
+./cerbo get /data/conf/settings.xml ./settings.xml
+./cerbo put ./dbus-czone/config.ini /data/dbus-czone/config.ini
+./cerbo status                              # alive? and the box's uptime
+./cerbo down                                # close it
+```
+
+Rules that go with it:
+
+- **Never open your own connection.** No bare `ssh`/`scp`, no per-command paramiko,
+  no `ssh` in a loop. `cerbo_ssh.py` is the legacy one-shot runner and is kept only
+  for the odd single read; prefer `./cerbo`.
+- **Batch, don't chatter.** Put the whole task's commands in one `./cerbo batch`
+  file rather than issuing them one tool call at a time.
+- **`batch` runs each line in its own shell**, so a variable set on one line is
+  empty on the next — and a command that then reads from an unset path blocks on
+  stdin until the timeout. Use `./cerbo script` when the commands need shared
+  state, or keep each line self-contained.
+- **A failed connect means stop and wait.** `./cerbo` enforces this: it stamps a
+  backoff file and refuses to connect again for 10 minutes
+  (`CERBO_BACKOFF_SECS`). Do not clear the stamp to "just try once more" — the
+  retries are what cause the outage. If it says the transport is dead, the fix is
+  `./cerbo down`, wait, then `./cerbo up`.
+- **The session self-closes** after 30 min idle (`CERBO_IDLE_EXIT`), so a forgotten
+  daemon never holds the box's one slot.
+- **OpenSSH `ControlMaster` does not work here** — tried 2026-09-02: the master
+  connects, then every multiplexed session is refused with
+  `Master refused session request: Permission denied` and sshd stops answering.
+  Use `./cerbo`.
 
 Because a session can still be lost mid-task, make each step individually
 verifiable: re-check `grep -m1 '^VERSION'` after a restart rather than assuming the
@@ -47,27 +86,40 @@ means restarting Signal K and everything else it hosts.
 
 ## Standalone drivers
 
-Use the deploy script — it encodes every rule in this section (one session,
-no connect retries, config value-guard, backups, restart only what changed,
-verify by re-reading the shipped VERSION):
+Use the deploy script — it encodes every rule in this section (the shared
+`./cerbo` session, no connect retries, config value-guard, backups, restart
+only what changed, verify the shipped VERSION *and* the running process):
 
 ```sh
 python deploy_cerbo.py recbms                  # upload changed files, svc -t, verify
 python deploy_cerbo.py solarpriority --install # first install of a service
+python deploy_cerbo.py solarpriority --start   # update / resume a stopped service (svc -tu)
 python deploy_cerbo.py recbms --dry-run        # show the plan / config diff only
 python deploy_cerbo.py czone --verify-only     # no upload, no restart
 ```
 
-Packages: `recbms`, `solarpriority`, `czone`, `batteries`, `edrive`.
+Packages: `recbms`, `solarpriority`, `czone`, `batteries`, `edrive`, `camerarelay`
+(the last one is `camera-relay/`: RTSP-to-WebSocket H.264 relay plus its
+WASM decoder test page; its `config.json` with the camera URLs lives only on
+the boat, `./cerbo put` it before `--install`).
 `python test_drivers.py` runs `dbus-batteries` and `dbus-edrive` off the boat
 against stubbed D-Bus, velib and SocketCAN — run it before every deploy of
 either. `python test_solar_priority.py` does the same for dbus-recbms' sustain
-control and the Solar Priority engine (one-way charge/discharge); the stand-ins
-live in `test_stubs.py`. `solarpriority` reads `/RecBms/TargetSoc` and
+control and the Solar Priority engine (one-way charge/discharge),
+`python test_recbms.py` for the solar lead gate and `python test_shore_input.py`
+for the shore AC input (resolver and driver); the stand-ins live in
+`test_stubs.py`. `solarpriority` reads `/RecBms/TargetSoc` and
 `Sustain/*`, so deploy `recbms` first (publisher first, as always).
 
-It aborts (exit 3) when the live config's *values* differ from the repo's
-HEAD copy — fold the on-boat edit into the repo first, or `--force-config`.
+It aborts (exit 3) when the live config's *values* match no committed copy of
+the file (HEAD or its last 30 commits) — that is an on-boat edit: fold it into
+the repo first, or `--force-config`. A live config that matches an older commit
+is merely behind and is updated without complaint. After a restart the running
+process must report the shipped version (`/Mgmt/ProcessVersion`, or the
+package's own status output where there is no D-Bus service, as for
+`camerarelay`); if it does not, the service gets one more `svc -t`, and the run
+exits 5 when it still reports the old version. `python test_deploy_cerbo.py`
+covers the script and `./cerbo` offline.
 Manual equivalent, if you must:
 
 ```sh

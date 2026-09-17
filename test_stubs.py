@@ -165,6 +165,15 @@ class FakeService:
     def __contains__(self, p):
         return p in self.values
 
+    # velib's `with service as s:` batches a tick's changes into one
+    # ItemsChanged. The fake just applies them; count() lets a test see how
+    # many values a tick actually touched.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
     def __del__(self):
         FakeBus.names.pop(self.name, None)
 
