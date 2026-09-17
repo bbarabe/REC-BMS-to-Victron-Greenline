@@ -154,12 +154,26 @@ class ConsumerConfigurationTests(unittest.TestCase):
         # ConfigParser reject the file (master review D18).
         import re
         path = os.path.join(REPO, 'dbus-recbms', 'solar_priority.ini')
-        text = open(path, encoding='utf-8').read()
-        self.assertEqual(SP.Config(path).engine, {k: float(v) for k, v in SP.ENGINE_DEFAULTS.items()})
+        with open(path, encoding='utf-8') as fh:
+            text = fh.read()
+        # The boat's deliberate settings, uncommented in the shipped ini with
+        # their reasons: the 5 s confirm (owner, 2026-09-16) and the 0.50 V
+        # boost for the flybridge tracker (owner, 2026-09-17). Every other
+        # tunable ships as a commented example equal to the engine default.
+        overrides = {'READY_MS': 5000.0, 'BOOST_V': 0.50}
+        expected = {k: float(v) for k, v in SP.ENGINE_DEFAULTS.items()}
+        expected.update(overrides)
+        self.assertEqual(SP.Config(path).engine, expected)
         examples = dict(re.findall(r'^;(\w+) = ([\d.]+)$', text, re.M))
-        self.assertEqual(set(examples), {k.lower() for k in SP.ENGINE_DEFAULTS})
+        active = {k: v for k, v in re.findall(r'^(\w+) = ([\d.]+)$', text, re.M)
+                  if k.upper() in SP.ENGINE_DEFAULTS}
+        self.assertEqual(set(active), {k.lower() for k in overrides})
+        self.assertEqual(set(examples) | set(active), {k.lower() for k in SP.ENGINE_DEFAULTS})
         for key, default in SP.ENGINE_DEFAULTS.items():
-            self.assertEqual(float(examples[key.lower()]), float(default), key)
+            if key in overrides:
+                self.assertEqual(float(active[key.lower()]), overrides[key], key)
+            else:
+                self.assertEqual(float(examples[key.lower()]), float(default), key)
         for key, value in (('oneway_enter_pct', '3'), ('solar_margin', '1.2'), ('cooldown_ms', '600000')):
             uncommented = text.replace(';%s = %s' % (key, examples[key]), '%s = %s' % (key, value))
             self.assertNotEqual(uncommented, text)

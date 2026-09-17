@@ -66,7 +66,7 @@
   },
   "solarboost": {
     "enabled": "true",
-    "max_boost_v": "0.30",
+    "max_boost_v": "0.50",
     "hold_s": "240",
     "measure_start_s": "180",
     "measure_len_s": "45",
