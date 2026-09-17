@@ -311,10 +311,23 @@ class PreferRenewableTests(unittest.TestCase):
     def test_a_dark_day_charges_once_the_bank_is_a_point_under_and_holds_until_back(self):
         self.assertEqual(prefer_renewable_wanted('HOLD', True, 49.2, 50.0, 1.0, 1)[0], 1)   # within a point: solar
         self.assertEqual(prefer_renewable_wanted('HOLD', True, 48.9, 50.0, 1.0, 1)[0], 0)   # a point under: charge
-        self.assertEqual(prefer_renewable_wanted('HOLD', True, 49.5, 50.0, 1.0, 0)[0], 0)   # recovering: still charge
-        self.assertEqual(prefer_renewable_wanted('HOLD', True, 50.0, 50.0, 1.0, 0)[0], 1)   # back inside: solar
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 49.5, 50.0, 1.0, 0, 0)[0], 0)   # recovering: still charge
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 50.0, 50.0, 1.0, 0, 0)[0], 1)   # back inside: solar
         self.assertEqual(prefer_renewable_wanted('CHARGE', True, 58.9, 60.0, 1.0, 1)[0], 0)
         self.assertEqual(prefer_renewable_wanted('CHARGE', True, None, 60.0, 1.0, 1)[0], 1) # no SOC: no deficit call
+
+    def test_the_nights_charge_now_does_not_leak_into_the_morning(self):
+        # 2026-09-17 dawn: 49.8 % under a 50 % hold, last decision the night's 0.
+        # Only a day-made 0 is a deficit to recover from.
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 49.8, 50.0, 1.0, 0, 1), (1, 'day: prefer solar'))
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 49.8, 50.0, 1.0, 0, None), (1, 'day: prefer solar'))
+        # A dark day that ended in deficit still recovers the next morning.
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 49.8, 50.0, 1.0, 0, 0)[0], 0)
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 50.0, 50.0, 1.0, 0, 0)[0], 1)
+        # A real deficit by day still charges, whatever the night said.
+        self.assertEqual(prefer_renewable_wanted('HOLD', True, 48.9, 50.0, 1.0, 0, 1)[0], 0)
+        # Unknown daylight still keeps the last decision of any kind.
+        self.assertEqual(prefer_renewable_wanted('HOLD', None, 49.8, 50.0, 1.0, 0, 1)[0], 0)
 
 
 if __name__ == '__main__':

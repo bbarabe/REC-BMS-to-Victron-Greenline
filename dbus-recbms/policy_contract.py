@@ -132,7 +132,7 @@ def resolve_shore_input(configured, types, active_input, available, last):
     return 1, 'default'
 
 
-def prefer_renewable_wanted(mode, daylight, soc, reference, deficit_pct, last):
+def prefer_renewable_wanted(mode, daylight, soc, reference, deficit_pct, last, last_day=None):
     """What the Quattro's "Prefer renewable energy" toggle should read:
     1 = prefer solar, 0 = charge now, None = leave it alone.
 
@@ -144,6 +144,12 @@ def prefer_renewable_wanted(mode, daylight, soc, reference, deficit_pct, last):
     charging only once the bank is a full `deficit_pct` under its floor or
     target (a dark day), holding that until it is back inside the band so
     the toggle does not chatter. Unknown daylight keeps the last decision.
+    `last` is the previous decision, whatever made it; `last_day` the
+    previous decision made by day, the only one the deficit hysteresis
+    reads. The night's charge-now must not leak into the morning: on
+    2026-09-17 the bank stood at 49.8 % under a 50 % hold at dawn and the
+    old rule read the night's 0 as "recovering", holding charge-now with
+    the sun up until the servo had crept the bank back to 50.0 %.
     Pure, so both the fixture and the boat run the same rule.
     """
     if mode not in ('CHARGE', 'HOLD', 'DISCHARGE'):
@@ -157,7 +163,7 @@ def prefer_renewable_wanted(mode, daylight, soc, reference, deficit_pct, last):
     if soc is not None and reference is not None:
         if soc < reference - deficit_pct:
             return 0, 'day deficit: %.1f%% is %.1f under %.1f%%: charge now' % (soc, reference - soc, reference)
-        if last == 0 and soc < reference:
+        if last_day == 0 and soc < reference:
             return 0, 'day deficit: charging back to %.1f%%' % reference
     return 1, 'day: prefer solar'
 

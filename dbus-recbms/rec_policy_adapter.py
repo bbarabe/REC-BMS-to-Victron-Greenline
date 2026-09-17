@@ -62,6 +62,7 @@ class RecPolicyAdapter:
         self.dark_since = None
         self.prefer_wanted = None
         self.prefer_last = None
+        self.prefer_last_day = None
         self.prefer_reason = ''
         self.prefer_written_at = None
         self.discovery_at = None
@@ -315,12 +316,16 @@ class RecPolicyAdapter:
         reference = target
         if mode == 'CHARGE' and hold.get('active') and hold.get('mode') == 1 and hold.get('soc') is not None:
             reference = hold['soc']
-        wanted, reason = prefer_renewable_wanted(mode, self._daylight(now), soc, reference,
-                                                 cfg.policy_day_deficit_pct, self.prefer_last)
+        daylight = self._daylight(now)
+        wanted, reason = prefer_renewable_wanted(mode, daylight, soc, reference,
+                                                 cfg.policy_day_deficit_pct, self.prefer_last,
+                                                 self.prefer_last_day)
         self.prefer_wanted, self.prefer_reason = wanted, reason
         if wanted is None:
             return actual
         self.prefer_last = wanted
+        if daylight:
+            self.prefer_last_day = wanted
         name = self.sources_names.get('vebus')
         if actual is None or not name:
             self.prefer_reason = reason + ' (toggle not readable)'
