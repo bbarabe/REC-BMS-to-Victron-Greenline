@@ -10,7 +10,7 @@ flow used — so the BMS driver needs no changes.
 
 What it does (see README.md "Solar Priority driver"):
   - powers AC loads from solar instead of shore by driving the Quattro's
-    /Ac/Control/IgnoreAcIn1: shore -> probe (90 s MPPT ramp) -> solar ->
+    /Ac/Control/IgnoreAcIn<shore input>: shore -> probe (90 s MPPT ramp) -> solar ->
     shore; shore -> burndown (surplus or harvested lead band) -> solar |
     probe | shore; solar/burndown -> suspend (heater on shore) -> resumed
   - capacity is MEASURED (MppOperationMode 2 => /Yield/Power is capacity),
@@ -35,8 +35,11 @@ Differences from the flow (all deliberate):
   - inputs come from a velib DbusMonitor (signal-driven cache). Values stay
     last-known-good exactly like the flow; service liveness is still judged
     on the jittering heartbeat paths AND on the service being present.
-  - IgnoreAcIn1 is forced back to 0 on SIGTERM / exit — a dead flow could
+  - IgnoreAcIn is forced back to 0 on SIGTERM / exit — a dead flow could
     leave the Quattro inverting indefinitely; a dead driver cannot.
+  - the shore AC input is resolved at runtime (4.0.0: GX AC input types,
+    else the input already settled on, else the Quattro's own facts), the
+    engine clock is monotonic, and a tick publishes one ItemsChanged.
   - every transition is logged to /var/log/dbus-solarpriority (durable),
     not just a debug sidebar.
   - a FAULT / emergency-SOC lockout is a hard 1 h hold (lockoutUntil): the
@@ -64,9 +67,10 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "1.1.0"
+VERSION = "4.0.0"
 ENGINE_VERSION = "4.3"
 BUSITEM = "com.victronenergy.BusItem"
+_CLOCK_BASE_MS = 10 ** 12      # see SolarPriorityDriver._ms
 
 log = logging.getLogger("dbus-solarpriority")
 
@@ -149,8 +153,18 @@ class Config:
         self.mppt7_instance = int(i.get("mppt_b_instance", 279))
         self.vebus_instance = int(i.get("vebus_instance", 276))
         self.battery_instance = int(i.get("battery_instance", 200))
-        self.ac_in = int(i.get("shore_ac_input", 1))     # 1 or 2
+        # 'auto' (default) resolves the shore input at runtime from the GX's
+        # AC input types and the Quattro's own facts (resolve_shore_input);
+        # 1 or 2 pins it.
+        raw = str(i.get("shore_ac_input", "auto")).strip().lower()
+        self.ac_in = "auto" if raw in ("", "auto") else int(raw)
+        if self.ac_in not in ("auto", 1, 2):
+            raise ValueError("[inputs] shore_ac_input must be auto, 1 or 2")
         self.tick_ms = int(i.get("tick_ms", 1000))
+        # EstimateW / NeedW are published in steps of this many watts, and a
+        # tick's changes go out as one ItemsChanged (2026-09-05: at 0.1 W
+        # they changed every second and every listener on the Cerbo paid).
+        self.power_step = float(i.get("power_step", 5))
 
         e = cp["engine"] if cp.has_section("engine") else {}
         self.engine = {}
@@ -176,7 +190,9 @@ class Inputs:
     FIELDS = ("soc", "batt", "load_now", "load_avg", "feed", "ac_out",
               "voc6", "voc7", "y6", "y7", "m6", "m7", "batt_v", "cvl",
               "boost_active", "boost_window", "boost_eff", "lead",
-              "target_soc", "sustain_active")
+              "target_soc", "sustain_active",
+              # shore-input resolution only (the engine never reads these)
+              "ac1_available", "ac2_available", "ac1_type", "ac2_type")
 
     def __init__(self):
         for f in self.FIELDS:
@@ -969,6 +985,55 @@ def register_service(svc):
         svc.register()
 
 
+# GX AC input types (/Settings/SystemSetup/AcInput1|2): 0 not available,
+# 1 grid, 2 generator, 3 shore power. Grid and shore are what Solar Priority
+# may drop; a generator never is.
+SHORE_INPUT_TYPES = (1, 3)
+
+
+def resolve_shore_input(configured, types, active_input, available, last):
+    """Which Quattro AC input carries shore power: (1 or 2, reason).
+
+    A fixed `configured` (1 or 2) wins. Otherwise ('auto') the GX's own AC
+    input types decide when exactly one input is grid or shore -- the owner
+    sets those when wiring, and they are the semantic answer whatever the
+    relay is doing. Failing that, the input already resolved is KEPT: a box
+    that has settled on an input never moves off it on ambiguous evidence
+    (an island reads ActiveInput 240 and no availability at all). Only a
+    fresh start with nothing to go on reads the live facts -- the accepted
+    input (/Ac/ActiveIn/ActiveInput 0 = AC in 1, 1 = AC in 2), then the
+    single available input, never one the GX calls a generator. With
+    nothing at all the answer is (None,
+    'unresolved') and the driver leaves the relay alone. Pure, so it can be
+    tested off the boat.
+    """
+    if configured in (1, 2):
+        return int(configured), "configured"
+    t1, t2 = (types or (None, None))[:2]
+    typed = [n for n, t in ((1, t1), (2, t2)) if t in SHORE_INPUT_TYPES]
+    if len(typed) == 1:
+        return typed[0], "gx input type"
+    if last in (1, 2):
+        return int(last), "kept"
+    # the live facts never pick an input the GX calls a generator
+    generator = [n for n, t in ((1, t1), (2, t2)) if t == 2]
+    if active_input in (0, 1) and int(active_input) + 1 not in generator:
+        return int(active_input) + 1, "accepted input"
+    a1, a2 = (available or (None, None))[:2]
+    present = [n for n, a in ((1, a1), (2, a2)) if a == 1 and n not in generator]
+    if len(present) == 1:
+        return present[0], "only input available"
+    return None, "unresolved"
+
+
+def _q(value, step):
+    """Round to the nearest multiple of `step` (0 = untouched)."""
+    if value is None or step <= 0:
+        return value
+    n = round(value / step) * step
+    return int(round(n)) if float(step).is_integer() else round(n, 3)
+
+
 # (service class, path) -> (input field, validator, is_heartbeat)
 def _rng(lo, hi):
     return lambda v: lo <= v <= hi
@@ -984,6 +1049,13 @@ INPUT_MAP = {
     ("system", "/Dc/Battery/Voltage"):    ("batt_v", _rng(20, 80)),
     ("vebus", "/Ac/ActiveIn/ActiveInput"): ("feed", lambda v: True),
     ("vebus", "/Ac/Out/L1/P"):            ("ac_out", _rng(-20000, 20000)),
+    # shore-input resolution. This Quattro firmware publishes
+    # /Ac/State/AcIn1Available and AcIn2Available (read 2026-09-14); one
+    # without them leaves the fields None -- unknown, never "absent".
+    ("vebus", "/Ac/State/AcIn1Available"): ("ac1_available", lambda v: v in (0, 1)),
+    ("vebus", "/Ac/State/AcIn2Available"): ("ac2_available", lambda v: v in (0, 1)),
+    ("settings", "/Settings/SystemSetup/AcInput1"): ("ac1_type", lambda v: v in (0, 1, 2, 3)),
+    ("settings", "/Settings/SystemSetup/AcInput2"): ("ac2_type", lambda v: v in (0, 1, 2, 3)),
     ("battery", "/RecBms/TargetChargeVoltage"): ("cvl", _rng(20, 80)),
     ("battery", "/RecBms/SolarBoost/Active"):   ("boost_active", lambda v: True),
     ("battery", "/RecBms/SolarBoost/WindowOpen"): ("boost_window", lambda v: True),
@@ -1006,14 +1078,24 @@ class SolarPriorityDriver:
         self.cfg = cfg
         self.now0 = time.time()
         self.inp = Inputs()
-        self.inp.feed_shore = 0 if cfg.ac_in == 1 else 1
-        self.ignore_path = "/Ac/Control/IgnoreAcIn%d" % cfg.ac_in
+        # Which AC input is shore: pinned by the ini, or resolved each tick
+        # (_resolve_shore_input). None until something is known; the relay
+        # is left alone until then.
+        self.shore_input = cfg.ac_in if cfg.ac_in in (1, 2) else None
+        self.shore_input_reason = "configured" if self.shore_input else "unresolved"
+        self.inp.feed_shore = (self.shore_input or 1) - 1
         self.load_window = []
         self.last_status = None
         self.engine = Engine(cfg.engine, self._ms(), logger=self._engine_log)
         self.sbus = shared_bus()
 
         self._init_settings()
+        if self.shore_input is None and int(self.settings["shoreinput"] or 0) in (1, 2):
+            # the input settled on before the restart: an island reads
+            # ActiveInput 240 and tells a fresh process nothing
+            self.shore_input = int(self.settings["shoreinput"])
+            self.shore_input_reason = "kept"
+            self.inp.feed_shore = self.shore_input - 1
         self.inp.enabled = bool(int(self.settings["enabled"]))
         self.inp.p_rated = float(self.settings["rated"])
         self._init_switch_service()
@@ -1041,11 +1123,55 @@ class SolarPriorityDriver:
             except (ValueError, OSError):
                 pass
         GLib.timeout_add(cfg.tick_ms, self._tick)
-        log.info("engine v%s, tick %d ms, shore on AC-in %d", ENGINE_VERSION,
-                 cfg.tick_ms, cfg.ac_in)
+        log.info("engine v%s, tick %d ms, shore on AC-in %s (now: %s, %s)",
+                 ENGINE_VERSION, cfg.tick_ms, cfg.ac_in, self.shore_input,
+                 self.shore_input_reason)
 
     def _ms(self):
-        return int(time.time() * 1000)
+        # The engine's clock. Every figure it keeps is an elapsed time, so it
+        # runs on the monotonic clock: a wall-clock step (GPS/NTP sync after
+        # boot) must not stretch or collapse a cooldown, a probe or a dwell.
+        # The engine also reads a timestamp of 0 as "long ago" (lastAssert,
+        # lastBoostTs) -- true of the epoch clock it was written for, not of
+        # one that starts at boot -- so the base is lifted well clear of 0.
+        return _CLOCK_BASE_MS + int(time.monotonic() * 1000)
+
+    # ---------------------------------------------------------- shore input
+    def _ignore_path(self, n=None):
+        return "/Ac/Control/IgnoreAcIn%d" % (n or self.shore_input)
+
+    def _resolve_shore_input(self, now):
+        """Settle which AC input is shore this tick and point the engine's
+        ActiveInput test at it. Returns False while nothing is known."""
+        v = lambda f: f.v if f is not None else None
+        i = self.inp
+        new, reason = resolve_shore_input(
+            self.cfg.ac_in, (v(i.ac1_type), v(i.ac2_type)), v(i.feed),
+            (v(i.ac1_available), v(i.ac2_available)), self.shore_input)
+        self.shore_input_reason = reason
+        if new is None:
+            return False
+        if new != self.shore_input:
+            old = self.shore_input
+            log.info("shore AC input %s -> %d (%s)", old, new, reason)
+            if old in (1, 2):
+                # never leave an ignore standing on the input we walk away
+                # from, and start over on shore on the new one (released
+                # here: force_shore tells the engine shore is already sent)
+                for n in (old, new):
+                    self._write("vebus", self.cfg.vebus_instance, self._ignore_path(n), 0,
+                                "shore input moved")
+                self.engine.force_shore(now)
+            self.shore_input = new
+        # remembered whatever decided it (a pinned input too): a later return
+        # to auto must not come up "kept" on a stale one
+        try:
+            if int(self.settings["shoreinput"] or 0) != new:
+                self.settings["shoreinput"] = new
+        except Exception:
+            log.warning("could not persist the shore input")
+        i.feed_shore = new - 1
+        return True
 
     def _engine_log(self, msg):
         if msg.startswith("ERROR "):
@@ -1062,6 +1188,9 @@ class SolarPriorityDriver:
             "enabled": ["/Settings/SolarPriority/Enabled", 0, 0, 1],
             "rated": ["/Settings/SolarPriority/RatedPower", int(c.rated_default),
                       int(c.rated_min), int(c.rated_max)],
+            # the shore input last resolved (0 = never), so a restart on an
+            # island still knows which input it is ignoring
+            "shoreinput": ["/Settings/SolarPriority/ShoreInput", 0, 0, 2],
         }
         self.settings = SettingsDevice(self.sbus, supported, self._setting_changed, timeout=120)
         granted = self._parse_instance(self.settings["instance"], c.instance)
@@ -1194,6 +1323,9 @@ class SolarPriorityDriver:
         svc.add_path("/SolarPriority/TargetSoc", None,
                      gettextcallback=lambda p, v: "---" if v is None else "%.0f%%" % float(v))
         svc.add_path("/SolarPriority/Sustain", 0)
+        # the AC input treated as shore (None until resolved) and why
+        svc.add_path("/SolarPriority/ShoreInput", None)
+        svc.add_path("/SolarPriority/ShoreInputReason", "")
 
         register_service(svc)
         self.sw = svc
@@ -1341,8 +1473,15 @@ class SolarPriorityDriver:
             log.warning("%s: write %s%s failed: %s", what, name, path, e)
             return False
 
+    def _shore_inputs(self):
+        """The inputs a protective 'back to shore' write goes to: the
+        resolved one, or both while nothing is resolved (a crashed process
+        may have left an ignore standing on either)."""
+        return (self.shore_input,) if self.shore_input in (1, 2) else (1, 2)
+
     def _safe_start(self):
-        self._write("vebus", self.cfg.vebus_instance, self.ignore_path, 0, "safe start")
+        for n in self._shore_inputs():
+            self._write("vebus", self.cfg.vebus_instance, self._ignore_path(n), 0, "safe start")
         return False
 
     def _shutdown(self):
@@ -1350,13 +1489,15 @@ class SolarPriorityDriver:
         try:
             name = self._svc("vebus", self.cfg.vebus_instance)
             if name:
-                self.monitor.set_value(name, self.ignore_path, 0)
+                for n in self._shore_inputs():
+                    self.monitor.set_value(name, self._ignore_path(n), 0)
             b = self._svc("battery", self.cfg.battery_instance)
             if b:
                 self.monitor.set_value(b, "/RecBms/SolarBoost/Request", 0.0)
                 if self.engine.st.get("sustainSent"):
                     self.monitor.set_value(b, "/RecBms/Sustain/Request", 0)
-            log.info("shutdown: IgnoreAcIn%d=0, boost and sustain released", self.cfg.ac_in)
+            log.info("shutdown: IgnoreAcIn%s=0, boost and sustain released",
+                     "/".join(str(n) for n in self._shore_inputs()))
         except Exception as e:
             log.warning("shutdown write failed: %s", e)
 
@@ -1366,19 +1507,52 @@ class SolarPriorityDriver:
 
     # ----------------------------------------------------------------- tick
     def _tick(self):
+        # one ItemsChanged for everything a tick publishes
+        # (and the timer survives anything: GLib drops a callback that
+        # raises, which would leave the relay wherever it stood)
+        try:
+            with self.sw as s:
+                self._tick_inner(s)
+        except Exception:
+            log.exception("tick failed - forcing shore")
+            try:
+                self.engine.force_shore(self._ms())
+                for n in self._shore_inputs():
+                    self._write("vebus", self.cfg.vebus_instance, self._ignore_path(n), 0,
+                                "error->shore")
+            except Exception:
+                log.exception("could not force shore")
+        return True
+
+    def _tick_inner(self, s):
         now = self._ms()
+        resolved = self._resolve_shore_input(now)
+        s["/SolarPriority/ShoreInput"] = self.shore_input
+        s["/SolarPriority/ShoreInputReason"] = self.shore_input_reason
+        if not resolved:
+            # Nothing says which AC input is shore (auto, no GX input type,
+            # never seen on shore): the relay is not ours to move yet. The
+            # safe start already released both inputs.
+            status = "shore AC input not resolved: set the GX AC input types"
+            if status != self.last_status:
+                log.warning(status)
+                s["/SolarPriority/Status"] = status
+                self.last_status = status
+            s["/SolarPriority/StatusFill"] = "grey"
+            return
+
         try:
             out = self.engine.tick(now, self.inp)
         except Exception:
             log.exception("decision error - forcing shore")
             self.engine.force_shore(now)
-            self._write("vebus", self.cfg.vebus_instance, self.ignore_path, 0, "error->shore")
-            self.sw["/SolarPriority/Status"] = "error -> shore (see log)"
-            self.sw["/SolarPriority/StatusFill"] = "red"
-            return True
+            self._write("vebus", self.cfg.vebus_instance, self._ignore_path(), 0, "error->shore")
+            s["/SolarPriority/Status"] = "error -> shore (see log)"
+            s["/SolarPriority/StatusFill"] = "red"
+            return
 
         if out.cmd is not None:
-            self._write("vebus", self.cfg.vebus_instance, self.ignore_path, int(out.cmd), "AC control")
+            self._write("vebus", self.cfg.vebus_instance, self._ignore_path(), int(out.cmd), "AC control")
         # sustain before boost: a probe releases the hold and asks for a
         # boost in the same tick, and the boost is gated on the target
         if out.sustain is not None:
@@ -1389,23 +1563,22 @@ class SolarPriorityDriver:
                         float(out.boost), "boost")
         if out.transition:
             log.info("%s", out.transition)
-            self.sw["/SolarPriority/LastTransition"] = out.transition
-            self.sw["/SolarPriority/LastTransitionTime"] = int(now / 1000)
+            s["/SolarPriority/LastTransition"] = out.transition
+            # a calendar time for the UI: the wall clock, not the engine's
+            s["/SolarPriority/LastTransitionTime"] = int(time.time())
 
-        s = self.sw
         s["/SolarPriority/State"] = out.state
         if out.status_text != self.last_status:
             s["/SolarPriority/Status"] = out.status_text
             self.last_status = out.status_text
         s["/SolarPriority/StatusFill"] = out.status_fill
-        s["/SolarPriority/EstimateW"] = round(out.est, 1)
-        s["/SolarPriority/NeedW"] = round(out.need_w, 1)
+        s["/SolarPriority/EstimateW"] = _q(out.est, self.cfg.power_step)
+        s["/SolarPriority/NeedW"] = _q(out.need_w, self.cfg.power_step)
         s["/SolarPriority/Desired"] = int(self.engine.st["desired"])
         s["/SolarPriority/OneWay"] = out.oneway
         s["/SolarPriority/TargetSoc"] = self.inp.target_soc.v if self.inp.target_soc else None
         s["/SolarPriority/Sustain"] = int(self.engine.st["sustainSent"] or 0)
         s["/SwitchableOutput/output_1/State"] = 1 if self.inp.enabled else 0
-        return True
 
 
 # ----------------------------------------------------------------------------
