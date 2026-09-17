@@ -81,8 +81,8 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "4.3.0"
-ENGINE_VERSION = "4.5.0"
+VERSION = "4.3.1"
+ENGINE_VERSION = "4.5.1"
 BUSITEM = "com.victronenergy.BusItem"
 _CLOCK_BASE_MS = 10 ** 12      # see SolarPriorityDriver._ms
 
@@ -128,7 +128,12 @@ ENGINE_DEFAULTS = {
     "SURPLUS_QUIET_W": 100, "BOOST_V": 0.30, "BOOST_INTERVAL_MS": 900000,
     "BOOST_RETRY_MS": 180000, "BURN_REARM_V": 0.25, "HARVEST_ARM_V": 0.02,
     "REFILL_RESET_V": 0.10, "HARVEST_MIN_EVID": 100, "STALL_BURN_MIN_V": 0.05,
-    "SUSPEND_LOAD_W": 1000, "SUSPEND_MS": 3000, "SUSPEND_MAX_MS": 1200000,
+    # 4.5.1 (owner, 2026-09-17): 2500, was 1000. The water heater (1.7 kW for
+    # ~2 min, every ~75 min) is 57 Wh, 0.07 % of the bank, at 30 A: the
+    # deficit budget carries it and the sun repays it within minutes by day,
+    # where a suspend cost two relay edges every time (about twenty a day).
+    # Suspend is for loads the budget should not carry for long.
+    "SUSPEND_LOAD_W": 2500, "SUSPEND_MS": 3000, "SUSPEND_MAX_MS": 1200000,
     "RESUME_DELTA_W": 200, "RESUME_MS": 10000,
     "MDL_A_V": 3.5, "MDL_VOC_IDLE_W": 3, "MDL_VOC_TAU_MS": 600000, "MDL_MIN_W": 10,
     "MDL_CAL_MIN_W": 30, "MDL_KFF_DEF": 0.78, "MDL_KFF_ALPHA": 0.05,

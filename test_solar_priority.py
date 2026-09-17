@@ -204,7 +204,7 @@ SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priorit
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 2 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5)
-check("engine version bumped", SP.ENGINE_VERSION == "4.5.0")
+check("engine version bumped", SP.ENGINE_VERSION == "4.5.1")
 Val = SP.Val
 
 
@@ -377,8 +377,8 @@ check("discharge: deficit and surge do not end it", s.state == "solar" and s.cmd
 check("discharge: DRAIN status", "DRAIN | PV 0W batt -600W" in s.out.status_text, s.out.status_text)
 s.tick(30, soc=84.0)
 check("discharge: SOC drift does not end it", s.state == "solar")
-s.tick(5, load=1500.0, batt=-1500.0)
-check("discharge: heater-class load -> suspend on shore", s.state == "suspend" and s.cmd == 0)
+s.tick(5, load=3000.0, batt=-3000.0)
+check("discharge: a 3 kW load -> suspend on shore", s.state == "suspend" and s.cmd == 0)
 check("discharge: ceiling kept through suspend", s.sustain == 2)
 s.tick(15, load=300.0, batt=-300.0)
 check("discharge: resumes to solar without a boost", s.state == "solar" and s.cmd == 1 and
@@ -462,8 +462,8 @@ check("HOLD: 81 % of the need with the bank 0.3 over: island, the band pays the 
       s.state == "solar" and any("81% of it, bank over target" in tr for tr in s.transitions), str(s.transitions))
 s = Sim(); day(s, batt=600.0, qdc=500.0); s.tick(700)
 check("HOLD: what the Quattro puts into the bank is not the sun's", s.state == "shore")
-s = Sim(); day(s, batt=2500.0, load=1500.0); s.tick(700)
-check("HOLD: never leaves under a heater-class load, even with the sun over the need", s.state == "shore")
+s = Sim(); day(s, batt=4000.0, load=3000.0); s.tick(700)
+check("HOLD: never leaves under a suspend-class load, even with the sun over the need", s.state == "shore")
 s = Sim(); day(s, batt=600.0, feed=240); s.tick(700)
 check("HOLD: never leaves while shore itself reads absent", s.state == "shore")
 s = Sim(MIN_SOC=50.5); day(s, batt=600.0); s.tick(700)
@@ -520,8 +520,12 @@ check("island: the SOC drift backstop still stands", s.state == "shore" and "SOC
 s = Sim(); day(s, batt=600.0); s.tick(700)
 s.tick(400, batt=-300.0, m=0, voc=10.0, pv=0.0)
 check("island: rides past dusk on the budget", s.state == "solar" and s.out.daylight is False and s.out.deficit_wh > 0)
-s.tick(5, load=1500.0, batt=-1500.0)
-check("island: heater -> suspend", s.state == "suspend" and s.cmd == 0)
+wh0 = s.out.deficit_wh
+s.tick(120, load=1700.0, batt=-1700.0)
+check("island: the water heater (1.7 kW, 2 min) is carried by the budget, not by a relay",
+      s.state == "solar" and s.cmd == 1 and abs(s.out.deficit_wh - wh0 - 57) < 2, "%s %.0f" % (s.state, s.out.deficit_wh - wh0))
+s.tick(5, load=3000.0, batt=-3000.0)
+check("island: 3 kW -> suspend", s.state == "suspend" and s.cmd == 0)
 wh = s.out.deficit_wh
 s.tick(15, load=250.0, batt=0.0)
 check("island: resumes, the deficit stands and shore time is not counted", s.state == "solar" and abs(s.out.deficit_wh - wh) < 1)

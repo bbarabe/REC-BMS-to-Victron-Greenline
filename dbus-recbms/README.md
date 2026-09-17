@@ -556,6 +556,11 @@ assumes the MPPTs at the target and the Quattro below it.
   the target — 30 s confirmation, the usual cooldown, never under a
   heater-class load. No trial on the island; the departure logs the math and
   a *prediction check* two minutes on logs predicted vs observed bank power.
+- **Heater-class loads.** Since 4.5.1 suspend starts at `suspend_load_w`
+  2500 W (was 1000): the water heater's 1.7 kW for two minutes is 57 Wh,
+  which the deficit budget carries and the sun repays within minutes by day,
+  where a suspend cost two relay edges every ~75 minutes. Loads over 2.5 kW
+  still suspend to shore as before.
 - **Returning.** The island's deficit is an energy (as in the 3.x engine):
   bank power under zero adds, power over zero repays, never under zero. At
   `hold_deficit_pct` (0.5 % of the bank, ~400 Wh) the engine returns, with a
