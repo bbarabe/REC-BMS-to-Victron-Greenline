@@ -203,7 +203,7 @@ SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priorit
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 5 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 1)
-check("engine version bumped", SP.ENGINE_VERSION == "4.3")
+check("engine version bumped", SP.ENGINE_VERSION == "4.3.1")
 Val = SP.Val
 
 
@@ -221,7 +221,7 @@ class Sim:
         self.inp.enabled = True
         self.inp.feed_shore = 0
         self.v = dict(soc=60.0, batt=0.0, load=300.0, pv=500.0, m=2, voc=60.0,
-                      batt_v=56.6, cvl=56.62, target=None)
+                      batt_v=56.6, cvl=56.62, target=None, qdc=None)
         self.cmd, self.sustain = 0, 0
         self.cmds, self.sustains, self.boosts = [], [], []
         self.transitions, self.states = [], set()
@@ -250,6 +250,7 @@ class Sim:
             inp.voc7, inp.y7, inp.m7 = Val(0.0, n), Val(0.0, n), Val(0, n)
             inp.batt_v, inp.cvl = Val(v["batt_v"], n), Val(v["cvl"], n)
             inp.target_soc = Val(v["target"], n) if v["target"] is not None else None
+            inp.q_dc = Val(v["qdc"], n) if v["qdc"] is not None else None
             out = self.eng.tick(n, inp)
             if out.cmd is not None:
                 self.cmd = out.cmd
@@ -271,6 +272,22 @@ s = Sim()
 s.tick(335, soc=60)
 check("no target: normal probe path", s.state == "probe" and s.oneway is None)
 check("no target: sustain never written", s.sustains == [])
+
+# ---- 4.3.1: the charger-quiet gate judges the Quattro, not the bank ----
+s = Sim()
+s.tick(335, soc=50, batt=350.0, qdc=21.0)      # the SUN fills the bank, Quattro at 0 A
+check("sun charging the bank at +350 W, Quattro quiet: leaves shore",
+      s.state == "probe" and s.cmd == 1, s.state)
+s = Sim()
+s.tick(30, soc=50, batt=350.0, qdc=21.0)
+check("... and the status says whose charge it is", "[chg +350W solar]" in s.out.status_text, s.out.status_text)
+s = Sim()
+s.tick(335, soc=50, batt=350.0, qdc=600.0)     # the QUATTRO is charging
+check("Quattro charging at +600 W: stays on shore", s.state == "shore" and s.cmd == 0, s.state)
+check("... tagged as a charger's", "[chg +350W]" in s.out.status_text, s.out.status_text)
+s = Sim()
+s.tick(335, soc=50, batt=350.0)                # a vebus without /Dc/0/Power
+check("no Quattro DC power published: the bank's power decides, as in 4.3", s.state == "shore", s.state)
 
 # ---- charge one-way: 60 % -> 80 % ----
 s = Sim()

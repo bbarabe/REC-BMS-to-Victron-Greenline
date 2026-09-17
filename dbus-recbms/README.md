@@ -395,6 +395,18 @@ behind is released and the engine starts over on shore. Published as
 `/SolarPriority/ShoreInput` and `/ShoreInputReason`. Safe start and shutdown
 release the resolved input, or both while unresolved.
 
+**Charger quiet means the Quattro (engine 4.3.1).** The flow left shore,
+and ran its measurement boosts, only while battery power was under
+`surplus_quiet_w` (100 W) -- "no charger is filling the bank". Battery power
+cannot tell the Quattro's charge from the sun's, and with the Quattro on
+*Prefer renewable energy* (0 A into the bank) the sun filling the bank held
+the engine on shore in full sun (2026-09-17: est 425 W vs need 244 W,
+`[chg +350W]`, Quattro 0 A). Those two gates now read the Quattro's own
+`/Dc/0/Power`; the status tags a bank charge the Quattro is not making as
+`[chg +350W solar]`. A vebus without the path falls back to battery power.
+The burn-down entries (surplus, harvest) still wait for a quiet bank: there
+the band has to be full, whoever filled it.
+
 **Deliberate differences from the flow**
 
 - `IgnoreAcIn` forced to 0 and the boost released on SIGTERM / atexit and

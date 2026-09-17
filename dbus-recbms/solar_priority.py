@@ -67,8 +67,8 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "4.0.0"
-ENGINE_VERSION = "4.3"
+VERSION = "4.1.0"
+ENGINE_VERSION = "4.3.1"
 BUSITEM = "com.victronenergy.BusItem"
 _CLOCK_BASE_MS = 10 ** 12      # see SolarPriorityDriver._ms
 
@@ -190,7 +190,7 @@ class Inputs:
     FIELDS = ("soc", "batt", "load_now", "load_avg", "feed", "ac_out",
               "voc6", "voc7", "y6", "y7", "m6", "m7", "batt_v", "cvl",
               "boost_active", "boost_window", "boost_eff", "lead",
-              "target_soc", "sustain_active",
+              "target_soc", "sustain_active", "q_dc",
               # shore-input resolution only (the engine never reads these)
               "ac1_available", "ac2_available", "ac1_type", "ac2_type")
 
@@ -581,6 +581,16 @@ class Engine:
             discharge = -batt.v
             sinceTrans = now - st["lastTransition"]
             needW = max(t["MIN_EST_W"], loadAvg.v * t["SOLAR_MARGIN"])
+            # 4.3.1: "charger quiet" must mean the QUATTRO is quiet. Battery
+            # power alone cannot tell shore charging from the sun filling the
+            # bank, and with the Quattro preferring renewable energy (it then
+            # puts 0 A into the bank) that held the engine on shore in full
+            # sun for as long as the sun had anything to fill: 2026-09-17,
+            # est 425 W vs need 244 W, "[chg +350W]", Quattro at 0 A. The
+            # Quattro's own DC power says who is charging; a vebus without
+            # the path falls back to the bank's.
+            qdc = inp.q_dc
+            chargerW = qdc.v if (qdc is not None and vebusAlive) else batt.v
 
             if st["state"] == "shore":
                 shoreMissing = (feed.v == 240 and sinceTrans > t["FEEDBACK_GRACE_MS"])
@@ -616,7 +626,7 @@ class Engine:
                     # (the sustain ceiling makes it so). Solar need not cover
                     # the load -- the deficit IS the plan.
                     ready = (not shoreMissing and soc.v >= t["MIN_SOC"]
-                             and batt.v <= t["SURPLUS_QUIET_W"])
+                             and chargerW <= t["SURPLUS_QUIET_W"])
                 else:
                     # Charging one-way: aboveCvl is judged against the
                     # sustain CVL (pinned at the SOC), which a freshly
@@ -625,7 +635,7 @@ class Engine:
                     # reason to wait.
                     ready = (not shoreMissing and (not aboveCvl or owc)
                              and soc.v >= t["MIN_SOC"]
-                             and batt.v <= t["SURPLUS_QUIET_W"] and (est >= needW or explore))
+                             and chargerW <= t["SURPLUS_QUIET_W"] and (est >= needW or explore))
                 if ready:
                     if not st["readySince"]:
                         st["readySince"] = now
@@ -650,7 +660,7 @@ class Engine:
                 # dbus-recbms would refuse it under a sustain ceiling anyway.
                 if (not boosting and dayOk and vocMax >= t["VOC_DAY_V"] and not vocRising
                         and not aboveCvl and not shoreMissing and soc.v >= t["MIN_SOC"]
-                        and batt.v <= t["SURPLUS_QUIET_W"] and not owd
+                        and chargerW <= t["SURPLUS_QUIET_W"] and not owd
                         and (now - st["lastBoostTs"]) >=
                         (t["BOOST_RETRY_MS"] if capSum <= 0 else t["BOOST_INTERVAL_MS"])):
                     st["lastBoostTs"] = now
@@ -695,7 +705,7 @@ class Engine:
                     if plantConf is not None and plantConf < needW:
                         s += " (dim)"
                     if batt.v > t["SURPLUS_QUIET_W"]:
-                        s += " [chg +%.0fW]" % batt.v
+                        s += " [chg +%.0fW%s]" % (batt.v, "" if chargerW > t["SURPLUS_QUIET_W"] else " solar")
                     if harvestArmed:
                         s += " [hv-armed]" if leadOn else " [hv-off: no lead]"
                     if leadFault:
@@ -1049,6 +1059,8 @@ INPUT_MAP = {
     ("system", "/Dc/Battery/Voltage"):    ("batt_v", _rng(20, 80)),
     ("vebus", "/Ac/ActiveIn/ActiveInput"): ("feed", lambda v: True),
     ("vebus", "/Ac/Out/L1/P"):            ("ac_out", _rng(-20000, 20000)),
+    # the Quattro's own DC power: + charging the bank, - inverting (4.3.1)
+    ("vebus", "/Dc/0/Power"):             ("q_dc", _rng(-30000, 30000)),
     # shore-input resolution. This Quattro firmware publishes
     # /Ac/State/AcIn1Available and AcIn2Available (read 2026-09-14); one
     # without them leaves the fields None -- unknown, never "absent".
