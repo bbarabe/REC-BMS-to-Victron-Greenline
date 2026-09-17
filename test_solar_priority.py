@@ -34,8 +34,9 @@ R = load(os.path.join(REPO, "dbus-recbms", "dbus_recbms.py"), "dbus_recbms")
 rcfg = R.Config(os.path.join(REPO, "dbus-recbms", "config.ini"))
 check("config: [sustain] parsed", rcfg.sustain_enabled and rcfg.sustain_hold_s == 120)
 
-T = [1_800_000_000.0]
-R.time = types.SimpleNamespace(time=lambda: T[0])
+T = [1_800_000_000.0]      # the wall clock: the equalization calendar only
+M = [5_000.0]              # the monotonic clock: every duration in the driver
+R.time = types.SimpleNamespace(time=lambda: T[0], monotonic=lambda: M[0])
 drv = R.RecBmsDriver(rcfg)
 batt = drv.batt
 SOC = [62.0]
@@ -43,7 +44,7 @@ SOC = [62.0]
 
 def live():
     drv.bms.update({
-        "_lastUpdate": T[0], "socHiRes": SOC[0], "soc": int(SOC[0]),
+        "_lastUpdate": M[0], "socHiRes": SOC[0], "soc": int(SOC[0]),
         "voltage": 56.6, "current": 0.0, "temperature": 21.0,
         "cvl": 62.7, "ccl": 200.0, "dcl": 400.0, "dvl": 48.0,
         "minCellV": 3.70, "maxCellV": 3.75, "minCellT": 20.0, "maxCellT": 22.0,
@@ -57,6 +58,7 @@ def rtick(n=1, soc=None, slider=None, dt=1.0):
         FakeBus.store["/Settings/RecBms/ChargeSlider"] = slider
     for _ in range(n):
         T[0] += dt
+        M[0] += dt
         live()
         drv._tick()
 
@@ -143,10 +145,47 @@ check("released: slider CVL, telemetry cleared", batt["/RecBms/TargetChargeVolta
       batt["/RecBms/Sustain/Active"] == 0 and batt["/RecBms/Sustain/Soc"] is None)
 
 # stale BMS: no present SOC to pin, so refuse
-drv.bms["_lastUpdate"] = T[0] - 100
+drv.bms["_lastUpdate"] = M[0] - 100
 check("refused while the BMS is stale", not batt.write("/RecBms/Sustain/Request", 1) and
       batt["/RecBms/Sustain/Status"] == "refused: BMS not live")
 check("bad mode refused", not batt.write("/RecBms/Sustain/Request", 7))
+
+# durations run on the monotonic clock: a wall-clock step (GPS/NTP sync
+# after boot) neither keeps a hold alive nor ends it early
+live()
+check("floor for the clock-step check", batt.write("/RecBms/Sustain/Request", 1))
+rtick()
+T[0] -= 3600
+rtick(n=100)
+check("-1 h wall step: hold still in force at 101 s, countdown sane",
+      batt["/RecBms/Sustain/Active"] == 1 and 0 < batt["/RecBms/Sustain/SecondsLeft"] <= 120,
+      str(batt["/RecBms/Sustain/SecondsLeft"]))
+T[0] += 7200
+rtick(n=10)
+check("+2 h wall step: hold not cut short at 111 s", batt["/RecBms/Sustain/Active"] == 1)
+rtick(n=15)
+check("hold expires at 120 monotonic seconds", batt["/RecBms/Sustain/Active"] == 0 and
+      batt["/RecBms/Sustain/Status"].startswith("expired"))
+drv.eq["active"] = False
+FakeBus.store["/Settings/RecBms/EqLastCompleted"] = T[0]
+
+# telemetry quantisation: the voltage keeps the BMS's 0.01 V (DVCC hands it to
+# the chargers as their sense), the rest moves in steps; control paths untouched
+check("config: [publish] voltage at 0.01 V", rcfg.voltage_step == 0.01 and rcfg.current_step == 0.5)
+drv.bms.update({"voltage": 56.637, "current": -1.27, "temperature": 21.3})
+SOC[0] = 75.26
+T[0] += 1; M[0] += 1
+drv.bms.update({"_lastUpdate": M[0], "socHiRes": SOC[0]})
+drv._tick()
+check("voltage published at 0.01 V", batt["/Dc/0/Voltage"] == 56.64, str(batt["/Dc/0/Voltage"]))
+check("current in 0.5 A steps", batt["/Dc/0/Current"] == -1.5, str(batt["/Dc/0/Current"]))
+check("power in 10 W steps", batt["/Dc/0/Power"] == -70, str(batt["/Dc/0/Power"]))
+check("SOC in 0.1 % steps", batt["/Soc"] == 75.3, str(batt["/Soc"]))
+check("temperature in 0.5 degree steps", batt["/Dc/0/Temperature"] == 21.5, str(batt["/Dc/0/Temperature"]))
+check("CVL is never quantised", batt["/Info/MaxChargeVoltage"] == round(curve(70) - batt["/RecBms/SolarLead"], 2))
+check("_q: None passes, step 0 is off, no float dust",
+      R._q(None, 0.5) is None and R._q(1.2345, 0) == 1.2345 and R._q(0.30000000000000004, 0.1) == 0.3
+      and R._q(1234.4, 60) == 1260 and isinstance(R._q(7.2, 1), int))
 
 # pure ratchet corner: no SOC (fallback) keeps the last hold, still clipped
 check("ratchet: floor without SOC keeps and clips",
