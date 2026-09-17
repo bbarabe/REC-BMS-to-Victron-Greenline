@@ -1,0 +1,3 @@
+#!/bin/sh
+exec 2>&1
+exec /usr/bin/python3 /data/camera-relay/camera_relay.py --config /data/camera-relay/config.json

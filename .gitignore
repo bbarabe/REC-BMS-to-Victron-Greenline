@@ -7,3 +7,4 @@ __pycache__/
 
 # Claude Code machine-local settings
 .claude/settings.local.json
+camera-relay/config.json

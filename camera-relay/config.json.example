@@ -1,0 +1,8 @@
+{
+  "port": 8095,
+  "static": "/data/camera-relay/www",
+  "cameras": {
+    "port": {"url": "rtsp://192.0.2.10/live/0/SUB", "main": "rtsp://192.0.2.10/live/0/MAIN", "label": "Port", "rotate": 90, "mirror": false, "flip": false},
+    "starboard": {"url": "rtsp://192.0.2.11/live/0/SUB", "main": "rtsp://192.0.2.11/live/0/MAIN", "label": "Starboard", "rotate": 270, "mirror": false, "flip": false}
+  }
+}
