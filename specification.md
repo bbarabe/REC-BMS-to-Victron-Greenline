@@ -674,7 +674,7 @@ Subscribed to Signal K `electrical.batteries.1..3.*` and
 `propulsion.{port,starboard}.alternatorVoltage`, assembled them in flow context,
 and published five `victron-virtual` batteries on a 1 s tick with a 10 s
 staleness check. SOC arrived as a Signal K ratio and was multiplied by 100.
-Replaced by [`dbus-batteries/`](../dbus-batteries/), which reads the same three
+Replaced by [`dbus-batteries/`](dbus-batteries/), which reads the same three
 PGNs directly off `can0` and makes the choice of which batteries to forward a
 runtime setting rather than five hardcoded nodes.
 
@@ -684,7 +684,7 @@ Ran `candump -L can0,<13 filters>` as an exec-node subprocess, parsed the
 chunked stdout, and published two `victron-virtual` motordrives; a watchdog
 `pkill`ed any stale capture and restarted 5 s after candump exited. The wire
 decode it implemented is unchanged and now lives in
-[`dbus-edrive/`](../dbus-edrive/), which reads the bus with kernel filters and
+[`dbus-edrive/`](dbus-edrive/), which reads the bus with kernel filters and
 starts no subprocess.
 
 
