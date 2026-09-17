@@ -86,18 +86,22 @@ means restarting Signal K and everything else it hosts.
 
 ## Standalone drivers
 
-Use the deploy script — it encodes every rule in this section (one session,
-no connect retries, config value-guard, backups, restart only what changed,
-verify by re-reading the shipped VERSION):
+Use the deploy script — it encodes every rule in this section (the shared
+`./cerbo` session, no connect retries, config value-guard, backups, restart
+only what changed, verify the shipped VERSION *and* the running process):
 
 ```sh
 python deploy_cerbo.py recbms                  # upload changed files, svc -t, verify
 python deploy_cerbo.py solarpriority --install # first install of a service
+python deploy_cerbo.py solarpriority --start   # update / resume a stopped service (svc -tu)
 python deploy_cerbo.py recbms --dry-run        # show the plan / config diff only
 python deploy_cerbo.py czone --verify-only     # no upload, no restart
 ```
 
-Packages: `recbms`, `solarpriority`, `czone`, `batteries`, `edrive`.
+Packages: `recbms`, `solarpriority`, `czone`, `batteries`, `edrive`, `camerarelay`
+(the last one is `camera-relay/`: RTSP-to-WebSocket H.264 relay plus its
+WASM decoder test page; its `config.json` with the camera URLs lives only on
+the boat, `./cerbo put` it before `--install`).
 `python test_drivers.py` runs `dbus-batteries` and `dbus-edrive` off the boat
 against stubbed D-Bus, velib and SocketCAN — run it before every deploy of
 either. `python test_solar_priority.py` does the same for dbus-recbms' sustain
@@ -105,8 +109,15 @@ control and the Solar Priority engine (one-way charge/discharge); the stand-ins
 live in `test_stubs.py`. `solarpriority` reads `/RecBms/TargetSoc` and
 `Sustain/*`, so deploy `recbms` first (publisher first, as always).
 
-It aborts (exit 3) when the live config's *values* differ from the repo's
-HEAD copy — fold the on-boat edit into the repo first, or `--force-config`.
+It aborts (exit 3) when the live config's *values* match no committed copy of
+the file (HEAD or its last 30 commits) — that is an on-boat edit: fold it into
+the repo first, or `--force-config`. A live config that matches an older commit
+is merely behind and is updated without complaint. After a restart the running
+process must report the shipped version (`/Mgmt/ProcessVersion`, or the
+package's own status output where there is no D-Bus service, as for
+`camerarelay`); if it does not, the service gets one more `svc -t`, and the run
+exits 5 when it still reports the old version. `python test_deploy_cerbo.py`
+covers the script and `./cerbo` offline.
 Manual equivalent, if you must:
 
 ```sh

@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-deploy_cerbo.py — ship a standalone driver to the Cerbo over ONE SSH session.
+deploy_cerbo.py — ship drivers through the shared ./cerbo SSH daemon.
 
     python deploy_cerbo.py recbms                 # upload + svc -t + verify
     python deploy_cerbo.py solarpriority --install   # first install (install.sh)
-    python deploy_cerbo.py recbms solarpriority   # several, one session
+    python deploy_cerbo.py recbms solarpriority   # several, shared daemon
+    python deploy_cerbo.py solarpriority --start # update/resume a stopped service
     python deploy_cerbo.py czone --verify-only    # no upload, no restart
     python deploy_cerbo.py recbms --dry-run       # show what would change
 
 Encodes the rules in CLAUDE.md so nobody re-derives them:
-  * one SSH session per run, 30 s keepalive, NEVER retries a failed connect
-    (repeated connects exhaust the Cerbo and it drops off the network)
-  * the on-boat config (calibration!) is diffed against the repo's HEAD copy
-    BEFORE anything is overwritten; a value difference aborts unless
-    --force-config, a comment-only difference is fine
+  * reuse the shared ./cerbo daemon for every command and upload; its single
+    SSH transport, keepalive and failed-connect backoff remain authoritative
+  * the on-boat config (calibration!) is diffed against the repo's committed
+    copies BEFORE anything is overwritten; a value set that matches no commit
+    (an on-boat edit) aborts unless --force-config, a comment-only difference
+    or a config that is simply behind the repo is fine
   * every overwritten file is backed up on the boat as <file>.bak-<tag>
   * only the requested service is restarted; verification re-reads the
     shipped VERSION after the restart instead of assuming the copy landed
@@ -23,14 +25,15 @@ Host and password come from CERBO_HOST / CERBO_PASS (never from a file).
 """
 import argparse
 import difflib
+import hashlib
 import os
 import posixpath
 import re
+import shlex
 import subprocess
 import sys
 import time
-
-import paramiko
+import tempfile
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
@@ -154,6 +157,21 @@ PACKAGES = {
             ("com.victronenergy.motordrive.edrive_stbd", "/Connected"),
         ],
     },
+    "camerarelay": {
+        "dir": "camera-relay",
+        "service": "camera-relay",
+        "install_arg": "",
+        "version_file": "camera_relay.py",
+        "files": ["camera_relay.py", "config.json.example", "README.md", "install.sh",
+                  "uninstall.sh", "service/run", "service/log/run",
+                  "www/index.html", "www/decoder-worker.js", "www/yuv-canvas.js",
+                  "www/h264dec.js", "www/h264dec.wasm"],
+        # config.json holds the camera URLs and stays on the boat (not in git)
+        "configs": [],
+        "verify": [],
+        # no D-Bus: ask the relay itself
+        "verify_cmds": ["wget -qO- http://127.0.0.1:8095/stats.json 2>&1 | cut -c1-600"],
+    },
 }
 EXEC_SUFFIXES = (".py", ".sh", "/run")
 # Everything shipped is text destined for a Linux box. A CRLF in a `#!/bin/sh`
@@ -162,7 +180,8 @@ EXEC_SUFFIXES = (".py", ".sh", "/run")
 # core.autocrlf=true has CRLF on disk and sftp copies it byte for byte, so the
 # line endings are normalised here rather than trusted. (.gitattributes also
 # pins the working tree to LF; this is the belt to that pair of braces.)
-TEXT_SUFFIXES = (".py", ".sh", ".ini", ".md", "/run")
+TEXT_SUFFIXES = (".py", ".sh", ".ini", ".md", "/run", ".js", ".html", ".json")
+BINARY_SUFFIXES = (".wasm", ".png", ".jpg", ".gz", ".tgz")
 
 
 def die(msg, code=2):
@@ -187,6 +206,24 @@ def git_head(relpath):
     return r.stdout if r.returncode == 0 else None
 
 
+def git_history(relpath, n=30):
+    """The last n committed copies of a file, newest first (HEAD included).
+    The config guard asks whether the live file is one of them: a live
+    config that matches an OLDER commit is simply behind the repo, not an
+    on-boat edit -- which is exactly the state after a config change is
+    committed and before it is deployed (2026-09-09)."""
+    rp = relpath.replace(os.sep, "/")
+    r = subprocess.run(["git", "-C", REPO, "log", "-n", str(n), "--format=%H", "--", rp],
+                       capture_output=True, text=True, encoding="utf-8")
+    out = []
+    for h in r.stdout.split():
+        c = subprocess.run(["git", "-C", REPO, "show", "%s:%s" % (h, rp)],
+                           capture_output=True, text=True, encoding="utf-8")
+        if c.returncode == 0:
+            out.append(c.stdout)
+    return out
+
+
 def local_version(pkg):
     p = os.path.join(REPO, pkg["dir"], pkg["version_file"])
     m = re.search(r'^VERSION\s*=\s*"([^"]+)"', open(p, encoding="utf-8").read(), re.M)
@@ -194,53 +231,59 @@ def local_version(pkg):
 
 
 class Cerbo:
+    """Deployment operations over the existing CLI and its shared transport.
+
+    Credentials stay in the child process environment. Closing this client does
+    not close the daemon used by other Cerbo work in the same session.
+    """
+
     def __init__(self, host, password):
-        self.c = paramiko.SSHClient()
-        self.c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            self.c.connect(host, username="root", password=password, timeout=15,
-                           allow_agent=False, look_for_keys=False)
-        except Exception as e:
-            die("cannot connect to %s (%s). Do NOT retry in a loop — wait a few "
-                "minutes; repeated connects are what knock the Cerbo offline." % (host, e))
-        self.c.get_transport().set_keepalive(30)
-        self.sftp = None
+        self.environ = dict(os.environ, CERBO_HOST=host, CERBO_PASS=password)
+        self._call("up")
+
+    def _call(self, *arguments):
+        result = subprocess.run([os.path.join(REPO, "cerbo"), *arguments],
+                                env=self.environ, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace")
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError("Cerbo %s failed (exit %d): %s" %
+                               (arguments[0], result.returncode, detail))
+        return result.stdout, result.stderr
 
     def run(self, cmd, timeout=60):
-        _, out, err = self.c.exec_command(cmd, timeout=timeout)
-        o = out.read().decode(errors="replace")
-        e = err.read().decode(errors="replace")
-        return o, e
+        return self._call("run", cmd, str(timeout))
 
     def cat(self, path):
-        o, e = self.run("cat '%s' 2>/dev/null" % path)
-        return o if not e.strip() else o
+        return self.run("cat %s" % shlex.quote(path))[0]
 
     def exists(self, path):
-        o, _ = self.run("[ -e '%s' ] && echo yes || echo no" % path)
-        return o.strip() == "yes"
+        out, _ = self.run("[ -e %s ] && echo yes || echo no" % shlex.quote(path))
+        return out.strip() == "yes"
 
     def put(self, local, remote):
-        if self.sftp is None:
-            self.sftp = self.c.open_sftp()
-        self.run("mkdir -p '%s'" % posixpath.dirname(remote))
-        data = open(local, "rb").read()
+        self.run("mkdir -p %s" % shlex.quote(posixpath.dirname(remote)))
+        with open(local, "rb") as handle:
+            data = handle.read()
         if remote.endswith(TEXT_SUFFIXES):
             data = data.replace(b"\r\n", b"\n")
-        with self.sftp.open(remote, "wb") as fh:
-            fh.write(data)
+        # Normalize a temporary copy so the user's working file stays intact.
+        # Uploads still travel through the daemon's single SFTP transport.
+        with tempfile.NamedTemporaryFile(prefix="cerbo-upload-") as staging:
+            staging.write(data)
+            staging.flush()
+            self._call("put", staging.name, remote)
         if remote.endswith(EXEC_SUFFIXES):
-            self.run("chmod 755 '%s'" % remote)
+            self.run("chmod 755 %s" % shlex.quote(remote))
 
     def dbus_get(self, service, path):
-        o, e = self.run("dbus -y %s %s GetValue 2>&1" % (service, path), timeout=15)
-        lines = (o or e).strip().splitlines()
-        return lines[-1].strip() if lines else ""   # dbus CLI errors are tracebacks; the last line says it
+        out, err = self.run("dbus -y %s %s GetValue 2>&1" %
+                            (shlex.quote(service), shlex.quote(path)), timeout=15)
+        lines = (out or err).strip().splitlines()
+        return lines[-1].strip() if lines else ""
 
     def close(self):
-        if self.sftp:
-            self.sftp.close()
-        self.c.close()
+        self.environ.pop("CERBO_PASS", None)
 
 
 def main():
@@ -248,6 +291,8 @@ def main():
     ap.add_argument("packages", nargs="+", choices=sorted(PACKAGES))
     ap.add_argument("--install", action="store_true", help="first install: run install.sh instead of svc -t")
     ap.add_argument("--no-restart", action="store_true", help="upload only")
+    ap.add_argument("--start", action="store_true",
+                    help="start an existing stopped service; restart it if already running")
     ap.add_argument("--verify-only", action="store_true", help="no upload, no restart")
     ap.add_argument("--dry-run", action="store_true", help="diff and plan only")
     ap.add_argument("--force-config", action="store_true",
@@ -255,6 +300,8 @@ def main():
     ap.add_argument("--tag", default=time.strftime("%Y%m%d-%H%M"), help="backup suffix (.bak-<tag>)")
     ap.add_argument("--settle", type=float, default=8.0, help="seconds to wait after restart before verifying")
     args = ap.parse_args()
+    if args.start and (args.install or args.no_restart or args.verify_only):
+        ap.error("--start cannot be combined with --install, --no-restart or --verify-only")
 
     host = os.environ.get("CERBO_HOST")
     pw = os.environ.get("CERBO_PASS")
@@ -283,6 +330,7 @@ def main():
         rc = 0
         for name, pkg in plan:
             base = "/data/" + pkg["dir"]
+            restart_command = "svc -%s /service/%s" % ("tu" if args.start else "t", pkg["service"])
             print("\n#### %s" % name)
             o, _ = cb.run("grep -m1 '^VERSION' %s/%s 2>/dev/null; svstat /service/%s 2>&1" % (
                 base, pkg["version_file"], pkg["service"]))
@@ -307,13 +355,20 @@ def main():
                 lp = os.path.join(REPO, pkg["dir"], f)
                 rp = base + "/" + f
                 local_txt = open(lp, "rb").read()
-                live_txt = cb.cat(rp).encode() if cb.exists(rp) else None
+                if f.endswith(BINARY_SUFFIXES):
+                    # compare by hash: cat + decode mangles binaries and re-uploads them every time
+                    live_md5 = cb.run("md5sum '%s' 2>/dev/null" % rp)[0].split()[:1] if cb.exists(rp) else None
+                    live_txt = local_txt if live_md5 and live_md5[0] == hashlib.md5(local_txt).hexdigest() else (b"" if live_md5 else None)
+                else:
+                    live_txt = cb.cat(rp).encode() if cb.exists(rp) else None
                 if f in pkg["configs"] and live_txt is not None:
                     head = git_head(pkg["dir"] + "/" + f)
                     live_vals = ini_values(live_txt.decode(errors="replace"))
                     head_vals = ini_values(head) if head is not None else None
                     new_vals = ini_values(local_txt.decode("utf-8"))
-                    if head_vals is not None and live_vals != head_vals:
+                    known = head_vals is None or live_vals == head_vals or any(
+                        live_vals == ini_values(t) for t in git_history(pkg["dir"] + "/" + f))
+                    if not known:
                         d = "\n".join(difflib.unified_diff(head_vals, live_vals, "repo HEAD", "live", lineterm=""))
                         print("!! live %s has on-boat VALUE edits not in the repo:\n%s" % (f, d))
                         if not args.force_config:
@@ -338,7 +393,7 @@ def main():
             if args.dry_run:
                 print("-- dry run: %d file(s) would be uploaded; %s" % (
                     len(uploads), "install.sh %s" % pkg["install_arg"] if args.install
-                    else ("no restart" if args.no_restart else "svc -t /service/%s" % pkg["service"])))
+                    else ("no restart" if args.no_restart else restart_command)))
                 continue
 
             # --- backup + upload ---
@@ -356,26 +411,64 @@ def main():
                 print((o + e).strip())
             elif args.no_restart:
                 print("-- not restarted (--no-restart)")
-            elif uploads:
-                cb.run("svc -t /service/%s" % pkg["service"])
-                print("-- svc -t /service/%s" % pkg["service"])
-            if (args.install or (uploads and not args.no_restart)):
+            elif uploads or args.start:
+                cb.run(restart_command)
+                print("-- " + restart_command)
+            restarted = bool(args.install or args.start or (uploads and not args.no_restart))
+            if restarted:
                 time.sleep(args.settle)
-            verify(cb, pkg, base)
+            if not verify(cb, pkg, base, expect=local_version(pkg) if restarted else None):
+                # 2026-09-14: one `svc -t` left dbus-solarpriority's old process
+                # running (same pid, old /Mgmt/ProcessVersion) while the
+                # shipped file already read the new VERSION, and verify
+                # printed both without complaint. A running process that
+                # does not report the shipped version is not deployed.
+                print("!! %s still reports the old version; sending svc -t once more" % pkg["service"])
+                cb.run("svc -t /service/%s" % pkg["service"])
+                time.sleep(args.settle)
+                if not verify(cb, pkg, base, expect=local_version(pkg)):
+                    print("!! %s did not come up on the shipped version" % pkg["service"])
+                    rc = 5
     finally:
         cb.close()
     sys.exit(rc)
 
 
-def verify(cb, pkg, base):
+def verify(cb, pkg, base, expect=None):
+    """Print the shipped VERSION, the service state, the log tail and the
+    package's D-Bus reads. With `expect`, the running process must report
+    that version on /Mgmt/ProcessVersion (the shipped file alone proves only
+    that the copy landed, not that the old process let go); returns False
+    when it does not."""
     o, _ = cb.run("grep -m1 '^VERSION' %s/%s; svstat /service/%s 2>&1" % (
         base, pkg["version_file"], pkg["service"]))
     print("verify: " + o.strip().replace("\n", " | "))
     o, _ = cb.run("tail -n 12 /var/log/%s/current 2>/dev/null | tai64nlocal" % pkg["service"])
     print("log:\n" + "\n".join("   " + l for l in o.strip().splitlines()))
+    running = None
     for svc, path in pkg["verify"]:
-        print("   %-42s %s" % (svc.split(".")[-1] + path, cb.dbus_get(svc, path)))
+        value = cb.dbus_get(svc, path)
+        if path == "/Mgmt/ProcessVersion":
+            running = value
+        print("   %-42s %s" % (svc.split(".")[-1] + path, value))
+    cmd_out = ""
+    for cmd in pkg.get("verify_cmds", []):
+        o, e = cb.run(cmd, timeout=15)
+        cmd_out += (o or e)
+        print("   $ %s\n     %s" % (cmd, (o or e).strip().replace("\n", "\n     ")))
+    if expect is None:
+        return True
+    if not any(path == "/Mgmt/ProcessVersion" for _, path in pkg["verify"]):
+        # No D-Bus process version (camera-relay): the package's own status
+        # output has to show the shipped version instead, e.g. stats.json's
+        # "version": "0.6.0". Without this the relay was declared old and
+        # restarted twice on 2026-09-14 although it was already running 0.6.0.
+        return re.search(r"(?<![\w.])%s(?![\w.])" % re.escape(expect), cmd_out) is not None
+    return str(running or "").strip("'\"").startswith(expect + " ")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        die(str(exc))
