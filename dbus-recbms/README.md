@@ -186,6 +186,37 @@ Consequences:
 Deploy order: install this driver version **before** deploying the flow
 revision that reads `/RecBms/TargetChargeVoltage`.
 
+**The lead is a Solar Priority tool (v4.0.0).** It is what leaves the MPPTs
+headroom on shore, so it is applied only while
+`/Settings/SolarPriority/Enabled` is 1 (polled at the 3 s DVCC cadence;
+absent reads as off) and never with the Max Charge slider at or above
+`[cvl] lead_full_pct` (100). With Solar Priority off, or a full charge asked
+for, every charger is commanded the true target and the systemcalc offset is
+cleared once. `lead_needs_solar_priority = false` restores the standing lead.
+Each change of the lead in force is logged with its reason.
+
+## Publishing and clocks (v4.0.0)
+
+`[publish]` quantises telemetry: a value goes on D-Bus only when it moves to
+a different step (current 0.5 A, power 10 W, temperature 0.5 °C, SOC 0.1 %,
+Ah 1, times 60 s), and everything a tick touches goes out as **one**
+ItemsChanged. At the BMS's native 0.01 V / 0.1 A jitter the driver was
+sending ~4 signals a second to every listener on the Cerbo. Control paths
+(CVL/CCL/DCL, targets, lead, alarms, sustain, boost) are never quantised.
+
+**The voltage stays at 0.01 V.** It is not only telemetry: DVCC's shared
+voltage sense hands the published `/Dc/0/Voltage` to every charger as its
+battery voltage, so the chargers regulate against it at that resolution.
+Quantised to 0.05 V they ran bang-bang in 0.05 V bands (boat, 2026-09-15:
+arrays at 0 W while the bank drained).
+
+Every duration in the driver — BMS liveness, boost and sustain expiry, sample
+freshness, the lead fault, an equalization's run time — is measured on the
+monotonic clock; a wall-clock step (GPS/NTP sync after boot) neither keeps a
+boost alive nor cuts a hold short. Wall time is only the equalization
+calendar (`EqLastCompleted`). Solar Priority's engine clock is monotonic for
+the same reason.
+
 ## Lead verification (v1.4.0)
 
 Reading Victron's `dbus-systemcalc-py` (`delegates/dvcc.py`) showed the one
@@ -336,8 +367,22 @@ are last-known-good exactly like the flow, each with the time it last
 (`system /Ac/Consumption/L1/Power`, `vebus /Ac/Out/L1/P`, each MPPT
 `/Yield/Power`), with a 20 s staleness rule — a dead system or vebus forces
 shore. Devices are matched by instance (`[inputs]`): MPPTs 278/279, vebus
-276, battery 200. `shore_ac_input` selects `IgnoreAcIn1|2` and the
-ActiveInput value that means "on shore".
+276, battery 200.
+
+**Shore AC input (driver 4.0.0).** `[inputs] shore_ac_input = auto` resolves
+which Quattro input is shore at runtime (`resolve_shore_input`, pure): the
+GX's own AC input types win when exactly one input is *Grid* or *Shore power*
+(Settings → System setup → AC input 1/2 — **set those when rewiring**);
+failing that the input already settled on is kept (remembered in
+`/Settings/SolarPriority/ShoreInput`, so a restart on an island still knows
+which input it is ignoring); a fresh start reads the input the Quattro has
+accepted, then the only input with AC on it, never one the GX calls a
+generator. While nothing answers, the relay is left alone and the status
+says so. `1` or `2` pins it. The resolved input selects `IgnoreAcIn1|2` and
+the ActiveInput value that means "on shore"; when it changes, the input left
+behind is released and the engine starts over on shore. Published as
+`/SolarPriority/ShoreInput` and `/ShoreInputReason`. Safe start and shutdown
+release the resolved input, or both while unresolved.
 
 **Deliberate differences from the flow**
 
@@ -355,7 +400,9 @@ ActiveInput value that means "on shore".
 / solar / burndown / suspend), `/Status` (the flow's node-status line),
 `/StatusFill`, `/LastTransition` + `/LastTransitionTime`, `/EstimateW`,
 `/NeedW`, `/Desired`, and for one-way mode `/OneWay` (`""` / `charge` /
-`discharge`), `/TargetSoc`, `/Sustain` (the mode last requested). Transitions are logged:
+`discharge`), `/TargetSoc`, `/Sustain` (the mode last requested). `EstimateW` and
+`NeedW` move in `[inputs] power_step` (5 W) steps and a tick's changes go out
+as one ItemsChanged. Transitions are logged:
 `tail -f /var/log/dbus-solarpriority/current | tai64nlocal`.
 
 **Migration from the flow** (the two must never run together — both write
@@ -417,7 +464,9 @@ The status line is prefixed `1-WAY CHARGE 62->80% |` / `1-WAY DISCHARGE 90->70% 
 the discharge stint reads `DRAIN | …`, and engagement, completion and the
 sustain requests are logged.
 
-`python test_solar_priority.py` drives both halves off the boat.
+`python test_solar_priority.py` drives both halves off the boat;
+`python test_recbms.py` covers the lead gate and `python test_shore_input.py`
+the shore input, resolver and driver.
 
 ## Deploying updates
 
