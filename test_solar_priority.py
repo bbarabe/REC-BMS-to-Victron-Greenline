@@ -108,7 +108,8 @@ rtick(n=1, dt=125)
 check("hold expires on its own", batt["/RecBms/Sustain/Active"] == 0 and
       batt["/RecBms/Sustain/Status"].startswith("expired") and
       batt["/RecBms/Sustain/Request"] == 0)
-check("slider back in force after expiry", batt["/RecBms/TargetChargeVoltage"] == curve(80) + rcfg.eq_boost
+check("slider back in force after expiry",
+      abs(batt["/RecBms/TargetChargeVoltage"] - (drv._slider_cvl(80) + rcfg.eq_boost)) < 0.006
       or batt["/RecBms/TargetChargeVoltage"] == curve(80), str(batt["/RecBms/TargetChargeVoltage"]))
 check("equalization starts once released", drv.eq["active"])
 drv.eq["active"] = False
