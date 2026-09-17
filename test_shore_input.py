@@ -188,6 +188,47 @@ d._shutdown()
 check("shutdown while unresolved releases both inputs",
       sorted(w[1] for w in m.writes if w[0] == VEBUS) == [IGN1, IGN2], str(m.writes))
 
+print("\n=== prefer renewable: the driver's writer (4.2.0) ===")
+PRE = "/Dc/0/PreferRenewableEnergy"
+MPPT = "com.victronenergy.solarcharger.ttyS5"
+d, m = driver(types_=(0, 3), active=1)
+m.push(VEBUS, PRE, 1)
+tick(d)
+del m.writes[:]
+d._write_prefer(d._ms(), 1)
+check("toggle already reads what is wanted: nothing written", [w for w in m.writes if w[1] == PRE] == [])
+d._write_prefer(d._ms(), 0)
+check("night: charge now written once", [w for w in m.writes if w[1] == PRE] == [(VEBUS, PRE, 0)], str(m.writes))
+d._write_prefer(d._ms(), 0)
+check("... and not again within the minute, whatever it reads", len([w for w in m.writes if w[1] == PRE]) == 1)
+M[0] += 61
+d._write_prefer(d._ms(), 0)
+check("still reading the old value a minute on: written again", len([w for w in m.writes if w[1] == PRE]) == 2)
+m.push(VEBUS, PRE, 2)
+M[0] += 61
+d._write_prefer(d._ms(), 0)
+check("a value that is neither 0 nor 1 is never written over", len([w for w in m.writes if w[1] == PRE]) == 2)
+d, m = driver(types_=(0, 3), active=1)
+tick(d)
+d._write_prefer(d._ms(), 0)
+check("a toggle this firmware does not publish is never written blind", [w for w in m.writes if w[1] == PRE] == [])
+# end to end: a dark array for DUSK_MS, Solar Priority on -> charge now
+d, m = driver(types_=(0, 3), active=1)
+m.add(MPPT, 278, {"/Pv/V": 0.3, "/Yield/Power": 0.0, "/MppOperationMode": 0})
+d._device_added(MPPT, 278)
+m.push(VEBUS, PRE, 1)
+d.inp.enabled = True
+tick(d, 310)
+check("the engine's night reaches the Quattro through the driver",
+      d.sw["/SolarPriority/Daylight"] == 0 and d.sw["/SolarPriority/PreferRenewable"] == 0
+      and (VEBUS, PRE, 0) in m.writes, "%s %s" % (d.sw["/SolarPriority/Daylight"], [w for w in m.writes if w[1] == PRE]))
+d.inp.enabled = False
+del m.writes[:]
+M[0] += 61
+tick(d, 2)
+check("Solar Priority off: the toggle is left alone",
+      d.sw["/SolarPriority/PreferRenewable"] is None and [w for w in m.writes if w[1] == PRE] == [])
+
 M0 = M[0]
 d, m = driver(types_=(0, 3), active=1)
 t0 = d._ms()

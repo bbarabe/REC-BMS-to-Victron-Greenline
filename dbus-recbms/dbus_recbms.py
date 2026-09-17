@@ -57,6 +57,12 @@ It expires by itself after [sustain] hold_s and dies with the process, so a
 dead requester can never leave the charger pinned. The slider value itself
 is published as /RecBms/TargetSoc.
 
+v4.1.0 solar gain: [cvl] solar_gain_pct puts the Quattro/solar split the
+other way up -- the Quattro at the target, the MPPTs that many SOC points
+above it through the curve -- so the sun has a band over the target that
+shore never fills (Solar Priority engine 4.4 HOLD rules). 0 keeps the lead
+below. SOC is published in 0.05 % steps for those rules.
+
 v4.0.0 system support (the 1.5.0 control, unchanged, plus): the solar lead
 only while Solar Priority is enabled and never at a 100 % slider; telemetry
 quantised and one ItemsChanged per tick ([publish]; the voltage stays at
@@ -90,7 +96,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -188,6 +194,12 @@ class Config:
         # standing Quattro/solar split: command the vebus this far below the
         # target and raise only the MPPTs back to it (0 disables)
         self.solar_lead = max(0.0, min(0.30, float(v.get("solar_lead_v", 0.0))))
+        # 4.1.0 solar gain: the split the other way up. The Quattro is
+        # commanded the target itself and the MPPTs stand this many SOC
+        # points ABOVE it, read through the curve (1 % at 50 % is 0.08 V).
+        # Above 0 it replaces solar_lead_v; 0 keeps the lead below.
+        self.solar_gain_pct = max(0.0, float(v.get("solar_gain_pct", 0.0)))
+        self.solar_gain_max_v = max(0.0, min(0.30, float(v.get("solar_gain_max_v", 0.30))))
         # the lead only while Solar Priority is enabled (its
         # /Settings/SolarPriority/Enabled), and never at/above this slider
         # position -- a full charge is every charger commanded the target
@@ -414,6 +426,19 @@ def standing_lead(lead_v, slider, full_pct, sp_enabled, needs_sp=True):
     return float(lead_v)
 
 
+def solar_gain_v(curve_at, at_pct, gain_pct, max_v):
+    """Volts the MPPTs stand above the Quattro: what the CVL curve rises over
+    gain_pct SOC points above at_pct (the slider, or the SOC a sustain hold
+    sits at). The band the sun may fill is stated in SOC, as the owner
+    thinks of it, and the curve turns it into the voltage the chargers
+    need; where the curve is clipped (cvl_max) the gain shrinks to nothing
+    on its own. Pure: curve_at is the driver's slider -> volts function."""
+    if gain_pct <= 0 or max_v <= 0:
+        return 0.0
+    rise = curve_at(at_pct + gain_pct) - curve_at(at_pct)
+    return round(max(0.0, min(max_v, rise)), 2)
+
+
 def sustain_ratchet(mode, held, soc, slider, lo, hi, step=1.0):
     """(held, effective) for this tick. Pure, so it can be tested off the boat.
 
@@ -514,6 +539,8 @@ class RecBmsDriver:
         # Lead verification (v1.4.0): what DVCC actually sends the MPPTs
         self.eff_cv = None                  # (volts or None, ts) from systemcalc
         self._last_pub_cvl = None           # /Info/MaxChargeVoltage we published
+        self._bms_cvl = None                # the BMS's own CVL this tick (bounds target + boost)
+        self._gain_mode = False             # [cvl] solar_gain_pct in force this tick
         self._last_offset = 0.0             # offset we last wrote
         self.sp_enabled = None              # /Settings/SolarPriority/Enabled, polled
         self.lead_v = 0.0                   # standing lead in force this tick
@@ -641,7 +668,7 @@ class RecBmsDriver:
         svc.add_path("/Dc/0/Current", None, gettextcallback=a1)
         svc.add_path("/Dc/0/Power", None, gettextcallback=w1)
         svc.add_path("/Dc/0/Temperature", None, gettextcallback=t1)
-        svc.add_path("/Soc", None, gettextcallback=fmt("%", 1))
+        svc.add_path("/Soc", None, gettextcallback=fmt("%", 2))
         svc.add_path("/Soh", None, gettextcallback=pc)
         svc.add_path("/Capacity", None, gettextcallback=fmt("Ah", 1))
         svc.add_path("/ConsumedAmphours", None, gettextcallback=fmt("Ah", 1))
@@ -894,6 +921,9 @@ class RecBmsDriver:
         if float(target) + volts > c.boost_ceiling_v:
             return False, "target %.2f + %.2f > ceiling %.2fV" % (
                 target, volts, c.boost_ceiling_v)
+        if self._bms_cvl is not None and float(target) + volts > self._bms_cvl:
+            return False, "target %.2f + %.2f > the BMS's own CVL %.2fV" % (
+                target, volts, self._bms_cvl)
         # The MPPTs ramp at a rate set by how far the bus sits below their
         # target. Measured 2026-08-19: ~0.15V of margin -> unthrottled in
         # 43-45 s, but only ~0.05V -> 126 s to reach 5 % of the step. With too
@@ -1232,8 +1262,10 @@ class RecBmsDriver:
             boost_v = 0.0
         lead_v = self.lead_v
         # The ceiling at the point of output: the solar chargers are sent
-        # target + boost, whatever the gate above concluded.
-        boost_v = max(0.0, min(boost_v, c.ceiling_v - target))
+        # target + boost, whatever the gate above concluded. The BMS's own
+        # CVL bounds it too (4.1.0: HOLD's probe asks for boosts routinely).
+        limit = c.ceiling_v if self._bms_cvl is None else min(c.ceiling_v, self._bms_cvl)
+        boost_v = max(0.0, min(boost_v, limit - target))
         if lead_v > 0 or boost_v > 0:
             # Keep writing the offset even while faulted: if the access
             # level is raised and systemcalc restarted, the next poll sees
@@ -1243,7 +1275,7 @@ class RecBmsDriver:
                 # Faulted, the Quattro is published the FULL target, so an
                 # offset that suddenly takes hold would put the MPPTs at
                 # target + offset: keep even that under the ceiling.
-                offset = max(0.0, min(offset, c.ceiling_v - target))
+                offset = max(0.0, min(offset, limit - target))
             if self._boost_write(offset, quiet=True):
                 self._last_offset = offset
                 # While faulted publish the FULL target (lead 0): the MPPT
@@ -1260,8 +1292,10 @@ class RecBmsDriver:
                     boost_v = 0.0
                 self._last_offset = 0.0
                 if now - self._last_offset_warn > 60:
-                    log.warning("solar lead: cannot write systemcalc offset; "
-                                "publishing the full target CVL")
+                    log.warning("solar %s: cannot write systemcalc offset; %s",
+                                "gain" if self._gain_mode else "lead",
+                                "every charger stays on the Quattro's figure" if self._gain_mode
+                                else "publishing the full target CVL")
                     self._last_offset_warn = now
         else:
             # No lead wanted this tick (Solar Priority off, or the slider at
@@ -1271,6 +1305,12 @@ class RecBmsDriver:
                 self._last_offset = 0.0
             # else: the clear did not land; the next tick tries again
             # (meanwhile the verifier keeps judging the offset still there)
+        if self._gain_mode:
+            # the gain rides on the offset: not in force, the MPPTs are on the
+            # Quattro's figure, and that is what the boost gate and the
+            # engine (EffectiveChargeVoltage) must be told
+            target = round(target - lead_v + lead, 2)
+            self.last_target = target
         s["/RecBms/SolarBoost/EffectiveChargeVoltage"] = round(target + boost_v, 2)
         s["/RecBms/LeadFault"] = self.lead_fault["msg"] if self.lead_fault["active"] else ""
         return lead
@@ -1559,22 +1599,53 @@ class RecBmsDriver:
         # so command the Quattro solar_lead_v BELOW the target and raise
         # only the solar chargers back up to it: the Quattro lands at or
         # under the calibrated equilibrium and solar finishes the top-off.
-        target = round(final_cvl, 2)
-        self.lead_v = standing_lead(c.solar_lead, slider, c.lead_full_pct,
-                                    self.sp_enabled, c.lead_needs_sp)
+        #
+        # 4.1.0 solar gain ([cvl] solar_gain_pct > 0): the same split the
+        # other way up. The Quattro is commanded the target itself -- at a
+        # ~0 A hold it regulates the bank within 0.02 V of its CVL (boat,
+        # nights of 2026-09-13..17; the overshoot above is an absorption
+        # effect) -- and the MPPTs stand solar_gain_pct SOC points above it,
+        # so the sun has a band to fill that shore never touches. Same gate
+        # (Solar Priority on, slider under full), same offset, same verifier.
+        gain_mode = self._gain_mode = c.solar_gain_pct > 0
+        self._bms_cvl = bms_cvl
+        if gain_mode:
+            quattro = round(final_cvl, 2)
+            at = held if held is not None else slider
+            gain = standing_lead(
+                solar_gain_v(self._slider_cvl, at, c.solar_gain_pct, c.solar_gain_max_v),
+                slider, c.lead_full_pct, self.sp_enabled, c.lead_needs_sp)
+            if held is not None and self.sustain.get("mode") == SUSTAIN_CEILING:
+                gain = 0.0      # a ceiling means nothing charges, the sun included
+            # the ceiling and the BMS's own limit bound the MPPTs' target too
+            target = round(max(quattro, min(quattro + gain, bms_cvl, c.ceiling_v)), 2)
+            self.lead_v = round(target - quattro, 2)
+        else:
+            target = round(final_cvl, 2)
+            self.lead_v = standing_lead(c.solar_lead, slider, c.lead_full_pct,
+                                        self.sp_enabled, c.lead_needs_sp)
         if self._lead_logged != self.lead_v:
-            log.info("solar lead %.2fV -> %.2fV (Solar Priority %s, "
+            log.info("solar %s %.2fV -> %.2fV (Solar Priority %s, "
                      "slider %.0f%%, full at %.0f%%)",
+                     "gain" if gain_mode else "lead",
                      self._lead_logged or 0.0, self.lead_v,
                      "on" if self.sp_enabled else "off", slider,
                      c.lead_full_pct)
             self._lead_logged = self.lead_v
         lead = self._service_boost(now, target)
+        if gain_mode:
+            # An offset that is not in force (fault, unwritable path) leaves
+            # every charger on the Quattro's figure: the gain is lost, the
+            # shore charger is never raised to the MPPTs' target.
+            cvl_out = quattro
+            target = round(quattro + lead, 2)
+        else:
+            cvl_out = round(target - lead, 2)
         s["/RecBms/TargetChargeVoltage"] = target
         s["/RecBms/TargetSoc"] = slider
         s["/RecBms/SolarLead"] = round(lead, 2)
-        s["/Info/MaxChargeVoltage"] = round(target - lead, 2)
-        self._last_pub_cvl = round(target - lead, 2)
+        s["/Info/MaxChargeVoltage"] = cvl_out
+        self._last_pub_cvl = cvl_out
         s["/Info/MaxChargeCurrent"] = ccl
         s["/Info/MaxDischargeCurrent"] = dcl
         s["/Info/BatteryLowVoltage"] = dvl

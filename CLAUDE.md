@@ -105,11 +105,13 @@ the boat, `./cerbo put` it before `--install`).
 `python test_drivers.py` runs `dbus-batteries` and `dbus-edrive` off the boat
 against stubbed D-Bus, velib and SocketCAN — run it before every deploy of
 either. `python test_solar_priority.py` does the same for dbus-recbms' sustain
-control and the Solar Priority engine (one-way charge/discharge),
-`python test_recbms.py` for the solar lead gate and `python test_shore_input.py`
-for the shore AC input (resolver and driver); the stand-ins live in
+control and the Solar Priority engine (one-way charge/discharge and the 4.4
+HOLD rules), `python test_recbms.py` for the solar lead gate and the 4.1.0
+solar gain, and `python test_shore_input.py` for the shore AC input and the
+prefer-renewable writer (resolver and driver); the stand-ins live in
 `test_stubs.py`. `solarpriority` reads `/RecBms/TargetSoc` and
-`Sustain/*`, so deploy `recbms` first (publisher first, as always).
+`Sustain/*`, and its HOLD rules need dbus-recbms 4.1.0's `solar_gain_pct`, so
+deploy `recbms` first (publisher first, as always).
 
 It aborts (exit 3) when the live config's *values* match no committed copy of
 the file (HEAD or its last 30 commits) — that is an on-boat edit: fold it into

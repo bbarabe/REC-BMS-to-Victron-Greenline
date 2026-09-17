@@ -198,6 +198,36 @@ lead it was about. `lead_needs_solar_priority = false` restores the standing
 lead.
 Each change of the lead in force is logged with its reason.
 
+## Solar gain (v4.1.0)
+
+`[cvl] solar_gain_pct` (1.0 on the boat) puts the same split the other way
+up, stated in SOC: the Quattro is commanded the target itself and the MPPTs
+stand that many SOC points **above** it, read through the curve (1 % at 50 %
+is 0.08 V, 0.17 V on the steep part; never more than `solar_gain_max_v`).
+The sun then has a band over the target that shore never fills, which is
+where Solar Priority's HOLD rules live. It needs no lead below: at a ~0 A hold
+the Quattro keeps the bank within 0.02 V of its CVL (boat, nights of
+2026-09-13..17 — the +0.05..0.15 V overshoot is an absorption effect).
+
+Above 0 it **replaces** `solar_lead_v`; `solar_gain_pct = 0` restores the lead
+below. Same gate (Solar Priority on, slider under `lead_full_pct`), same
+systemcalc offset, same verifier, same 62.40 V ceiling — and since 4.1.0 the
+BMS's own CVL bounds the MPPTs' target and any boost on top of it as well
+(HOLD's probe asks for boosts routinely). Differences:
+
+- under a sustain **floor** the split follows the hold: Quattro at the present
+  SOC's voltage, MPPTs a band above it, so a floor no longer puts the arrays'
+  target at the bank's own voltage (boat, 2026-09-17: 1 W under a floor);
+- under a sustain **ceiling** there is no gain — nothing charges, the sun
+  included;
+- an offset that is not in force (fault, unwritable path) leaves every charger
+  on the Quattro's figure: the gain is lost, the shore charger is never
+  raised to the MPPTs' target.
+
+`/RecBms/SolarLead` reads the offset in force either way, and
+`/RecBms/TargetChargeVoltage` the MPPTs' target. SOC is published in 0.05 %
+steps (`[publish] soc_step`) because the HOLD rules read quarter points.
+
 ## Publishing and clocks (v4.0.0)
 
 `[publish]` quantises telemetry: a value goes on D-Bus only when it moves to
@@ -481,13 +511,55 @@ deficit, surge, SOC-drift and ceiling-stall exits are off — the bank draining
 (suspend, on shore under the ceiling, resume without the re-ramp boost), and
 the AC-control faults. No measurement boosts are requested.
 
-Both stand down within `oneway_exit_pct` = 0.5 % of the target and the normal
-engine finishes the last bit (the charger tops up to the slider, or a
-burn-down spends the band). Moving the slider re-evaluates on the next tick,
+Both stand down within `oneway_exit_pct` = 0.5 % of the target and the HOLD
+rules take over (engine 4.4; with `hold_rules = 0` the 4.3 engine finishes the
+last bit: the charger tops up to the slider, or a burn-down spends the band). Moving the slider re-evaluates on the next tick,
 including flipping direction. `oneway_enter_pct = 0` turns the feature off.
 The status line is prefixed `1-WAY CHARGE 62->80% |` / `1-WAY DISCHARGE 90->70% |`,
 the discharge stint reads `DRAIN | …`, and engagement, completion and the
 sustain requests are logged.
+
+### HOLD rules (engine 4.4)
+
+Within `oneway_enter_pct` (now 2) of the Max Charge target the bank is **held**,
+and the relay is decided on the SOC and on measured power instead of voltages.
+Needs dbus-recbms >= 4.1.0 with `solar_gain_pct` (the band over the target).
+`hold_rules = 0` puts the 4.3 engine (probe / harvest / burn-down) back, with
+no safety override and the Quattro's toggle left to the owner; going back also
+needs `solar_gain_pct = 0` in dbus-recbms, because the 4.3 harvest logic
+assumes the MPPTs at the target and the Quattro below it.
+
+- **Day and night** come from the brightest array's voltage (`dawn_v` 60 V for
+  10 min, under `dusk_v` 50 V for 5 min; ten recorded days gave one dawn and
+  one dusk each). Dusk sets the Quattro to *charge now*, dawn to *prefer
+  solar*; by day *charge now* is only a safety under `safety_soc` 25 %. The
+  toggle is written on a difference, at most once a minute, never when it
+  cannot be read as 0/1, and left alone while Solar Priority is off.
+- **Shore holds, never raises.** On shore under the target the dbus-recbms
+  floor is requested (it pins min(present SOC, slider)) unless it is day *and*
+  the Quattro reads prefer solar — so a night, a toggle that did not take, or
+  one that cannot be read all leave the refill to the sun.
+- **Leaving shore.** By day everything the arrays make reaches the bank, so it
+  is simply measured. Need = DC loads + `inv_idle_w` + AC load / `inv_eff`
+  (the Quattro's AC reading is no guide: inverting, it reports its DC draw,
+  ~100 W over the same loads read on shore). Leave when the sun covers the
+  need, or `hold_frac` (75 %) of it with the bank `hold_mid_pct` (0.25 %) over
+  the target — 30 s confirmation, the usual cooldown, never under a
+  heater-class load. No trial on the island; the departure logs the math and
+  a *prediction check* two minutes on logs predicted vs observed bank power.
+- **Returning.** The island's deficit is an energy (as in the 3.x engine):
+  bank power under zero adds, power over zero repays, never under zero. At
+  `hold_deficit_pct` (0.5 % of the bank, ~400 Wh) the engine returns, with a
+  backoff. Nothing is exempt from it. Suspend, faults, MIN_SOC and the SOC
+  drift backstop are unchanged.
+- **The only probe.** An array reports *limited* on shore by day: the
+  dbus-recbms boost lifts the MPPTs' target, at most every 30 min. It ends the
+  moment the rules are met (and the boat leaves), or once no array is limited
+  and the output has been flat for 20 s, or at dbus-recbms's 120 s cap.
+
+Diagnostics: `/SolarPriority/Hold`, `/Daylight`, `/PreferRenewable`,
+`/PredictedW`, `/DeficitWh`; the status line is prefixed `HOLD 50% |`.
+`scorecard/replay_engine.py` replays recorded days through the real engine.
 
 `python test_solar_priority.py` drives both halves off the boat;
 `python test_recbms.py` covers the lead gate and `python test_shore_input.py`

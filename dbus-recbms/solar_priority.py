@@ -29,7 +29,18 @@ What it does (see README.md "Solar Priority driver"):
     the bank is sustained as a ceiling the whole time (nothing may charge
     it), shore is left as soon as the gates allow, and the loads drain the
     bank day and night while solar covers what it can. Ends within
-    ONEWAY_EXIT_PCT of the target; the normal engine finishes the last bit.
+    ONEWAY_EXIT_PCT of the target; the HOLD rules take over from there.
+  - HOLD rules (engine 4.4): within ONEWAY_ENTER_PCT of the target the bank
+    is held and the relay is decided on the SOC and on measured power. Day
+    and night come from the array voltage and set the Quattro to prefer
+    solar / charge now; on shore under the target dbus-recbms is asked for a
+    floor (shore holds, never raises) unless it is day and the Quattro reads
+    prefer solar; the boat leaves when the sun covers its need (DC loads +
+    the Quattro's draw for the AC load), or 75 % of it with the bank 0.25 %
+    over the target; it returns when the island has drawn 0.5 % of the bank
+    below its best point (an energy: deficit adds, surplus repays). The only
+    probe is a dbus-recbms boost when an array reports "limited" on shore.
+    HOLD_RULES = 0 leaves the 4.3 engine in charge there.
 
 Differences from the flow (all deliberate):
   - inputs come from a velib DbusMonitor (signal-driven cache). Values stay
@@ -67,8 +78,8 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "4.1.0"
-ENGINE_VERSION = "4.3.1"
+VERSION = "4.2.0"
+ENGINE_VERSION = "4.4.0"
 BUSITEM = "com.victronenergy.BusItem"
 _CLOCK_BASE_MS = 10 ** 12      # see SolarPriorityDriver._ms
 
@@ -128,7 +139,43 @@ ENGINE_DEFAULTS = {
     # normal engine lets the shore charger fill that gap whenever the
     # Quattro is set to charge. One SOC point is the step dbus-recbms itself
     # treats as real movement (sustain step_pct).
-    "ONEWAY_ENTER_PCT": 1, "ONEWAY_EXIT_PCT": 0.5,
+    # 4.4: 2 / 0.5. HOLD lets the bank ride a point over the target (the
+    # solar gain) and the curve is good to ~0.4 of a point, so ENTER has to
+    # stand clear of that band or the top of it would read as "discharge".
+    "ONEWAY_ENTER_PCT": 2, "ONEWAY_EXIT_PCT": 0.5,
+    # ---- HOLD rules (4.4, owner 2026-09-17) ------------------------------
+    # Within ENTER of the Max Charge target the bank is HELD, and the relay
+    # is decided on the SOC and on measured power, not on voltages. 0 = the
+    # 4.3 engine (probe / harvest / burn-down) runs there instead.
+    "HOLD_RULES": 1,
+    # leave shore when the sun covers the boat's need, or covers HOLD_FRAC of
+    # it while the bank stands HOLD_MID_PCT over the target (the band pays
+    # the rest: early morning, evening, passing clouds)
+    "HOLD_MID_PCT": 0.25, "HOLD_FRAC": 0.75,
+    # return to shore once the island has drawn this share of the bank below
+    # its best point since it left (an energy, as in the 3.x engine: deficit
+    # adds, surplus repays, never under zero) -- 0.5 % of 1440 Ah is ~400 Wh
+    "HOLD_DEFICIT_PCT": 0.5, "BANK_AH": 1440,
+    # the boat's need on the island: DC loads + what the Quattro takes to
+    # invert the AC load. 20 recorded transfers fit 90 W / 0.95, five at 15 s
+    # resolution (2026-09-17) nearer 135 W; every departure logs predicted
+    # against observed bank power so these can be tuned.
+    "INV_IDLE_W": 120, "INV_EFF": 0.95, "PRED_CHECK_MS": 120000,
+    # at night shore may hold the bank where it is, never raise it: the floor
+    # is asked for while the bank is this far under the target
+    "HOLD_FLOOR_GAP_PCT": 0.05,
+    # the only probe HOLD needs: an array reports "limited" on shore by day,
+    # so its output is not what the sun has. Raise the MPPTs' target (the
+    # dbus-recbms boost, which caps it at 120 s and at the ceiling) at most
+    # every PROBE_INTERVAL_MS; stop as soon as the rules are met (and leave),
+    # or once no array is limited and the output has stopped rising.
+    "PROBE_INTERVAL_MS": 1800000, "PROBE_MIN_MS": 20000, "PROBE_FLAT_MS": 20000,
+    "PROBE_READY_MS": 10000,
+    # day / night from the brightest array's voltage, never its current (a
+    # curtailed array reads a tenth of an amp under a bright sky)
+    "DAWN_V": 60, "DUSK_V": 50, "DAWN_MS": 600000, "DUSK_MS": 300000,
+    # Charge now by day only as a safety, under this SOC
+    "SAFETY_SOC": 25, "SAFETY_EXIT_SOC": 27,
 }
 
 
@@ -196,6 +243,9 @@ class Inputs:
               "voc6", "voc7", "y6", "y7", "m6", "m7", "batt_v", "cvl",
               "boost_active", "boost_window", "boost_eff", "lead",
               "target_soc", "sustain_active", "q_dc",
+              # HOLD rules (4.4): DC loads, the Quattro's prefer-renewable
+              # toggle as it reads, the bank's size
+              "dc_sys", "pre", "bank_ah",
               # shore-input resolution only (the engine never reads these)
               "ac1_available", "ac2_available", "ac1_type", "ac2_type")
 
@@ -215,6 +265,11 @@ class Outputs:
         self.boost = None        # volts to request (0 = release), or None
         self.sustain = None      # 0/1/2 to write to /RecBms/Sustain/Request, or None
         self.oneway = ""         # "", "charge" or "discharge"
+        self.hold = False        # the HOLD rules decided this tick
+        self.prefer = None       # 1 prefer solar / 0 charge now / None leave alone
+        self.daylight = None     # True / False / None (not known yet)
+        self.pred_w = None       # predicted bank power on the island (shore, HOLD)
+        self.deficit_wh = 0.0    # the island's running deficit (HOLD)
         self.status_fill = "grey"
         self.status_text = ""
         self.est = 0.0
@@ -238,7 +293,51 @@ def fresh_state(now, t):
         "battWin": [], "mdl6": None, "mdl7": None, "vocRef": None,
         "lastBoostTs": 0, "lockoutUntil": 0,
         "oneway": None, "sustainSent": 0, "sustainAssert": 0,
+        # 4.4
+        "daylight": None, "lightSince": 0, "darkSince": 0, "safety": False, "wasHold": False,
+        "predWin": [], "holdProbe": 0, "probeRef": None,
+        "drawdownWh": 0.0, "drawdownTs": 0, "predW": None, "predCheckAt": 0,
     }
+
+
+def daylight_update(st, now, brightest, t):
+    """Day or night from the brightest array's voltage: True once it has read
+    DAWN_V for DAWN_MS, False once it has read under DUSK_V for DUSK_MS,
+    unchanged in between and while no array reports. Two timers with a gap
+    between the thresholds, so a cloud changes nothing and each edge comes
+    once a day (HA history 2026-09-07..17: one dawn, one dusk every day,
+    0.01 of 37.5 kWh outside the detected day). Returns 'dawn', 'dusk' or None."""
+    edge = None
+    if brightest is None:
+        st["lightSince"] = st["darkSince"] = 0
+    elif brightest >= t["DAWN_V"]:
+        st["darkSince"] = 0
+        st["lightSince"] = st["lightSince"] or now
+        if now - st["lightSince"] >= t["DAWN_MS"] and st["daylight"] is not True:
+            st["daylight"], edge = True, "dawn"
+    elif brightest < t["DUSK_V"]:
+        st["lightSince"] = 0
+        st["darkSince"] = st["darkSince"] or now
+        if now - st["darkSince"] >= t["DUSK_MS"] and st["daylight"] is not False:
+            st["daylight"], edge = False, "dusk"
+    else:
+        st["lightSince"] = st["darkSince"] = 0
+    return edge
+
+
+def prefer_wanted(enabled, safety, daylight, managed=True):
+    """The Quattro's prefer-renewable toggle: 1 prefer solar, 0 charge now,
+    None leave it alone. Owner, 2026-09-17: charge now at night, prefer
+    solar by day, and charge now by day only as a safety under SAFETY_SOC --
+    never permanently. Solar Priority off leaves the owner's setting alone;
+    so does a day/night that is not known yet."""
+    if not enabled or not managed:
+        return None
+    if safety:
+        return 0
+    if daylight is None:
+        return None
+    return 1 if daylight else 0
 
 
 SUSTAIN_OFF, SUSTAIN_FLOOR, SUSTAIN_CEILING = 0, 1, 2   # dbus-recbms modes
@@ -424,6 +523,10 @@ class Engine:
             st["harvestSince"] = 0
             st["suspendTrigStart"] = 0
             st["resumeStart"] = 0
+            st["holdProbe"] = 0
+            st["drawdownWh"] = 0.0
+            st["drawdownTs"] = 0
+            st["predCheckAt"] = 0
             boostMsg[0] = 0
             transition[0] = "-> SHORE (" + reason + ")"
             status[1] = transition[0]
@@ -476,7 +579,7 @@ class Engine:
             status[0] = "yellow"
             status[1] = transition[0]
 
-        def enter_solar(reason):
+        def enter_solar(reason, keep_backoff=False):
             st["state"] = "solar"
             st["desired"] = 1
             st["socEntry"] = soc.v
@@ -486,8 +589,13 @@ class Engine:
             st["surgeStart"] = 0
             st["burnExitStart"] = 0
             st["burnCalmStart"] = 0
-            st["backoffMs"] = t["COOLDOWN_MS"]
-            st["backoffUntil"] = 0
+            st["drawdownWh"] = 0.0
+            st["drawdownTs"] = 0
+            if not keep_backoff:
+                # a probe proved the island; HOLD leaves without one, so its
+                # backoff only relaxes after STABLE_MS of island (solar state)
+                st["backoffMs"] = t["COOLDOWN_MS"]
+                st["backoffUntil"] = 0
             transition[0] = "-> SOLAR (" + reason + ")"
             status[0] = "green"
             status[1] = transition[0]
@@ -502,6 +610,8 @@ class Engine:
             st["resumeStart"] = 0
             st["loadExceedStart"] = 0
             st["surgeStart"] = 0
+            st["drawdownTs"] = 0          # the deficit stands; shore time is not integrated
+            st["predCheckAt"] = 0
             boostMsg[0] = 0
             transition[0] = "-> SUSPEND (load %.0fW, base %.0fW)" % (loadNow.v, st["suspendBase"])
             status[0] = "blue"
@@ -562,6 +672,62 @@ class Engine:
         owc = oneway == "charge"
         owd = oneway == "discharge"
 
+        # ---- 4.4: day / night, the safety, HOLD, and what the island would cost ----
+        volts = [x.v for x in (voc6, voc7) if x is not None]
+        edge = daylight_update(st, now, max(volts) if volts else None, t)
+        if edge:
+            self.log("%s (brightest array %.0fV)" % (edge.upper(), max(volts)))
+        if not t["HOLD_RULES"]:
+            st["safety"] = False        # the 4.3 engine: no safety override, the toggle is the owner's
+        elif soc is not None:
+            if soc.v < t["SAFETY_SOC"] and not st["safety"]:
+                st["safety"] = True
+                self.log("SAFETY: SOC %.1f%% under %.0f%% -- charge now, no hold on shore"
+                         % (soc.v, t["SAFETY_SOC"]))
+            elif soc.v >= t["SAFETY_EXIT_SOC"] and st["safety"]:
+                st["safety"] = False
+                self.log("safety over at SOC %.1f%%" % soc.v)
+        # HOLD: within ENTER of the target (no one-way direction), decided on
+        # the SOC and on measured power
+        hold = bool(t["HOLD_RULES"]) and enabled and not missing and tgt is not None and oneway is None
+        if hold and not st["wasHold"] and st["state"] == "solar":
+            # HOLD takes over an island another mode started (a one-way drain
+            # that reached its target): its budget and its backstop start here
+            st["socEntry"] = soc.v
+            st["drawdownWh"] = 0.0
+            st["drawdownTs"] = 0
+        if hold != st["wasHold"]:
+            st["readySince"] = 0        # a confirmation earned under the other rules does not count
+        st["wasHold"] = hold
+        if st["holdProbe"] and not (hold and st["state"] == "shore"):
+            # the probe's branch no longer runs (disabled, an input lost, the
+            # slider moved into one-way): release its boost now
+            st["holdProbe"] = 0
+            boostMsg[0] = 0
+        limited = (m6 is not None and m6.v == 1) or (m7 is not None and m7.v == 1)
+        # The boat's need on the island is its DC loads plus what the Quattro
+        # takes to invert the AC load; the sun, the DC loads and the MPPTs'
+        # own losses carry across a transfer unchanged. So what reaches the
+        # bank now, less what the Quattro adds now, is what the arrays
+        # deliver -- and that less the need is the bank power the island
+        # will see. (The Quattro's AC reading is no guide: inverting, it
+        # reports its DC draw, ~100 W over the same loads read on shore.)
+        solarM = needM = predM = None
+        if batt is not None and loadAvg is not None:
+            inv = t["INV_IDLE_W"] + loadAvg.v / t["INV_EFF"]
+            qd = inp.q_dc.v if (inp.q_dc is not None and vebusAlive) else 0.0
+            dcl = max(0.0, inp.dc_sys.v) if inp.dc_sys is not None else 0.0
+            pw = st["predWin"]
+            pw.append((now, batt.v - qd + dcl, dcl + inv))
+            while pw and pw[0][0] < now - t["EVAL_MS"]:
+                pw.pop(0)
+            if len(pw) > 60:
+                del pw[:len(pw) - 60]
+            if len(pw) >= 5:
+                solarM = sum(x[1] for x in pw) / len(pw)
+                needM = sum(x[2] for x in pw) / len(pw)
+                predM = solarM - needM
+
         needW = 0.0
         if not enabled:
             if st["state"] != "shore":
@@ -597,7 +763,97 @@ class Engine:
             qdc = inp.q_dc
             chargerW = qdc.v if (qdc is not None and vebusAlive) else batt.v
 
-            if st["state"] == "shore":
+            if st["state"] == "shore" and hold:
+                # ---- HOLD on shore (4.4) ----
+                # By day the Quattro prefers solar, so everything the arrays
+                # make reaches the bank and is simply measured; the MPPTs'
+                # target stands a band over the Quattro's (dbus-recbms solar
+                # gain). Leave when the sun covers the need, or most of it
+                # with the bank over the target. No trial on the island: the
+                # deficit budget pays for a wrong call.
+                shoreMissing = (feed.v == 240 and sinceTrans > t["FEEDBACK_GRACE_MS"])
+                light = st["daylight"] is True
+                r1 = solarM is not None and solarM >= needM
+                r2 = (solarM is not None and soc.v >= tgt.v + t["HOLD_MID_PCT"]
+                      and solarM >= t["HOLD_FRAC"] * needM)
+                go = (light and not shoreMissing and soc.v >= t["MIN_SOC"]
+                      and loadNow.v < t["SUSPEND_LOAD_W"] and (r1 or r2))
+                if go:
+                    st["readySince"] = st["readySince"] or now
+                else:
+                    st["readySince"] = 0
+                gateOk = (sinceTrans >= t["COOLDOWN_MS"] and now >= st["backoffUntil"]
+                          and now >= st["lockoutUntil"])
+                readyMs = t["PROBE_READY_MS"] if st["holdProbe"] else t["READY_MS"]
+
+                if st["holdProbe"]:
+                    # The probe: the boost has lifted the MPPTs' target, the
+                    # arrays show what the sun has. It ends the moment the
+                    # rules are met (below), or once no array is limited and
+                    # the output has stopped rising -- not the instant they
+                    # read "not limited": the Flybridge tracker reports
+                    # tracking while parked at 40 W (boat, 2026-09-17).
+                    ref = st["probeRef"]
+                    if solarM is not None and (ref is None or limited
+                                               or solarM > ref["w"] * 1.05 + 10):
+                        # "flat" is timed from the arrays coming off their limit
+                        st["probeRef"] = ref = {"w": solarM, "ts": now}
+                    age = now - st["holdProbe"]
+                    if not boosting and age > 10000:
+                        st["holdProbe"] = 0
+                        self.log("hold probe over (boost ended): solar %.0fW of need %.0fW"
+                                 % (solarM or 0, needM or 0))
+                    elif (age >= t["PROBE_MIN_MS"] and not limited and not go and ref is not None
+                          and now - ref["ts"] >= t["PROBE_FLAT_MS"]):
+                        st["holdProbe"] = 0
+                        boostMsg[0] = 0
+                        self.log("hold probe done in %ds: solar %.0fW of need %.0fW -- staying"
+                                 % (age / 1000, solarM or 0, needM or 0))
+                elif (light and limited and not go and not boosting and gateOk and not shoreMissing
+                      and not leadFault and soc.v >= t["MIN_SOC"]
+                      and loadNow.v < t["SUSPEND_LOAD_W"]
+                      and (needM is None or needM <= pRated)     # a need no sun can meet: nothing to learn
+                      and now - st["lastBoostTs"] >= t["PROBE_INTERVAL_MS"]):
+                    st["lastBoostTs"] = now
+                    st["holdProbe"] = now
+                    st["probeRef"] = None
+                    boostMsg[0] = t["BOOST_V"]
+                    self.log("hold probe: an array is limited on shore (solar %.0fW, need %.0fW)"
+                             % (solarM or 0, needM or 0))
+
+                if go and gateOk and (now - st["readySince"]) >= readyMs:
+                    if st["holdProbe"] or boosting:
+                        boostMsg[0] = 0
+                    st["holdProbe"] = 0
+                    st["predW"] = predM
+                    st["predCheckAt"] = now + t["PRED_CHECK_MS"]
+                    enter_solar("hold: solar %.0fW vs need %.0fW%s, predicted batt %+.0fW, SOC %.2f%% / %.0f%%" % (
+                        solarM, needM, "" if r1 else " (%.0f%% of it, bank over target)" % (100 * solarM / needM),
+                        predM, soc.v, tgt.v), keep_backoff=True)
+                else:
+                    status[0] = "red" if shoreMissing else "blue"
+                    sx = "NO SHORE? | " if shoreMissing else "SHORE | "
+                    if solarM is not None:
+                        sx += "solar %.0fW need %.0fW" % (solarM, needM)
+                    else:
+                        sx += "measuring"
+                    sx += " SOC %.2f%%" % soc.v
+                    sx += " [day]" if light else (" [night]" if st["daylight"] is False else " [light?]")
+                    if limited:
+                        sx += " [limited]"
+                    if st["holdProbe"]:
+                        sx += " [probe %ds]" % ((now - st["holdProbe"]) / 1000)
+                    if now < st["lockoutUntil"]:
+                        sx += " [LOCKOUT %dm]" % math.ceil((st["lockoutUntil"] - now) / 60000)
+                    elif now < st["backoffUntil"]:
+                        sx += " [backoff %dm]" % math.ceil((st["backoffUntil"] - now) / 60000)
+                    elif sinceTrans < t["COOLDOWN_MS"]:
+                        sx += " [cd %ds]" % math.ceil((t["COOLDOWN_MS"] - sinceTrans) / 1000)
+                    elif go:
+                        sx += " [confirm %ds]" % math.ceil((readyMs - (now - st["readySince"])) / 1000)
+                    status[1] = sx
+
+            elif st["state"] == "shore":
                 shoreMissing = (feed.v == 240 and sinceTrans > t["FEEDBACK_GRACE_MS"])
 
                 if st["backoffUntil"] > now:
@@ -877,6 +1133,32 @@ class Engine:
                 else:
                     st["suspendTrigStart"] = 0
 
+                # HOLD (4.4): the island's deficit is an energy, as in the 3.x
+                # engine -- bank power under zero adds to it, power over zero
+                # repays it, never under zero: what the bank has been drawn
+                # below its best point since it left shore. A cloud passes; a
+                # slow drain is bounded. Nothing is exempt: the 3.x engine
+                # excused a drain while an array read "limited", and the MPPTs
+                # read limited under a 1.7 kW heater (boat, 2026-09-16). Here
+                # the MPPTs' ceiling is the same on shore and on the island,
+                # so the bank does not leave shore above it.
+                budget = 0.0
+                if hold:
+                    ah = inp.bank_ah.v if inp.bank_ah is not None else t["BANK_AH"]
+                    budget = t["HOLD_DEFICIT_PCT"] / 100.0 * ah * (battV.v if battV is not None else 55.0)
+                    if st["drawdownTs"]:
+                        hours = min(max(0.0, now - st["drawdownTs"]), 5000) / 3600000.0
+                        st["drawdownWh"] = max(0.0, st["drawdownWh"] - batt.v * hours)
+                    st["drawdownTs"] = now
+                    if st["predCheckAt"] and now >= st["predCheckAt"]:
+                        st["predCheckAt"] = 0
+                        seen = battMean if battMean is not None else batt.v
+                        if st["predW"] is not None:
+                            self.log("prediction check: predicted batt %+.0fW, observed %+.0fW (error %+.0fW)"
+                                     % (st["predW"], seen, seen - st["predW"]))
+                else:
+                    st["drawdownTs"] = 0
+
                 # Note: the flow's ceiling-stall condition also tested
                 # `!shoreMissing`, but that variable is only assigned in the
                 # shore branch (JS `var` hoisting) so it was always undefined
@@ -894,6 +1176,26 @@ class Engine:
                     escalateBackoff()
                     toShore("SOC %.1f%% (entry %.1f%%)" % (soc.v, st["socEntry"]))
                     status[0] = "blue"
+                elif hold:
+                    # the one ordinary way back is the deficit budget; the
+                    # SOC drift from the departure stays as the backstop
+                    st["loadExceedStart"] = 0
+                    st["surgeStart"] = 0
+                    if soc.v < st["socEntry"] - t["SOC_DRIFT_MAX"]:
+                        escalateBackoff()
+                        toShore("SOC %.1f%% (entry %.1f%%)" % (soc.v, st["socEntry"]))
+                        status[0] = "blue"
+                    elif st["drawdownWh"] >= budget:
+                        escalateBackoff()
+                        toShore("deficit: %.0f Wh drawn below the island's best, budget %.0f Wh "
+                                "(batt %.0fW, PV %.0fW, load %.0fW)" % (
+                                    st["drawdownWh"], budget, batt.v, pvNow, loadNow.v))
+                        status[0] = "blue"
+                    else:
+                        status[0] = "yellow" if st["drawdownWh"] >= budget / 2 else "green"
+                        status[1] = "SOLAR | PV %.0fW batt %s%.0fW load %.0fW SOC %.2f%% [deficit %.0f/%.0f Wh]%s" % (
+                            pvNow, "+" if batt.v >= 0 else "", batt.v, loadNow.v, soc.v,
+                            st["drawdownWh"], budget, " [limited]" if limited else "")
                 elif owd:
                     # Discharging one-way: a deficit, a surge or SOC drift is
                     # the bank doing exactly what was asked. Only the floor,
@@ -937,6 +1239,8 @@ class Engine:
         if oneway and status[1] and not status[1].startswith("->"):
             status[1] = "%s %.0f->%.0f%% | %s" % (
                 "1-WAY CHARGE" if owc else "1-WAY DISCHARGE", soc.v, tgt.v, status[1])
+        elif hold and status[1] and not status[1].startswith("->"):
+            status[1] = "HOLD %.0f%% | %s" % (tgt.v, status[1])
 
         # ---- Command emission ----
         if st["lastSent"] != st["desired"] or (enabled and now - st["lastAssert"] >= t["ASSERT_MS"]):
@@ -948,10 +1252,26 @@ class Engine:
         # is connected (shore, suspend) -- solar must be free to charge the
         # rest of the time. Discharging, it is a ceiling the whole time.
         # Re-asserted every ASSERT_MS: dbus-recbms expires it on its own.
-        if owc:
+        #
+        # HOLD (4.4): shore may hold the bank where it is, never raise it.
+        # Under the target and on shore the floor is asked for unless it is
+        # day AND the Quattro reads "prefer solar" (it then charges nothing
+        # anyway) -- so a night, a toggle that did not take, or one that
+        # cannot be read all leave the refill to the sun. The owner's rule
+        # "at dusk hold the lower of now and the target" is this floor:
+        # dbus-recbms pins it at min(present SOC, slider).
+        # The safety (SOC under SAFETY_SOC) overrides every hold: charge.
+        pre = inp.pre.v if inp.pre is not None else None
+        if st["safety"]:
+            want = SUSTAIN_OFF
+        elif owc:
             want = SUSTAIN_FLOOR if st["state"] in ("shore", "suspend") else SUSTAIN_OFF
         elif owd:
             want = SUSTAIN_CEILING
+        elif (hold and st["state"] in ("shore", "suspend")
+              and soc.v < tgt.v - t["HOLD_FLOOR_GAP_PCT"]
+              and not (st["daylight"] is True and pre == 1)):
+            want = SUSTAIN_FLOOR
         else:
             want = SUSTAIN_OFF
         if st["sustainSent"] != want or (want and now - st["sustainAssert"] >= t["ASSERT_MS"]):
@@ -962,7 +1282,14 @@ class Engine:
         out.transition = transition[0]
         out.boost = boostMsg[0]
         out.oneway = oneway or ""
+        out.hold = hold
+        out.daylight = st["daylight"]
+        out.prefer = prefer_wanted(enabled, st["safety"], st["daylight"], bool(t["HOLD_RULES"]))
+        out.pred_w = predM if (hold and st["state"] == "shore") else None
+        out.deficit_wh = st["drawdownWh"]
         out.status_fill, out.status_text = status
+        if hold and solarM is not None:
+            est, needW = solarM, needM          # what HOLD judges, for the UI
         out.est = est
         out.need_w = needW
         out.state = st["state"]
@@ -1066,6 +1393,12 @@ INPUT_MAP = {
     ("vebus", "/Ac/Out/L1/P"):            ("ac_out", _rng(-20000, 20000)),
     # the Quattro's own DC power: + charging the bank, - inverting (4.3.1)
     ("vebus", "/Dc/0/Power"):             ("q_dc", _rng(-30000, 30000)),
+    # HOLD rules (4.4): the DC loads, the Quattro's prefer-renewable toggle as
+    # it reads (1 prefer solar, 0 charge now; anything else is never written
+    # over), the bank's size for the deficit budget
+    ("system", "/Dc/System/Power"):       ("dc_sys", _rng(-5000, 20000)),
+    ("vebus", "/Dc/0/PreferRenewableEnergy"): ("pre", lambda v: v in (0, 1, 2)),
+    ("battery", "/InstalledCapacity"):    ("bank_ah", _rng(10, 10000)),
     # shore-input resolution. This Quattro firmware publishes
     # /Ac/State/AcIn1Available and AcIn2Available (read 2026-09-14); one
     # without them leaves the fields None -- unknown, never "absent".
@@ -1084,7 +1417,8 @@ INPUT_MAP = {
     ("battery", "/RecBms/Sustain/Active"): ("sustain_active", lambda v: True),
 }
 WRITE_PATHS = {
-    "vebus": ["/Ac/Control/IgnoreAcIn1", "/Ac/Control/IgnoreAcIn2"],
+    "vebus": ["/Ac/Control/IgnoreAcIn1", "/Ac/Control/IgnoreAcIn2",
+              "/Dc/0/PreferRenewableEnergy"],
     "battery": ["/RecBms/SolarBoost/Request", "/RecBms/LeadFault",
                 "/RecBms/Sustain/Request"],
 }
@@ -1103,6 +1437,8 @@ class SolarPriorityDriver:
         self.inp.feed_shore = (self.shore_input or 1) - 1
         self.load_window = []
         self.last_status = None
+        self._prefer_written = 0         # engine clock of the last toggle write
+        self._prefer_logged = None       # the value last logged at INFO
         self.engine = Engine(cfg.engine, self._ms(), logger=self._engine_log)
         self.sbus = shared_bus()
 
@@ -1340,6 +1676,15 @@ class SolarPriorityDriver:
         svc.add_path("/SolarPriority/TargetSoc", None,
                      gettextcallback=lambda p, v: "---" if v is None else "%.0f%%" % float(v))
         svc.add_path("/SolarPriority/Sustain", 0)
+        # HOLD rules (4.4): whether they decided this tick, day (1) / night
+        # (0) / not known (None), the prefer-renewable setting wanted (None:
+        # left alone), the bank power predicted for the island while on shore
+        # and the island's running deficit
+        svc.add_path("/SolarPriority/Hold", 0)
+        svc.add_path("/SolarPriority/Daylight", None)
+        svc.add_path("/SolarPriority/PreferRenewable", None)
+        svc.add_path("/SolarPriority/PredictedW", None)
+        svc.add_path("/SolarPriority/DeficitWh", 0)
         # the AC input treated as shore (None until resolved) and why
         svc.add_path("/SolarPriority/ShoreInput", None)
         svc.add_path("/SolarPriority/ShoreInputReason", "")
@@ -1490,6 +1835,26 @@ class SolarPriorityDriver:
             log.warning("%s: write %s%s failed: %s", what, name, path, e)
             return False
 
+    def _write_prefer(self, now, wanted):
+        """Own the Quattro's prefer-renewable toggle the way the relay is
+        owned: compare with the value it reads, write only on a difference
+        and at most once a minute. A toggle that cannot be read as 0 or 1 is
+        never written blind."""
+        actual = self.inp.pre
+        if actual is None or actual.v not in (0, 1) or int(actual.v) == int(wanted):
+            return
+        if now - self._prefer_written < 60000:
+            return
+        self._prefer_written = now
+        self._write("vebus", self.cfg.vebus_instance, "/Dc/0/PreferRenewableEnergy",
+                    int(wanted), "prefer renewable")
+        # one line per change of mind; a toggle that will not take is retried quietly
+        (log.info if wanted != self._prefer_logged else log.debug)(
+            "prefer renewable energy %d -> %d (%s)", int(actual.v), int(wanted),
+            "safety" if self.engine.st.get("safety") else
+            ("day: prefer solar" if wanted else "night: charge now"))
+        self._prefer_logged = wanted
+
     def _shore_inputs(self):
         """The inputs a protective 'back to shore' write goes to: the
         resolved one, or both while nothing is resolved (a crashed process
@@ -1578,6 +1943,8 @@ class SolarPriorityDriver:
         if out.boost is not None:
             self._write("battery", self.cfg.battery_instance, "/RecBms/SolarBoost/Request",
                         float(out.boost), "boost")
+        if out.prefer is not None:
+            self._write_prefer(now, out.prefer)
         if out.transition:
             log.info("%s", out.transition)
             s["/SolarPriority/LastTransition"] = out.transition
@@ -1595,6 +1962,11 @@ class SolarPriorityDriver:
         s["/SolarPriority/OneWay"] = out.oneway
         s["/SolarPriority/TargetSoc"] = self.inp.target_soc.v if self.inp.target_soc else None
         s["/SolarPriority/Sustain"] = int(self.engine.st["sustainSent"] or 0)
+        s["/SolarPriority/Hold"] = 1 if out.hold else 0
+        s["/SolarPriority/Daylight"] = None if out.daylight is None else int(out.daylight)
+        s["/SolarPriority/PreferRenewable"] = out.prefer
+        s["/SolarPriority/PredictedW"] = _q(out.pred_w, self.cfg.power_step)
+        s["/SolarPriority/DeficitWh"] = _q(out.deficit_wh, 5)
         s["/SwitchableOutput/output_1/State"] = 1 if self.inp.enabled else 0
 
 

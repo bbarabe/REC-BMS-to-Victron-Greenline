@@ -181,9 +181,10 @@ drv._tick()
 check("voltage published at 0.01 V", batt["/Dc/0/Voltage"] == 56.64, str(batt["/Dc/0/Voltage"]))
 check("current in 0.5 A steps", batt["/Dc/0/Current"] == -1.5, str(batt["/Dc/0/Current"]))
 check("power in 10 W steps", batt["/Dc/0/Power"] == -70, str(batt["/Dc/0/Power"]))
-check("SOC in 0.1 % steps", batt["/Soc"] == 75.3, str(batt["/Soc"]))
+check("SOC in 0.05 % steps (4.1.0: the HOLD rules read quarter points)", batt["/Soc"] == 75.25, str(batt["/Soc"]))
 check("temperature in 0.5 degree steps", batt["/Dc/0/Temperature"] == 21.5, str(batt["/Dc/0/Temperature"]))
-check("CVL is never quantised", batt["/Info/MaxChargeVoltage"] == round(curve(70) - batt["/RecBms/SolarLead"], 2))
+check("CVL is never quantised (no Solar Priority here: no gain, every charger on the slider's voltage)",
+      batt["/Info/MaxChargeVoltage"] == curve(70) and batt["/RecBms/SolarLead"] == 0)
 check("_q: None passes, step 0 is off, no float dust",
       R._q(None, 0.5) is None and R._q(1.2345, 0) == 1.2345 and R._q(0.30000000000000004, 0.1) == 0.3
       and R._q(1234.4, 60) == 1260 and isinstance(R._q(7.2, 1), int))
@@ -201,9 +202,9 @@ check("ratchet: floor without SOC keeps and clips",
 print("\n=== solar priority engine: one-way ===")
 SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priority")
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
-check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 1 and
+check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 2 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5)
-check("engine version bumped", SP.ENGINE_VERSION == "4.3.1")
+check("engine version bumped", SP.ENGINE_VERSION == "4.4.0")
 Val = SP.Val
 
 
@@ -221,9 +222,10 @@ class Sim:
         self.inp.enabled = True
         self.inp.feed_shore = 0
         self.v = dict(soc=60.0, batt=0.0, load=300.0, pv=500.0, m=2, voc=60.0,
-                      batt_v=56.6, cvl=56.62, target=None, qdc=None)
+                      batt_v=56.6, cvl=56.62, target=None, qdc=None, dcl=None, pre=None)
         self.cmd, self.sustain = 0, 0
         self.cmds, self.sustains, self.boosts = [], [], []
+        self.boost_cmds, self.boost_until, self.prefers = [], 0, []
         self.transitions, self.states = [], set()
         self.out = None
 
@@ -244,14 +246,22 @@ class Sim:
             inp.batt = Val(v["batt"], n)
             inp.load_now = Val(v["load"], n)
             inp.load_avg = Val(v["load"], n)
-            inp.feed = Val(240 if self.cmd == 1 else 0, n)
+            inp.feed = Val(v["feed"] if v.get("feed") is not None else (240 if self.cmd == 1 else 0), n)
             inp.ac_out = Val(v["load"], n)
             inp.voc6, inp.y6, inp.m6 = Val(v["voc"], n), Val(v["pv"], n), Val(v["m"], n)
             inp.voc7, inp.y7, inp.m7 = Val(0.0, n), Val(0.0, n), Val(0, n)
             inp.batt_v, inp.cvl = Val(v["batt_v"], n), Val(v["cvl"], n)
             inp.target_soc = Val(v["target"], n) if v["target"] is not None else None
             inp.q_dc = Val(v["qdc"], n) if v["qdc"] is not None else None
+            inp.dc_sys = Val(v["dcl"], n) if v["dcl"] is not None else None
+            inp.pre = Val(v["pre"], n) if v["pre"] is not None else None
+            # dbus-recbms: a boost runs until released or for 120 s
+            inp.boost_active = Val(1 if n < self.boost_until else 0, n)
             out = self.eng.tick(n, inp)
+            if out.boost is not None:
+                self.boost_cmds.append((n, out.boost))
+                self.boost_until = n + 120000 if out.boost > 0 else 0
+            self.prefers.append(out.prefer)
             if out.cmd is not None:
                 self.cmd = out.cmd
                 self.cmds.append((n, out.cmd))
@@ -317,13 +327,19 @@ check("charge: floor requested with the shore command",
       s.sustain == 1 and s.sustains[-1][0] == s.cmds[-1][0])
 check("charge: still engaged at 68 %", s.oneway == "charge")
 s.tick(1, soc=79.5, batt=0.0)
-check("charge: done within EXIT of the target", s.oneway is None and s.sustain == 0 and
+check("charge: done within EXIT of the target", s.oneway is None and
       any("ONE-WAY charge done (SOC 79.5% at target 80%)" in l for l in s.logs))
+check("... and HOLD keeps the floor (day/night not known yet): the last half point is the sun's",
+      s.sustain == 1 and s.out.hold, "sustain %s" % s.sustain)
+h = Sim(HOLD_RULES=0)
+h.tick(1, soc=60, target=80)
+h.tick(1, soc=79.5)
+check("hold_rules = 0: the 4.3 engine finishes the last bit from shore", h.oneway is None and h.sustain == 0)
 
 # ---- hysteresis and re-targeting ----
 s = Sim()
 s.tick(1, soc=79.2, target=80)
-check("79.2 -> 80 is inside ENTER (1): normal engine", s.oneway is None)
+check("79.2 -> 80 is inside ENTER (2): HOLD", s.oneway is None)
 s.tick(1, soc=77)
 check("77 -> 80 engages: a slider step from the present SOC is a direction", s.oneway == "charge")
 s.tick(1, soc=79.3)
@@ -370,7 +386,15 @@ check("discharge: resumes to solar without a boost", s.state == "solar" and s.cm
 s.tick(1, soc=70.4)
 check("discharge: done within EXIT of the target", s.oneway is None and s.sustain == 0)
 s.tick(20)
-check("discharge done: the normal deficit exit takes over", s.state == "shore" and s.cmd == 0)
+check("discharge done: HOLD takes the island over, its backstop starting from here",
+      s.state == "solar" and s.out.hold and s.eng.st["socEntry"] == 70.4 and 0 < s.out.deficit_wh < 5,
+      "%s entry %s deficit %s" % (s.state, s.eng.st["socEntry"], s.out.deficit_wh))
+h = Sim(HOLD_RULES=0)
+h.tick(1, soc=90, target=70, batt_v=60.3, cvl=60.3)
+h.tick(335, pv=0.0, m=0, voc=10.0)
+h.tick(1, soc=70.4, batt=-300.0)
+h.tick(120)
+check("hold_rules = 0: the 4.3 deficit exit takes over instead", h.state == "shore" and h.cmd == 0, h.state)
 
 # ---- the SOC floor still wins ----
 s = Sim()
@@ -388,6 +412,166 @@ s.tick(1, soc=47, target=40)
 s.tick(335, pv=0.0, m=0, voc=10.0)
 s.tick(1, soc=29.0, batt=-300.0)
 check("emergency SOC -> shore + lockout", s.state == "shore" and s.eng.st["lockoutUntil"] > s.now)
+
+# ================================================================ engine 4.4
+print("\n=== solar priority engine: HOLD rules (4.4) ===")
+t0 = dict(SP.ENGINE_DEFAULTS)
+st = {"daylight": None, "lightSince": 0, "darkSince": 0}
+D = SP.daylight_update
+edges = [D(st, 1000 * k, 70.0, t0) for k in range(1, 700)]
+check("dawn: once, after DAWN_MS of array voltage", edges.count("dawn") == 1 and edges.index("dawn") == 600 and st["daylight"] is True)
+check("a cloud (55 V) changes nothing", D(st, 800000, 55.0, t0) is None and st["daylight"] is True)
+check("a short dip under DUSK_V changes nothing", D(st, 801000, 40.0, t0) is None and D(st, 802000, 70.0, t0) is None and st["daylight"] is True)
+edges = [D(st, 900000 + 1000 * k, 12.0, t0) for k in range(400)]
+check("dusk: once, after DUSK_MS dark", edges.count("dusk") == 1 and edges.index("dusk") == 300 and st["daylight"] is False)
+check("no array reporting: day/night kept", D(st, 2000000, None, t0) is None and st["daylight"] is False)
+W = SP.prefer_wanted
+check("prefer: solar by day, charge now at night", W(True, False, True) == 1 and W(True, False, False) == 0)
+check("prefer: the safety charges now even by day", W(True, True, True) == 0)
+check("prefer: left alone when off or when day/night is not known", W(False, False, True) is None and W(True, False, None) is None)
+
+
+def day(sim, **kv):
+    """a sunny day on shore, the Quattro reading prefer solar"""
+    base = dict(soc=50.0, target=50, voc=70.0, m=2, pre=1, qdc=0.0, load=250.0, dcl=50.0, batt=0.0)
+    base.update(kv)
+    sim.tick(1, **base)
+
+
+NEED = 50 + 120 + 250 / 0.95                       # DC loads + idle + AC load / efficiency = 433 W
+s = Sim()
+day(s, batt=600.0)                                 # 600 W reaching the bank: the arrays deliver 650 W
+s.tick(590)
+check("HOLD: nothing moves before the day is established", s.state == "shore" and s.out.daylight is None and s.prefers[-1] is None)
+s.tick(60)
+check("HOLD: sun over the need -> island, directly", s.state == "solar" and s.cmd == 1 and "probe" not in s.states, s.state)
+check("HOLD: no boost, no sustain, prefer solar", s.boost_cmds == [] and s.sustain == 0 and s.prefers[-1] == 1)
+check("HOLD: the departure states the math",
+      any(tr.startswith("-> SOLAR (hold: solar 650W vs need 433W, predicted batt +217W") for tr in s.transitions), str(s.transitions))
+check("HOLD: need = DC loads + idle + AC / efficiency", abs(s.eng.st["predW"] - (650 - NEED)) < 1, str(s.eng.st["predW"]))
+s.tick(125, batt=200.0, qdc=-400.0)
+check("HOLD: prediction checked against the island 2 min on",
+      any(l.startswith("prediction check: predicted batt +217W, observed +2") for l in s.logs), str(s.logs[-3:]))
+
+s = Sim(); day(s, batt=250.0); s.tick(700)
+check("HOLD: 300 W of sun under 75 % of a 433 W need: stays", s.state == "shore" and s.cmd == 0)
+s = Sim(); day(s, batt=300.0, soc=50.1); s.tick(700)
+check("HOLD: 350 W is 81 % of the need, but the bank is only 0.1 over: stays", s.state == "shore")
+s = Sim(); day(s, batt=300.0, soc=50.3); s.tick(700)
+check("HOLD: 81 % of the need with the bank 0.3 over: island, the band pays the rest",
+      s.state == "solar" and any("81% of it, bank over target" in tr for tr in s.transitions), str(s.transitions))
+s = Sim(); day(s, batt=600.0, qdc=500.0); s.tick(700)
+check("HOLD: what the Quattro puts into the bank is not the sun's", s.state == "shore")
+s = Sim(); day(s, batt=2500.0, load=1500.0); s.tick(700)
+check("HOLD: never leaves under a heater-class load, even with the sun over the need", s.state == "shore")
+s = Sim(); day(s, batt=600.0, feed=240); s.tick(700)
+check("HOLD: never leaves while shore itself reads absent", s.state == "shore")
+s = Sim(MIN_SOC=50.5); day(s, batt=600.0); s.tick(700)
+check("HOLD: never leaves under MIN_SOC", s.state == "shore")
+s = Sim(); day(s, batt=600.0, dcl=None); s.tick(700)
+check("HOLD: no DC-load reading: still decides (on bank power and the inverter's draw)", s.state == "solar")
+
+# night, and the floor
+s = Sim(); day(s, batt=-50.0, voc=10.0, m=0, soc=49.6, pre=0); s.tick(320)
+check("night: charge now wanted, no departure", s.out.daylight is False and s.prefers[-1] == 0 and s.state == "shore")
+check("night under the target: floor -- shore holds the bank, never raises it", s.sustain == 1)
+s.tick(5, pre=1)
+check("... whatever the toggle reads: it is the night that asks for it", s.sustain == 1)
+s.tick(2, pre=0)
+s.tick(5, soc=50.2)
+check("night over the target: no floor needed", s.sustain == 0)
+s = Sim(); day(s, batt=100.0, soc=49.6, pre=0); s.tick(700)
+check("day, but the toggle still reads charge now: the floor stays", s.out.daylight is True and s.sustain == 1)
+s.tick(2, pre=1)
+check("... released once it reads prefer solar", s.sustain == 0)
+s = Sim(); day(s, batt=100.0, soc=49.6, pre=None); s.tick(700)
+check("a toggle that cannot be read: the floor stays by day too", s.sustain == 1)
+
+# the island's deficit is an energy
+s = Sim(); day(s, batt=600.0); s.tick(700)
+budget = 0.5 / 100 * 1440 * 56.6
+s.tick(3000, batt=-300.0)
+check("island: 250 Wh drawn, still out", s.state == "solar" and abs(s.out.deficit_wh - 250) < 3, str(s.out.deficit_wh))
+s.tick(1600, batt=600.0)
+check("island: the sun repays it, never under zero", s.out.deficit_wh == 0.0)
+s.tick(3000, batt=-300.0)
+check("island: a second cloud starts from zero", s.state == "solar" and abs(s.out.deficit_wh - 250) < 3)
+s.tick(2000, batt=-300.0)
+check("island: %.0f Wh (0.5 %% of the bank) below its best -> shore" % budget,
+      s.state == "shore" and any(tr.startswith("-> SHORE (deficit: 4") for tr in s.transitions), str(s.transitions[-1:]))
+check("... with a backoff, since no probe proves the next departure", s.eng.st["backoffUntil"] > s.now)
+s.tick(100, batt=600.0)
+check("the sun is back, but the backoff holds the boat on shore", s.state == "shore" and "[backoff" in s.out.status_text, s.out.status_text)
+s.tick(300)
+check("... and lets it go once it has run out", s.state == "solar")
+check("a HOLD departure does not wipe the backoff it has earned (no probe proved it)",
+      s.eng.st["backoffMs"] == 2 * s.t["COOLDOWN_MS"], str(s.eng.st["backoffMs"]))
+s = Sim(); day(s, batt=600.0); s.tick(700)
+s.tick(6000, batt=-300.0, m=1)
+check("island: nothing is exempt -- a drain with an array reading 'limited' still counts", s.state == "shore")
+s = Sim(); day(s, batt=600.0); s.tick(700)
+s.tick(60, batt=-300.0, soc=49.5)
+check("island: no floor while away, even under the target", s.state == "solar" and s.sustain == 0)
+s.now += 3600000
+s.tick(1)
+check("island: a stalled clock integrates five seconds, not the hour", s.out.deficit_wh < 7, str(s.out.deficit_wh))
+s.tick(2, soc=47.9)
+check("island: the SOC drift backstop still stands", s.state == "shore" and "SOC 47.9%" in s.transitions[-1], str(s.transitions[-1:]))
+s = Sim(); day(s, batt=600.0); s.tick(700)
+s.tick(400, batt=-300.0, m=0, voc=10.0, pv=0.0)
+check("island: rides past dusk on the budget", s.state == "solar" and s.out.daylight is False and s.out.deficit_wh > 0)
+s.tick(5, load=1500.0, batt=-1500.0)
+check("island: heater -> suspend", s.state == "suspend" and s.cmd == 0)
+wh = s.out.deficit_wh
+s.tick(15, load=250.0, batt=0.0)
+check("island: resumes, the deficit stands and shore time is not counted", s.state == "solar" and abs(s.out.deficit_wh - wh) < 1)
+
+# the probe
+s = Sim(); day(s, batt=-20.0, m=1, soc=50.9); s.tick(340)
+check("limited arrays before the day is known: no probe", s.boost_cmds == [])
+s.tick(300)
+check("probe: an array limited on shore by day -> the boost lifts the MPPTs' target",
+      len(s.boost_cmds) == 1 and s.boost_cmds[0][1] == s.t["BOOST_V"] and s.state == "shore", str(s.boost_cmds))
+s.tick(45, batt=700.0, m=2)
+check("probe: the sun covers the need -> leaves at once and releases the boost",
+      s.state == "solar" and s.boost_cmds[-1][1] == 0 and s.boost_cmds[-1][0] - s.boost_cmds[0][0] <= 60000, str(s.boost_cmds))
+s = Sim(); day(s, batt=-20.0, m=1, soc=50.1); s.tick(640)
+s.tick(60, batt=150.0, m=2)
+check("probe: not limited, output flat, need not met -> released, stays",
+      s.state == "shore" and s.boost_cmds[-1][1] == 0 and len(s.boost_cmds) == 2
+      and any(l.startswith("hold probe done") for l in s.logs), str(s.boost_cmds))
+s.tick(1500, batt=-20.0, m=1)
+check("probe: not again inside 30 minutes", len(s.boost_cmds) == 2)
+s.tick(400)
+check("probe: again after 30 minutes", len(s.boost_cmds) == 3 and s.boost_cmds[-1][1] > 0)
+s = Sim(); day(s, batt=-20.0, m=1, soc=50.1); s.tick(640)
+for k in range(12):                                 # a tracker waking slowly: reads "tracking", output still rising
+    s.tick(10, batt=20.0 + 25 * k, m=2)
+check("probe: output still rising -> not cut short (a parked tracker reads 'not limited')",
+      [c for c in s.boost_cmds if c[1] == 0] == [], str(s.boost_cmds))
+s.tick(15)
+check("... dbus-recbms ends the boost at 120 s", any(l.startswith("hold probe over (boost ended)") for l in s.logs))
+
+# a probe whose branch stops running lets go of its boost
+s = Sim(); day(s, batt=-20.0, m=1, soc=50.1); s.tick(640)
+s.inp.enabled = False
+s.tick(1)
+check("probe: Solar Priority switched off mid-probe -> boost released at once",
+      s.boost_cmds[-1][1] == 0 and s.eng.st["holdProbe"] == 0, str(s.boost_cmds))
+
+# hold_rules = 0 is the 4.3 engine: no safety override, the toggle left alone
+h = Sim(HOLD_RULES=0); day(h, soc=24.0, target=40, batt=100.0); h.tick(700)
+check("hold_rules = 0: one-way charge keeps its floor under 25 %, the toggle is the owner's",
+      h.oneway == "charge" and h.sustain == 1 and set(h.prefers) == {None})
+
+# the safety
+s = Sim(); day(s, soc=24.0, target=40, batt=100.0); s.tick(700)
+check("safety under 25 %: charge now by day, and no floor in the charger's way",
+      s.oneway == "charge" and s.prefers[-1] == 0 and s.sustain == 0)
+s.tick(2, soc=26.0)
+check("safety holds until 27 %", s.prefers[-1] == 0 and s.sustain == 0)
+s.tick(2, soc=27.5)
+check("safety over: one-way charge has its floor back, prefer solar by day", s.prefers[-1] == 1 and s.sustain == 1)
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:
