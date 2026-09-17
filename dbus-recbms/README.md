@@ -188,11 +188,14 @@ revision that reads `/RecBms/TargetChargeVoltage`.
 
 **The lead is a Solar Priority tool (v4.0.0).** It is what leaves the MPPTs
 headroom on shore, so it is applied only while
-`/Settings/SolarPriority/Enabled` is 1 (polled at the 3 s DVCC cadence;
-absent reads as off) and never with the Max Charge slider at or above
+`/Settings/SolarPriority/Enabled` is 1 (read at start and polled at the 3 s
+DVCC cadence; absent reads as off, a read that merely fails keeps the last
+answer) and never with the Max Charge slider at or above
 `[cvl] lead_full_pct` (100). With Solar Priority off, or a full charge asked
 for, every charger is commanded the true target and the systemcalc offset is
-cleared once. `lead_needs_solar_priority = false` restores the standing lead.
+cleared (retried until the write lands), and a lead fault cannot outlive the
+lead it was about. `lead_needs_solar_priority = false` restores the standing
+lead.
 Each change of the lead in force is logged with its reason.
 
 ## Publishing and clocks (v4.0.0)

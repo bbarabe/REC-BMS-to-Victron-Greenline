@@ -77,7 +77,6 @@ Baselines:
 import configparser
 import glob
 import logging
-import math
 import os
 import platform
 import socket
@@ -446,7 +445,7 @@ def _q(value, step):
     n = round(value / step) * step
     if float(step).is_integer():
         return int(round(n))
-    return round(n, max(0, -int(math.floor(math.log10(step)))))
+    return round(n, 6)
 
 
 def fmt(unit, digits):
@@ -518,6 +517,7 @@ class RecBmsDriver:
         if cfg.pin_bms_instance:
             self._pin_bms_instance()
         self._boost_write(0.0, quiet=True)   # first tick sets the real lead
+        self._poll_solar_priority()          # ... and must know this to do it
         atexit.register(self._boost_shutdown)
         for _sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -1114,14 +1114,26 @@ class RecBmsDriver:
             v = None
         self.eff_cv = (v, time.monotonic())
         self._pub["/RecBms/DvccEffectiveChargeVoltage"] = v
-        # Is Solar Priority on? Its setting; absent (driver not installed)
-        # reads as off, and then no lead is applied.
-        sp = self._settings_get("/Settings/SolarPriority/Enabled")
+        self._poll_solar_priority()
+        return True
+
+    def _poll_solar_priority(self):
+        """Is Solar Priority on? Its localsettings entry. A path that does
+        not exist (driver never installed) reads as off, and then no lead is
+        applied; a read that merely FAILED (timeout, busy bus) keeps the last
+        answer, so one hiccup cannot step the Quattro's command by the lead
+        and back."""
         try:
-            self.sp_enabled = bool(int(sp)) if sp is not None else False
+            sp = self.sbus.call_blocking(
+                "com.victronenergy.settings", "/Settings/SolarPriority/Enabled",
+                BUSITEM, "GetValue", "", [], timeout=2)
+            self.sp_enabled = bool(int(sp))
         except (TypeError, ValueError):
             self.sp_enabled = False
-        return True
+        except Exception as e:
+            name = getattr(e, "get_dbus_name", lambda: "")() or ""
+            if "UnknownObject" in name or "UnknownMethod" in name or self.sp_enabled is None:
+                self.sp_enabled = False
 
     def _verify_lead(self, now):
         """Compare what DVCC really sends the MPPTs against what we expect
@@ -1131,8 +1143,18 @@ class RecBmsDriver:
         c = self.cfg
         f = self.lead_fault
         pub, off = self._last_pub_cvl, self._last_offset
-        if pub is None or off <= 0.005:
-            return not f["active"]          # nothing to verify this tick
+        if pub is None:
+            return not f["active"]          # nothing published yet
+        if off <= 0.005:
+            # No offset in force (no lead wanted, no boost): nothing can be
+            # wrong with it. A fault raised while there was one is over, and
+            # a half-run mismatch timer must not survive into the next lead.
+            f["mismatch_since"] = 0.0
+            if f["active"]:
+                log.info("solar lead: no offset in force any more; fault cleared")
+                f["active"] = False
+                f["msg"] = ""
+            return True
         v, ts = self.eff_cv if self.eff_cv else (None, 0.0)
         stale = (now - ts) > 15
         applied = v is not None and abs(v - (pub + off)) <= 0.015
@@ -1229,9 +1251,10 @@ class RecBmsDriver:
             # No lead wanted this tick (Solar Priority off, or the slider at
             # full). The offset persists inside systemcalc, so drop it once
             # when it was in force.
-            if self._last_offset > 0.005:
-                self._boost_write(0.0, quiet=True)
-            self._last_offset = 0.0
+            if self._last_offset <= 0.005 or self._boost_write(0.0, quiet=True):
+                self._last_offset = 0.0
+            # else: the clear did not land; the next tick tries again
+            # (meanwhile the verifier keeps judging the offset still there)
         s["/RecBms/SolarBoost/EffectiveChargeVoltage"] = round(target + boost_v, 2)
         s["/RecBms/LeadFault"] = self.lead_fault["msg"] if self.lead_fault["active"] else ""
         return lead
@@ -1380,6 +1403,12 @@ class RecBmsDriver:
             self._pub = ctx
             try:
                 return self._tick_inner()
+            except Exception:
+                # GLib drops a timer whose callback raises, and the last CVL
+                # and CCL would then stand for ever. Keep ticking; a fault
+                # that persists shows in the log every tick.
+                log.exception("tick failed")
+                return True
             finally:
                 self._pub = self.batt
 

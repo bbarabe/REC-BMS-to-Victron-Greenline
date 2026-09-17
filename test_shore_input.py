@@ -164,9 +164,37 @@ check("the rewire: AC in 1 released, engine back on shore, now on AC in 2",
       (VEBUS, IGN1, 0) in m.writes and d.shore_input == 2 and d.inp.feed_shore == 1 and
       d.engine.st["state"] == "shore", "%s %s" % (m.writes, d.engine.st["state"]))
 
-d, m = driver(ac_in=1, types_=(0, 3), active=1)
+check("... and the new input is released too (the engine believes shore is already sent)",
+      (VEBUS, IGN2, 0) in m.writes, str(m.writes))
+
+d, m = driver(ac_in=1, types_=(0, 3), active=1, remembered=2)
 tick(d)
 check("a pinned input ignores the GX types", d.shore_input == 1 and d.shore_input_reason == "configured")
+check("... and is remembered, so a later auto cannot come up 'kept' on a stale input",
+      FakeBus.store["/Settings/SolarPriority/ShoreInput"] == 1)
+
+d, m = driver(types_=(0, 3), active=1)
+tick(d)
+d.engine.st["state"] = "solar"
+del m.writes[:]
+d._tick_inner = lambda s: 1 / 0
+check("a tick that raises keeps the timer and forces shore",
+      d._tick() is True and d.engine.st["state"] == "shore" and (VEBUS, IGN2, 0) in m.writes, str(m.writes))
+
+d, m = driver(types_=(0, 0), active=240)
+tick(d)
+del m.writes[:]
+d._shutdown()
+check("shutdown while unresolved releases both inputs",
+      sorted(w[1] for w in m.writes if w[0] == VEBUS) == [IGN1, IGN2], str(m.writes))
+
+M0 = M[0]
+d, m = driver(types_=(0, 3), active=1)
+t0 = d._ms()
+SP.time = types.SimpleNamespace(time=lambda: 1_700_000_000.0, monotonic=lambda: M[0])   # wall clock steps back years
+M[0] += 5
+check("the engine clock ignores a wall-clock step and sits clear of 0",
+      d._ms() - t0 == 5000 and t0 > 10 ** 11, "%s %s" % (t0, d._ms()))
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:

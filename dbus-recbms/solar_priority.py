@@ -1156,15 +1156,20 @@ class SolarPriorityDriver:
             log.info("shore AC input %s -> %d (%s)", old, new, reason)
             if old in (1, 2):
                 # never leave an ignore standing on the input we walk away
-                # from, and start over on shore on the new one
-                self._write("vebus", self.cfg.vebus_instance, self._ignore_path(old), 0,
-                            "shore input moved")
+                # from, and start over on shore on the new one (released
+                # here: force_shore tells the engine shore is already sent)
+                for n in (old, new):
+                    self._write("vebus", self.cfg.vebus_instance, self._ignore_path(n), 0,
+                                "shore input moved")
                 self.engine.force_shore(now)
             self.shore_input = new
-            try:
+        # remembered whatever decided it (a pinned input too): a later return
+        # to auto must not come up "kept" on a stale one
+        try:
+            if int(self.settings["shoreinput"] or 0) != new:
                 self.settings["shoreinput"] = new
-            except Exception:
-                log.warning("could not persist the shore input")
+        except Exception:
+            log.warning("could not persist the shore input")
         i.feed_shore = new - 1
         return True
 
@@ -1509,7 +1514,14 @@ class SolarPriorityDriver:
             with self.sw as s:
                 self._tick_inner(s)
         except Exception:
-            log.exception("tick failed")
+            log.exception("tick failed - forcing shore")
+            try:
+                self.engine.force_shore(self._ms())
+                for n in self._shore_inputs():
+                    self._write("vebus", self.cfg.vebus_instance, self._ignore_path(n), 0,
+                                "error->shore")
+            except Exception:
+                log.exception("could not force shore")
         return True
 
     def _tick_inner(self, s):

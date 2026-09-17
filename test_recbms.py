@@ -72,6 +72,58 @@ tick()
 check("SP on, slider 100: no lead, every charger gets the full target",
       b["/RecBms/SolarLead"] == 0 and b["/Info/MaxChargeVoltage"] == b["/RecBms/TargetChargeVoltage"])
 
+# the offset persists inside systemcalc: a clear that fails must be retried
+drv.sp_enabled = True
+FakeBus.store["/Settings/RecBms/ChargeSlider"] = 80
+tick(2)
+ok_writes = [True]
+drv._boost_write = lambda v, quiet=False: (writes.append(round(v, 2)), ok_writes[0])[1]
+drv.sp_enabled = False
+ok_writes[0] = False
+del writes[:]
+tick(3)
+check("a failed offset clear is retried every tick", writes == [0.0, 0.0, 0.0], str(writes))
+ok_writes[0] = True
+tick(3)
+check("... until it lands, then no more", writes == [0.0, 0.0, 0.0, 0.0], str(writes))
+
+# a lead fault cannot outlive the lead it was about
+drv.sp_enabled = True
+tick(2)
+drv.lead_fault.update(active=True, msg="test fault", mismatch_since=M[0] - 5)
+drv.sp_enabled = False
+tick(2)
+check("no lead wanted: the fault and its half-run timer are cleared",
+      not drv.lead_fault["active"] and not drv.lead_fault["mismatch_since"] and b["/RecBms/LeadFault"] == "")
+
+# the Solar Priority setting: absent = off, a failed read keeps the last answer
+class _Gone(Exception):
+    def get_dbus_name(self):
+        return "org.freedesktop.DBus.Error.UnknownObject"
+
+
+real_call = drv.sbus.call_blocking
+drv.sp_enabled = True
+drv.sbus.call_blocking = lambda *a, **k: (_ for _ in ()).throw(TimeoutError("busy"))
+drv._poll_solar_priority()
+check("a failed read keeps Solar Priority on", drv.sp_enabled is True)
+drv.sbus.call_blocking = lambda *a, **k: (_ for _ in ()).throw(_Gone())
+drv._poll_solar_priority()
+check("a setting that does not exist reads as off", drv.sp_enabled is False)
+drv.sbus.call_blocking = real_call
+FakeBus.store["/Settings/SolarPriority/Enabled"] = 1
+drv._poll_solar_priority()
+check("the setting is read from localsettings", drv.sp_enabled is True)
+
+check("_q: any step keeps its own decimals",
+      R._q(0.74, 0.25) == 0.75 and R._q(0.26, 0.25) == 0.25 and R._q(7.4, 2.5) == 7.5 and R._q(-1.27, 0.5) == -1.5)
+
+# a tick that raises must not end the timer (GLib drops a callback that raises)
+inner = drv._tick_inner
+drv._tick_inner = lambda: 1 / 0
+check("a tick that raises keeps the timer", drv._tick() is True)
+drv._tick_inner = inner
+
 print("\n=== dbus-recbms: sustain ratchet (regression) ===")
 F = R.SUSTAIN_FLOOR
 r = R.sustain_ratchet(F, 90.0, 92.0, 80.0, 40, 100)
