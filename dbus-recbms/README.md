@@ -256,7 +256,8 @@ it equals the published CVL alone (offset ignored), or is unavailable, for
 The offset keeps being written while faulted, so the fault clears by itself
 once it is seen applied (the MPPTs then see `target + lead` for one tick plus
 one DVCC cycle, ≤ 4 s, before the lead is re-established — harmless, and
-still under `ceiling_v` even during EQ). Fix: Settings → General → Access level =
+the offset written while faulted is clamped so even that stays under
+`[cvl] ceiling_v`). Fix: Settings → General → Access level =
 **Superuser**, then `svc -t /service/dbus-systemcalc-py` (the reify). The
 driver also logs the access level at startup. Note: the boat's current
 firmware applied the offset at access level 2 (verified 2026-08-21 on
@@ -276,6 +277,13 @@ Things dvcc.py does that are worth knowing:
 - The DVCC "limit managed battery charge voltage" setting is applied
   *before* the solar offset, so it does **not** cap a boost — this driver's
   `ceiling_v` is the only ceiling on the MPPTs.
+- **One ceiling (v4.0.0): `[cvl] ceiling_v = 62.40`** bounds every charge
+  voltage the driver commands, whoever asks — the slider, the equalization
+  boost on top of it (61.96 + 0.44 lands exactly on it), a sustain hold, the
+  solar lead and a solar boost (the MPPTs get target + boost). The target is
+  min()'d with it, a boost that would cross it is refused (and aborted if
+  the target rises under it), and the offset is clamped again where it is
+  written. `[solarboost] ceiling_v` may be lower, never higher.
 - If this driver dies (not CAN loss — the service itself), systemcalc stops
   writing to the MPPTs and they raise error #67 after ~60 s and stop;
   daemontools restarts the driver in ~1 s, so this only matters in a crash

@@ -177,6 +177,11 @@ class Config:
         if len(self.cvl_curve) < 2:
             raise ValueError("[cvl] curve needs at least two pct:volts points")
         self.cvl_max = float(v.get("max_v", 61.96))
+        # The installation's absolute ceiling on ANY charge voltage this
+        # driver commands, whoever asks: the slider, the equalization boost
+        # on top of it, a sustain hold, the solar lead and a solar boost
+        # (the MPPTs' target + boost). Enforced where the voltages go out.
+        self.ceiling_v = float(v.get("ceiling_v", 62.40))
         self.eq_boost = float(v.get("eq_boost_v", 0.44))
         self.eq_interval_s = float(v.get("eq_interval_days", 7)) * 86400
         self.eq_duration_s = float(v.get("eq_duration_min", 60)) * 60
@@ -242,7 +247,9 @@ class Config:
         self.boost_cell_max_v = float(sb.get("cell_max_v", 4.05))
         self.boost_cell_min_t = float(sb.get("cell_min_t", 5))
         self.boost_cell_max_t = float(sb.get("cell_max_t", 45))
-        self.boost_ceiling_v = float(sb.get("ceiling_v", 62.70))
+        # a boost-only ceiling may be set lower; it can never be higher
+        self.boost_ceiling_v = min(float(sb.get("ceiling_v", self.ceiling_v)),
+                                   self.ceiling_v)
         self.boost_min_margin_v = float(sb.get("min_margin_v", 0.10))
         self.boost_service = sb.get("target_service", "com.victronenergy.system")
         self.boost_path = sb.get(
@@ -1224,12 +1231,21 @@ class RecBmsDriver:
             self._boost_clear("aborted: solar lead fault")
             boost_v = 0.0
         lead_v = self.lead_v
+        # The ceiling at the point of output: the solar chargers are sent
+        # target + boost, whatever the gate above concluded.
+        boost_v = max(0.0, min(boost_v, c.ceiling_v - target))
         if lead_v > 0 or boost_v > 0:
             # Keep writing the offset even while faulted: if the access
             # level is raised and systemcalc restarted, the next poll sees
             # the offset applied and the fault self-clears.
-            if self._boost_write(lead_v + boost_v, quiet=True):
-                self._last_offset = lead_v + boost_v
+            offset = lead_v + boost_v
+            if not verified:
+                # Faulted, the Quattro is published the FULL target, so an
+                # offset that suddenly takes hold would put the MPPTs at
+                # target + offset: keep even that under the ceiling.
+                offset = max(0.0, min(offset, c.ceiling_v - target))
+            if self._boost_write(offset, quiet=True):
+                self._last_offset = offset
                 # While faulted publish the FULL target (lead 0): the MPPT
                 # ceiling is never silently lowered by a lead that is not
                 # actually in force.
@@ -1506,7 +1522,7 @@ class RecBmsDriver:
                 eq_label = "next EQ ~%dh" % round((c.eq_interval_s - (wall - eq_last)) / 3600)
 
         bms_cvl = v("cvl") if live else c.safe_cvl
-        final_cvl = min(final_cvl, bms_cvl)
+        final_cvl = min(final_cvl, bms_cvl, c.ceiling_v)
 
         # ---- resolve outputs ----
         if live:

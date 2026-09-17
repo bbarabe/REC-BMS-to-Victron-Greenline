@@ -72,6 +72,62 @@ tick()
 check("SP on, slider 100: no lead, every charger gets the full target",
       b["/RecBms/SolarLead"] == 0 and b["/Info/MaxChargeVoltage"] == b["/RecBms/TargetChargeVoltage"])
 
+# 62.40 V is the ceiling on every charge voltage, whoever asks
+check("config: one ceiling, 62.40 V, for the CVL and the boost",
+      cfg.ceiling_v == 62.40 and cfg.boost_ceiling_v == 62.40)
+check("slider 100: CVL 61.96, no lead, no offset",
+      b["/RecBms/TargetChargeVoltage"] == 61.96 and b["/Info/MaxChargeVoltage"] == 61.96 and
+      b["/RecBms/SolarLead"] == 0 and drv._last_offset == 0.0)
+drv.eq.update(active=True, startTime=M[0])
+tick()
+check("equalization at 100 %: 61.96 + 0.44 lands on the ceiling, not over",
+      b["/RecBms/TargetChargeVoltage"] == 62.40 and b["/Info/MaxChargeVoltage"] == 62.40,
+      str(b["/RecBms/TargetChargeVoltage"]))
+ok_, why = drv._boost_allowed(0.30)
+check("a solar boost on top of it is refused by the ceiling", not ok_ and "ceiling" in why, why)
+drv.cfg.eq_boost = 1.0
+tick()
+check("a larger equalization boost is clamped to the ceiling", b["/RecBms/TargetChargeVoltage"] == 62.40,
+      str(b["/RecBms/TargetChargeVoltage"]))
+drv.cfg.eq_boost = cfg.eq_boost
+drv.eq["active"] = False
+FakeBus.store["/Settings/RecBms/EqLastCompleted"] = T[0]
+tick()
+ok_, why = drv._boost_allowed(0.30)
+check("slider 100, no equalization: a 0.30 V boost fits under the ceiling (62.26)", ok_, why)
+drv.cfg.boost_max_v = 0.50
+ok_, why = drv._boost_allowed(0.50)
+check("... a 0.50 V one does not (62.46)", not ok_ and "ceiling" in why, why)
+drv.cfg.boost_max_v = cfg.boost_max_v
+drv.boost = {"active": True, "req_ts": M[0], "volts": 0.30}
+drv._boost_allowed = lambda volts: (True, "")        # the gate out of the way:
+drv.cfg.ceiling_v = 62.10                            # ... the output clamp alone
+del writes[:]
+tick()
+check("the offset written for a boost is clamped at the point of output",
+      writes and abs(writes[-1] - 0.14) < 1e-9 and b["/RecBms/SolarBoost/EffectiveChargeVoltage"] == 62.10,
+      "%s %s" % (writes[-3:], b["/RecBms/SolarBoost/EffectiveChargeVoltage"]))
+del drv._boost_allowed
+drv.cfg.ceiling_v = 62.40
+drv._boost_clear("test done")
+
+
+def _cfg_with(boost_ceiling):
+    import tempfile
+    text = open(os.path.join(REPO, "dbus-recbms", "config.ini")).read()
+    head, tail = text.split("[solarboost]", 1)
+    tail = tail.replace("ceiling_v = 62.40", "ceiling_v = %s" % boost_ceiling, 1)
+    with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as f:
+        f.write(head + "[solarboost]" + tail)
+    try:
+        return R.Config(f.name)
+    finally:
+        os.unlink(f.name)
+
+
+check("a boost-only ceiling can be lower, never higher",
+      _cfg_with("62.70").boost_ceiling_v == 62.40 and _cfg_with("62.00").boost_ceiling_v == 62.00)
+
 # the offset persists inside systemcalc: a clear that fails must be retried
 drv.sp_enabled = True
 FakeBus.store["/Settings/RecBms/ChargeSlider"] = 80
