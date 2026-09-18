@@ -82,6 +82,7 @@ Baselines:
 
 import configparser
 import glob
+import json
 import logging
 import os
 import platform
@@ -96,7 +97,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -271,6 +272,12 @@ class Config:
         self.sustain_enabled = str(su.get("enabled", "true")).lower() != "false"
         self.sustain_hold_s = float(su.get("hold_s", 120))
         self.sustain_step = max(0.0, float(su.get("step_pct", 1)))
+
+        # [energy] -- the in/out ledger (v4.2.0); an empty state_file keeps
+        # it in memory only
+        en = cp["energy"] if cp.has_section("energy") else {}
+        self.energy_file = str(en.get("state_file", "/data/dbus-recbms/energy.json")).strip() or None
+        self.energy_log_hourly = str(en.get("log_hourly", "true")).lower() != "false"
 
 
 # ----------------------------------------------------------------------------
@@ -494,6 +501,97 @@ def fmt_int(unit=""):
     return cb
 
 
+class EnergyLedger:
+    """Energy into and out of the bank, kept apart (v4.2.0).
+
+    Integrated every tick from the BMS's own 0.1 A current and 0.01 V
+    voltage (before the [publish] quantisation). The SOC is no substitute:
+    it is the net of the two, moves in ~1 Ah steps, and the BMS resets it
+    at a full charge. Lifetime kWh each way go out on /History/ChargedEnergy
+    and /History/DischargedEnergy (the paths Venus and VRM show for a
+    battery); the trailing 24 h on /RecBms/Energy/Charged24h and
+    Discharged24h, from 5-minute bins; the closed hour is logged. Saved to a
+    JSON file once per bin and at exit, so a restart carries on.
+    Pure: the driver feeds it watts, seconds and the wall clock."""
+    BIN_S = 300
+    WINDOW = 24 * 3600 // BIN_S
+
+    def __init__(self, path=None):
+        self.path = path
+        self.charged_wh = 0.0       # lifetime
+        self.discharged_wh = 0.0
+        self.bins = {}              # bin number (wall // BIN_S) -> [in Wh, out Wh]
+        self.hour = None            # (hour number, [in Wh, out Wh]) in progress
+        self._bin = None
+        self._save_failed = False
+        self.load()
+
+    def load(self):
+        if not self.path:
+            return
+        try:
+            with open(self.path) as f:
+                d = json.load(f)
+            self.charged_wh = float(d.get("charged_wh", 0.0))
+            self.discharged_wh = float(d.get("discharged_wh", 0.0))
+            self.bins = {int(k): [float(v[0]), float(v[1])] for k, v in d.get("bins", {}).items()}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, KeyError, IndexError) as e:
+            log.warning("energy ledger %s unreadable (%s): starting from zero", self.path, e)
+
+    def save(self):
+        if not self.path:
+            return
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"charged_wh": round(self.charged_wh, 3),
+                           "discharged_wh": round(self.discharged_wh, 3),
+                           "bins": {str(k): [round(v[0], 3), round(v[1], 3)]
+                                    for k, v in self.bins.items()}}, f)
+            os.replace(tmp, self.path)
+            self._save_failed = False
+        except OSError as e:
+            if not self._save_failed:
+                log.warning("energy ledger not saved to %s: %s", self.path, e)
+            self._save_failed = True
+
+    def add(self, watts, dt_s, wall):
+        """Account `watts` (bank power, + charging) over `dt_s`. Returns the
+        closed hour as (in Wh, out Wh) when one just ended, else None."""
+        wh = watts * max(0.0, dt_s) / 3600.0
+        b = int(wall // self.BIN_S)
+        cell = self.bins.setdefault(b, [0.0, 0.0])
+        h = int(wall // 3600)
+        if self.hour is None or self.hour[0] != h:
+            closed = self.hour[1] if self.hour is not None else None
+            self.hour = (h, [0.0, 0.0])
+        else:
+            closed = None
+        if wh >= 0:
+            self.charged_wh += wh
+            cell[0] += wh
+            self.hour[1][0] += wh
+        else:
+            self.discharged_wh -= wh
+            cell[1] -= wh
+            self.hour[1][1] -= wh
+        if b != self._bin:
+            for k in [k for k in self.bins if k <= b - self.WINDOW]:
+                del self.bins[k]
+            if self._bin is not None:
+                self.save()
+            self._bin = b
+        return closed
+
+    def last24h(self, wall):
+        """(in Wh, out Wh) over the trailing 24 h of bins."""
+        b = int(wall // self.BIN_S)
+        cells = [v for k, v in self.bins.items() if b - self.WINDOW < k <= b]
+        return sum(v[0] for v in cells), sum(v[1] for v in cells)
+
+
 # ----------------------------------------------------------------------------
 # The driver
 # ----------------------------------------------------------------------------
@@ -553,6 +651,9 @@ class RecBmsDriver:
         self._boost_write(0.0, quiet=True)   # first tick sets the real lead
         self._poll_solar_priority()          # ... and must know this to do it
         atexit.register(self._boost_shutdown)
+        self.energy = EnergyLedger(cfg.energy_file)
+        self._energy_ts = None
+        atexit.register(self.energy.save)
         for _sig in (signal.SIGTERM, signal.SIGINT):
             try:
                 signal.signal(_sig, self._boost_signal)
@@ -708,6 +809,11 @@ class RecBmsDriver:
         svc.add_path("/System/NrOfModulesBlockingDischarge", None,
                      gettextcallback=fmt_int())
         svc.add_path("/History/ChargeCycles", None, gettextcallback=fmt_int())
+        kwh = fmt("kWh", 3)
+        svc.add_path("/History/ChargedEnergy", None, gettextcallback=kwh)
+        svc.add_path("/History/DischargedEnergy", None, gettextcallback=kwh)
+        svc.add_path("/RecBms/Energy/Charged24h", None, gettextcallback=kwh)
+        svc.add_path("/RecBms/Energy/Discharged24h", None, gettextcallback=kwh)
 
         # Driver diagnostics (non-standard, read-only)
         svc.add_path("/RecBms/Phase", "STARTUP")
@@ -1472,7 +1578,7 @@ class RecBmsDriver:
         c = self.cfg
         bms = self.bms
         now = time.monotonic()      # elapsed-time basis for every primitive below
-        wall = time.time()          # the calendar, for the equalization record only
+        wall = time.time()          # the calendar: the equalization record, the energy bins
 
         # ---- staged fallback (port of the NR State Assembler) ----
         never_seen = "_lastUpdate" not in bms
@@ -1572,6 +1678,18 @@ class RecBmsDriver:
 
         volts = v("voltage")
         amps = v("current") if live else 0.0
+
+        # ---- energy ledger (v4.2.0): the BMS's own 0.1 A, before quantisation;
+        # a stalled or stepped clock integrates at most 5 s
+        if self._energy_ts is not None:
+            closed = self.energy.add(volts * amps, min(now - self._energy_ts, 5.0), wall)
+            if closed is not None and c.energy_log_hourly:
+                e24 = self.energy.last24h(wall)
+                log.info("energy: last hour +%.0f Wh in / -%.0f Wh out; 24 h +%.2f / -%.2f kWh; "
+                         "lifetime +%.1f / -%.1f kWh", closed[0], closed[1],
+                         e24[0] / 1000, e24[1] / 1000,
+                         self.energy.charged_wh / 1000, self.energy.discharged_wh / 1000)
+        self._energy_ts = now
         cell_min, cell_max = v("minCellV"), v("maxCellV")
         cell_min_t, cell_max_t = v("minCellT"), v("maxCellT")
 
@@ -1689,6 +1807,11 @@ class RecBmsDriver:
         s["/System/NrOfModulesBlockingCharge"] = bms.get("modulesBlockingCharge")
         s["/System/NrOfModulesBlockingDischarge"] = bms.get("modulesBlockingDischarge")
         s["/History/ChargeCycles"] = bms.get("chargeCycles")
+        e24 = self.energy.last24h(wall)
+        s["/History/ChargedEnergy"] = _q(self.energy.charged_wh / 1000, 0.001)
+        s["/History/DischargedEnergy"] = _q(self.energy.discharged_wh / 1000, 0.001)
+        s["/RecBms/Energy/Charged24h"] = _q(e24[0] / 1000, 0.001)
+        s["/RecBms/Energy/Discharged24h"] = _q(e24[1] / 1000, 0.001)
         if bms.get("serial"):
             s["/Serial"] = bms["serial"]
         # /FirmwareVersion has no source: 0x35F bytes 4-5 are capacity, and

@@ -13,6 +13,44 @@ import types
 
 R = load(os.path.join(REPO, "dbus-recbms", "dbus_recbms.py"), "dbus_recbms")
 cfg = R.Config(os.path.join(REPO, "dbus-recbms", "config.ini"))
+import tempfile
+_tmpdir = tempfile.mkdtemp(prefix="recbms-test-")
+cfg.energy_file = os.path.join(_tmpdir, "energy.json")
+
+print("\n=== dbus-recbms: the energy ledger (4.2.0) ===")
+check("config: current published at the BMS's 0.1 A, ledger file and hourly log set",
+      cfg.current_step == 0.1 and cfg.energy_log_hourly and cfg.energy_file.endswith("energy.json"))
+E = R.EnergyLedger
+e = E(None)
+w0 = 1_800_000_000.0
+for i in range(360):                       # +10 A at 56.6 V for 6 min
+    e.add(566.0, 1.0, w0 + i)
+check("6 min at +566 W: 56.6 Wh in, nothing out", abs(e.charged_wh - 56.6) < 0.01 and e.discharged_wh == 0.0,
+      "%.2f %.2f" % (e.charged_wh, e.discharged_wh))
+for i in range(180):                       # -20 A for 3 min
+    e.add(-1132.0, 1.0, w0 + 360 + i)
+check("3 min at -1132 W: 56.6 Wh out, the in side untouched",
+      abs(e.discharged_wh - 56.6) < 0.01 and abs(e.charged_wh - 56.6) < 0.01)
+check("24 h window carries both", tuple(round(x, 1) for x in e.last24h(w0 + 540)) == (56.6, 56.6), str(e.last24h(w0 + 540)))
+x = E(None); x.add(566.0, 5.0, w0)
+check("the driver clips a stalled clock to 5 s: 5 s at 566 W is 0.79 Wh", abs(x.charged_wh - 0.786) < 0.001, str(x.charged_wh))
+closed = e.add(0.0, 1.0, w0 + 3600 * 2)
+check("an hour rolling over returns the closed hour's (in, out)", closed is not None and tuple(round(x, 1) for x in closed) == (56.6, 56.6), str(closed))
+check("25 h later the window is empty, the lifetime figures stand",
+      e.last24h(w0 + 25 * 3600) == (0.0, 0.0) and abs(e.charged_wh - 56.6) < 0.01)
+e.add(0.0, 1.0, w0 + 25 * 3600)
+check("... and the old bins are pruned", all(k > (w0 + 25 * 3600) // 300 - 288 for k in e.bins), str(sorted(e.bins)[:3]))
+e = E(cfg.energy_file)
+e.add(1000.0, 1.0, w0); e.add(1000.0, 1.0, w0 + 300); e.add(-500.0, 1.0, w0 + 600)   # two bin rolls -> saved
+e.save()
+e2 = E(cfg.energy_file)
+check("a restart carries on from the file (to the Wh)", abs(e2.charged_wh - e.charged_wh) < 1e-3 and abs(e2.discharged_wh - e.discharged_wh) < 1e-3
+      and all(abs(a - b) < 1e-3 for a, b in zip(e2.last24h(w0 + 600), e.last24h(w0 + 600))), "%s %s" % (e2.charged_wh, e2.last24h(w0 + 600)))
+os.remove(cfg.energy_file)
+with open(cfg.energy_file, "w") as f:
+    f.write("{not json")
+check("an unreadable file starts from zero, no crash", E(cfg.energy_file).charged_wh == 0.0)
+os.remove(cfg.energy_file)
 
 print("\n=== dbus-recbms: solar lead gate ===")
 check("config: solar_lead_v 0.15", abs(cfg.solar_lead - 0.15) < 1e-9, str(cfg.solar_lead))
@@ -297,6 +335,25 @@ check("offset not in force: the boost gate and the engine are told the MPPTs' re
       "%s %s" % (drv.last_target, b["/RecBms/SolarBoost/EffectiveChargeVoltage"]))
 del drv._verify_lead
 drv.lead_fault.update(active=False, msg="", mismatch_since=0.0)
+
+print("\n=== dbus-recbms: the ledger in the driver ===")
+c_in, c_out = b["/History/ChargedEnergy"] or 0, b["/History/DischargedEnergy"] or 0
+for _ in range(60):
+    T[0] += 1
+    M[0] += 1
+    drv.bms.update({"_lastUpdate": M[0], "current": 10.0, "voltage": 56.6})
+    drv._tick()
+check("driver: 60 s at +10 A / 56.6 V -> +0.009 kWh on /History/ChargedEnergy and the 24 h path, nothing out",
+      abs(b["/History/ChargedEnergy"] - c_in - 0.009) < 0.0015 and b["/History/DischargedEnergy"] == c_out
+      and abs(b["/RecBms/Energy/Charged24h"] - 0.009) < 0.0015,
+      "%s %s %s" % (b["/History/ChargedEnergy"], b["/History/DischargedEnergy"], b["/RecBms/Energy/Charged24h"]))
+M[0] += 3600                     # a stalled tick: an hour passes at once
+T[0] += 3600
+drv.bms.update({"_lastUpdate": M[0], "current": 10.0, "voltage": 56.6})
+drv._tick()
+check("driver: a stalled clock integrates five seconds of it, not the hour",
+      abs(b["/History/ChargedEnergy"] - c_in - 0.010) < 0.0015, str(b["/History/ChargedEnergy"]))
+drv.bms.update({"current": 0.0})
 
 print("\n=== dbus-recbms: sustain ratchet (regression) ===")
 F = R.SUSTAIN_FLOOR

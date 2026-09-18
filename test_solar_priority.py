@@ -32,6 +32,7 @@ sys.modules["dbusmonitor"] = dm
 print("\n=== dbus-recbms: sustain ===")
 R = load(os.path.join(REPO, "dbus-recbms", "dbus_recbms.py"), "dbus_recbms")
 rcfg = R.Config(os.path.join(REPO, "dbus-recbms", "config.ini"))
+rcfg.energy_file = None            # the ledger stays in memory off the boat
 check("config: [sustain] parsed", rcfg.sustain_enabled and rcfg.sustain_hold_s == 120)
 
 T = [1_800_000_000.0]      # the wall clock: the equalization calendar only
@@ -172,14 +173,14 @@ FakeBus.store["/Settings/RecBms/EqLastCompleted"] = T[0]
 
 # telemetry quantisation: the voltage keeps the BMS's 0.01 V (DVCC hands it to
 # the chargers as their sense), the rest moves in steps; control paths untouched
-check("config: [publish] voltage at 0.01 V", rcfg.voltage_step == 0.01 and rcfg.current_step == 0.5)
+check("config: [publish] voltage at 0.01 V, current at the BMS's 0.1 A (4.2.0)", rcfg.voltage_step == 0.01 and rcfg.current_step == 0.1)
 drv.bms.update({"voltage": 56.637, "current": -1.27, "temperature": 21.3})
 SOC[0] = 75.26
 T[0] += 1; M[0] += 1
 drv.bms.update({"_lastUpdate": M[0], "socHiRes": SOC[0]})
 drv._tick()
 check("voltage published at 0.01 V", batt["/Dc/0/Voltage"] == 56.64, str(batt["/Dc/0/Voltage"]))
-check("current in 0.5 A steps", batt["/Dc/0/Current"] == -1.5, str(batt["/Dc/0/Current"]))
+check("current in 0.1 A steps", batt["/Dc/0/Current"] == -1.3, str(batt["/Dc/0/Current"]))
 check("power in 10 W steps", batt["/Dc/0/Power"] == -70, str(batt["/Dc/0/Power"]))
 check("SOC in 0.05 % steps (4.1.0: the HOLD rules read quarter points)", batt["/Soc"] == 75.25, str(batt["/Soc"]))
 check("temperature in 0.5 degree steps", batt["/Dc/0/Temperature"] == 21.5, str(batt["/Dc/0/Temperature"]))
@@ -204,7 +205,7 @@ SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priorit
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 2 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5)
-check("engine version bumped", SP.ENGINE_VERSION == "4.5.2")
+check("engine version bumped", SP.ENGINE_VERSION == "4.5.3")
 Val = SP.Val
 
 
@@ -539,6 +540,31 @@ check("island: 3 kW -> suspend", s.state == "suspend" and s.cmd == 0)
 wh = s.out.deficit_wh
 s.tick(15, load=250.0, batt=0.0)
 check("island: resumes, the deficit stands and shore time is not counted", s.state == "solar" and abs(s.out.deficit_wh - wh) < 1)
+
+# 4.5.3: dusk by output -- arrays under DARK_W for DARK_MS, none limited
+s = Sim(); day(s, batt=600.0); s.tick(700)
+s.tick(599, batt=-300.0, m=2, pv=40.0)
+check("island: 40 W for 10 min less a second: still out, the tag counts",
+      s.state == "solar" and "[dark 59" in s.out.status_text, s.out.status_text)
+b0 = s.eng.st["backoffUntil"]
+s.tick(2)
+check("island: 40 W for 10 min with the arrays tracking -> shore (dusk by output), well before night is declared",
+      s.state == "shore" and s.out.daylight is True and s.transitions[-1].startswith("-> SHORE (dark: arrays 40W for 10 min"),
+      str(s.transitions[-1:]))
+check("... without a backoff", s.eng.st["backoffUntil"] == b0)
+s = Sim(); day(s, batt=600.0); s.tick(700)
+s.tick(900, batt=-300.0, m=1, pv=40.0)
+check("island: 40 W but an array reads limited: says nothing about the sun -- the budget decides", s.state == "solar")
+s.tick(300, batt=-300.0, m=2, pv=40.0)
+check("... the timer runs from the moment no array is limited", s.state == "solar")
+s.tick(301, batt=-300.0, m=2, pv=40.0)
+check("... and ends the island 10 min later", s.state == "shore" and "dark" in s.transitions[-1], str(s.transitions[-1:]))
+s = Sim(); day(s, batt=600.0); s.tick(700)
+s.tick(400, batt=-300.0, m=2, pv=40.0)
+s.tick(60, batt=100.0, m=2, pv=300.0)
+check("a cloud that lifts resets the dark timer", s.state == "solar" and "[dark" not in s.out.status_text, s.out.status_text)
+s.tick(599, batt=-300.0, m=2, pv=40.0)
+check("... which starts again from zero", s.state == "solar")
 
 # 4.5.2: night ends the island; a suspend at night ends on shore
 s = Sim(); day(s, batt=600.0); s.tick(700)

@@ -228,6 +228,29 @@ BMS's own CVL bounds the MPPTs' target and any boost on top of it as well
 `/RecBms/TargetChargeVoltage` the MPPTs' target. SOC is published in 0.05 %
 steps (`[publish] soc_step`) because the HOLD rules read quarter points.
 
+## Energy ledger (v4.2.0)
+
+The REC sends no energy or Ah counters (its frame set has no `0x378`), and
+its SOC is no substitute for them: it is the *net* of charge and discharge,
+moves in ~1 Ah steps, and the BMS resets it at a full charge. The driver
+therefore integrates the BMS's own 0.1 A current and 0.01 V voltage every
+tick — before the `[publish]` quantisation — into two separate ledgers:
+
+| path | |
+|---|---|
+| `/History/ChargedEnergy` | lifetime kWh into the bank (the path Venus and VRM show) |
+| `/History/DischargedEnergy` | lifetime kWh out of it |
+| `/RecBms/Energy/Charged24h` | kWh in over the trailing 24 h (5-minute bins) |
+| `/RecBms/Energy/Discharged24h` | kWh out over the trailing 24 h |
+
+Every closed hour is logged (`energy: last hour +12 Wh in / -31 Wh out; 24 h
+…; lifetime …`), which is the durable hourly series for questions like "does
+the bank really sit still overnight under the floor". The ledger is saved to
+`[energy] state_file` (`/data/dbus-recbms/energy.json`, outside the deploy's
+file list, so it survives updates) once per bin and at exit; a stalled or
+stepped clock integrates at most 5 s. Since 4.2.0 the current is also
+published at 0.1 A (`current_step`), so the trickle currents show in HA.
+
 ## Publishing and clocks (v4.0.0)
 
 `[publish]` quantises telemetry: a value goes on D-Bus only when it moves to
@@ -566,12 +589,14 @@ assumes the MPPTs at the target and the Quattro below it.
   `hold_deficit_pct` (0.5 % of the bank, ~400 Wh) the engine returns, with a
   backoff. Nothing is exempt from it. Suspend, faults, MIN_SOC and the SOC
   drift backstop are unchanged.
-- **Night (4.5.2).** The budget carries the sunset taper; once night is
-  declared (the arrays' voltage under `dusk_v` — on the recorded days 35-70
-  min after they stopped producing, by which time the budget has usually
-  brought the boat home) the island ends: there is nothing to harvest. No
-  backoff, since dawn must not wait on it. A suspend that runs into the night
-  ends on shore instead of resuming the island.
+- **Dusk and night (4.5.2, 4.5.3).** The budget carries the sunset taper.
+  The island ends once the arrays have made under `dark_w` (50 W) for
+  `dark_ms` (10 min) with no array reading *limited* (a throttled array says
+  nothing about the sun), and in any case once night is declared (the arrays'
+  voltage under `dusk_v` — on the recorded days 35-70 min after they stopped
+  producing). Neither earns a backoff, since dawn must not wait on it. A
+  suspend that runs into the night ends on shore instead of resuming the
+  island.
 - **The only probe.** An array reports *limited* on shore by day: the
   dbus-recbms boost lifts the MPPTs' target, at most every 30 min. It ends the
   moment the rules are met (and the boat leaves), or once no array is limited

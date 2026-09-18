@@ -44,7 +44,9 @@ What it does (see README.md "Solar Priority driver"):
     about harvesting the sun on the way up, with few relay cycles), and a
     Charge now clicked on the GX by day is honoured as the owner's.
     4.5.2: the island ends when night is declared (nothing to harvest), and
-    a suspend at night ends on shore instead of resuming the island.
+    a suspend at night ends on shore instead of resuming the island. 4.5.3:
+    it also ends once the arrays make under DARK_W for DARK_MS with none
+    reading "limited" -- dusk by output.
     HOLD_RULES = 0 leaves the 4.3 engine in charge of all of it.
 
 Differences from the flow (all deliberate):
@@ -84,7 +86,7 @@ import dbus.mainloop.glib
 from gi.repository import GLib
 
 VERSION = "4.3.1"
-ENGINE_VERSION = "4.5.2"
+ENGINE_VERSION = "4.5.3"
 BUSITEM = "com.victronenergy.BusItem"
 _CLOCK_BASE_MS = 10 ** 12      # see SolarPriorityDriver._ms
 
@@ -186,6 +188,11 @@ ENGINE_DEFAULTS = {
     "DAWN_V": 60, "DUSK_V": 50, "DAWN_MS": 600000, "DUSK_MS": 300000,
     # Charge now by day only as a safety, under this SOC
     "SAFETY_SOC": 25, "SAFETY_EXIT_SOC": 27,
+    # 4.5.3 (owner): the island ends once the arrays make under DARK_W for
+    # DARK_MS with no array reading "limited" (a throttled array says
+    # nothing about the sun). Dusk by output, well before the voltage
+    # detector declares night; the deficit budget still carries the taper.
+    "DARK_W": 50, "DARK_MS": 600000,
 }
 
 
@@ -306,7 +313,7 @@ def fresh_state(now, t):
         # 4.4
         "daylight": None, "lightSince": 0, "darkSince": 0, "safety": False, "wasHold": False,
         "preferWanted": None, "preSeen": False, "ownerCharge": False,
-        "predWin": [], "holdProbe": 0, "probeRef": None,
+        "predWin": [], "holdProbe": 0, "probeRef": None, "dimSince": 0,
         "drawdownWh": 0.0, "drawdownTs": 0, "predW": None, "predCheckAt": 0,
     }
 
@@ -538,6 +545,7 @@ class Engine:
             st["drawdownWh"] = 0.0
             st["drawdownTs"] = 0
             st["predCheckAt"] = 0
+            st["dimSince"] = 0
             boostMsg[0] = 0
             transition[0] = "-> SHORE (" + reason + ")"
             status[1] = transition[0]
@@ -1231,6 +1239,10 @@ class Engine:
                     # SOC drift from the departure stays as the backstop
                     st["loadExceedStart"] = 0
                     st["surgeStart"] = 0
+                    if pvNow < t["DARK_W"] and not limited:
+                        st["dimSince"] = st["dimSince"] or now
+                    else:
+                        st["dimSince"] = 0
                     if st["daylight"] is False:
                         # HOLD (4.5.2): nothing to harvest after dusk. The
                         # budget carries the sunset taper (the detector
@@ -1238,6 +1250,12 @@ class Engine:
                         # boat 09-07..16); once it does, home -- and without
                         # the backoff a wrong call earns: dawn must not wait.
                         toShore("night")
+                        status[0] = "blue"
+                    elif st["dimSince"] and now - st["dimSince"] >= t["DARK_MS"]:
+                        # 4.5.3: dusk by output -- the arrays have made under
+                        # DARK_W for DARK_MS and none is throttled
+                        toShore("dark: arrays %.0fW for %d min, not limited" % (
+                            pvNow, round(t["DARK_MS"] / 60000)))
                         status[0] = "blue"
                     elif st["ownerCharge"]:
                         toShore("owner's charge now")
@@ -1254,9 +1272,10 @@ class Engine:
                         status[0] = "blue"
                     else:
                         status[0] = "yellow" if st["drawdownWh"] >= budget / 2 else "green"
-                        status[1] = "SOLAR | PV %.0fW batt %s%.0fW load %.0fW SOC %.2f%% [deficit %.0f/%.0f Wh]%s" % (
+                        status[1] = "SOLAR | PV %.0fW batt %s%.0fW load %.0fW SOC %.2f%% [deficit %.0f/%.0f Wh]%s%s" % (
                             pvNow, "+" if batt.v >= 0 else "", batt.v, loadNow.v, soc.v,
-                            st["drawdownWh"], budget, " [limited]" if limited else "")
+                            st["drawdownWh"], budget, " [limited]" if limited else "",
+                            " [dark %ds]" % ((now - st["dimSince"]) // 1000) if st["dimSince"] else "")
                 elif owd:
                     # Discharging one-way: a deficit, a surge or SOC drift is
                     # the bank doing exactly what was asked. Only the floor,
