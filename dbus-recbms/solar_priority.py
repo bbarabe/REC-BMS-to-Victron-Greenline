@@ -43,6 +43,8 @@ What it does (see README.md "Solar Priority driver"):
     4.5: the same rules run at any distance UNDER the target (charging is
     about harvesting the sun on the way up, with few relay cycles), and a
     Charge now clicked on the GX by day is honoured as the owner's.
+    4.5.2: the island ends when night is declared (nothing to harvest), and
+    a suspend at night ends on shore instead of resuming the island.
     HOLD_RULES = 0 leaves the 4.3 engine in charge of all of it.
 
 Differences from the flow (all deliberate):
@@ -82,7 +84,7 @@ import dbus.mainloop.glib
 from gi.repository import GLib
 
 VERSION = "4.3.1"
-ENGINE_VERSION = "4.5.1"
+ENGINE_VERSION = "4.5.2"
 BUSITEM = "com.victronenergy.BusItem"
 _CLOCK_BASE_MS = 10 ** 12      # see SolarPriorityDriver._ms
 
@@ -1111,7 +1113,12 @@ class Engine:
                             pvNow, loadNow.v, soc.v)
 
             elif st["state"] == "suspend":
-                if now - st["suspendStart"] >= t["SUSPEND_MAX_MS"]:
+                if hold and st["daylight"] is False:
+                    # HOLD (4.5.2): there is no island to resume after dusk;
+                    # the boat is on shore already, so this moves no relay.
+                    toShore("night: not resuming the island")
+                    status[0] = "blue"
+                elif now - st["suspendStart"] >= t["SUSPEND_MAX_MS"]:
                     toShore("suspend timeout after %dmin" % round(t["SUSPEND_MAX_MS"] / 60000))
                     status[0] = "blue"
                 elif loadNow.v <= st["suspendBase"] + t["RESUME_DELTA_W"]:
@@ -1224,7 +1231,15 @@ class Engine:
                     # SOC drift from the departure stays as the backstop
                     st["loadExceedStart"] = 0
                     st["surgeStart"] = 0
-                    if st["ownerCharge"]:
+                    if st["daylight"] is False:
+                        # HOLD (4.5.2): nothing to harvest after dusk. The
+                        # budget carries the sunset taper (the detector
+                        # declares night 35-70 min after the arrays stop,
+                        # boat 09-07..16); once it does, home -- and without
+                        # the backoff a wrong call earns: dawn must not wait.
+                        toShore("night")
+                        status[0] = "blue"
+                    elif st["ownerCharge"]:
                         toShore("owner's charge now")
                         status[0] = "blue"
                     elif soc.v < st["socEntry"] - t["SOC_DRIFT_MAX"]:

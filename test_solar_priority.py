@@ -204,7 +204,7 @@ SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priorit
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 2 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5)
-check("engine version bumped", SP.ENGINE_VERSION == "4.5.1")
+check("engine version bumped", SP.ENGINE_VERSION == "4.5.2")
 Val = SP.Val
 
 
@@ -245,7 +245,7 @@ class Sim:
             inp.soc = Val(v["soc"], n)
             inp.batt = Val(v["batt"], n)
             inp.load_now = Val(v["load"], n)
-            inp.load_avg = Val(v["load"], n)
+            inp.load_avg = Val(v["lavg"] if v.get("lavg") is not None else v["load"], n)
             inp.feed = Val(v["feed"] if v.get("feed") is not None else (240 if self.cmd == 1 else 0), n)
             inp.ac_out = Val(v["load"], n)
             inp.voc6, inp.y6, inp.m6 = Val(v["voc"], n), Val(v["pv"], n), Val(v["m"], n)
@@ -386,7 +386,16 @@ check("discharge: resumes to solar without a boost", s.state == "solar" and s.cm
 s.tick(1, soc=70.4)
 check("discharge: done within EXIT of the target", s.oneway is None and s.sustain == 0)
 s.tick(20)
-check("discharge done: HOLD takes the island over, its backstop starting from here",
+check("discharge done at night: HOLD takes over and brings the boat home (nothing to harvest)",
+      s.state == "shore" and s.out.hold and s.transitions[-1] == "-> SHORE (night)",
+      "%s %s" % (s.state, s.transitions[-1:]))
+s = Sim()
+s.tick(1, soc=90, target=70, batt_v=60.3, cvl=60.3, voc=70.0)
+s.tick(335, pv=0.0, m=0)
+s.tick(300, batt=-600.0)
+s.tick(1, soc=70.4)
+s.tick(20)
+check("discharge done by day: HOLD takes the island over, its backstop starting from here",
       s.state == "solar" and s.out.hold and s.eng.st["socEntry"] == 70.4 and 0 < s.out.deficit_wh < 5,
       "%s entry %s deficit %s" % (s.state, s.eng.st["socEntry"], s.out.deficit_wh))
 h = Sim(HOLD_RULES=0)
@@ -518,8 +527,9 @@ check("island: a stalled clock integrates five seconds, not the hour", s.out.def
 s.tick(2, soc=47.9)
 check("island: the SOC drift backstop still stands", s.state == "shore" and "SOC 47.9%" in s.transitions[-1], str(s.transitions[-1:]))
 s = Sim(); day(s, batt=600.0); s.tick(700)
-s.tick(400, batt=-300.0, m=0, voc=10.0, pv=0.0)
-check("island: rides past dusk on the budget", s.state == "solar" and s.out.daylight is False and s.out.deficit_wh > 0)
+s.tick(400, batt=-300.0, m=0, pv=0.0)
+check("island: a dark spell by day (arrays at 0 W, voltage up) rides on the budget",
+      s.state == "solar" and s.out.daylight is True and s.out.deficit_wh > 0)
 wh0 = s.out.deficit_wh
 s.tick(120, load=1700.0, batt=-1700.0)
 check("island: the water heater (1.7 kW, 2 min) is carried by the budget, not by a relay",
@@ -529,6 +539,27 @@ check("island: 3 kW -> suspend", s.state == "suspend" and s.cmd == 0)
 wh = s.out.deficit_wh
 s.tick(15, load=250.0, batt=0.0)
 check("island: resumes, the deficit stands and shore time is not counted", s.state == "solar" and abs(s.out.deficit_wh - wh) < 1)
+
+# 4.5.2: night ends the island; a suspend at night ends on shore
+s = Sim(); day(s, batt=600.0); s.tick(700)
+s.tick(299, batt=-300.0, m=0, voc=10.0, pv=0.0)
+check("dusk: the budget carries the taper until night is declared", s.state == "solar" and s.out.daylight is True and s.out.deficit_wh > 0)
+b0 = s.eng.st["backoffUntil"]
+s.tick(2)
+check("night declared: the island ends -- nothing to harvest",
+      s.state == "shore" and s.cmd == 0 and s.out.daylight is False and s.transitions[-1] == "-> SHORE (night)", str(s.transitions[-1:]))
+check("... without a backoff: dawn must not wait on it", s.eng.st["backoffUntil"] == b0)
+check("... and the deficit ledger is cleared with the island", s.out.deficit_wh == 0.0)
+s = Sim(); day(s, batt=600.0); s.tick(700)
+s.tick(5, load=3000.0, lavg=250.0, batt=-3000.0)      # the 60 s mean is still the base
+check("island: 3 kW -> suspend (day)", s.state == "suspend" and s.cmd == 0)
+islands = sum(1 for _, c in s.cmds if c == 1)
+s.tick(310, voc=10.0, pv=0.0, load=3000.0, batt=0.0, lavg=3000.0)
+check("suspend that runs into the night: shore, no island to resume",
+      s.state == "shore" and s.cmd == 0 and "night" in s.transitions[-1], str(s.transitions[-1:]))
+check("... which moved no relay (the suspend was on shore already)", sum(1 for _, c in s.cmds if c == 1) == islands)
+s.tick(60, load=250.0, lavg=None)
+check("... and the load dropping afterwards resumes nothing", s.state == "shore" and s.cmd == 0)
 
 # the probe
 s = Sim(); day(s, batt=-20.0, m=1, soc=50.9); s.tick(340)

@@ -566,6 +566,12 @@ assumes the MPPTs at the target and the Quattro below it.
   `hold_deficit_pct` (0.5 % of the bank, ~400 Wh) the engine returns, with a
   backoff. Nothing is exempt from it. Suspend, faults, MIN_SOC and the SOC
   drift backstop are unchanged.
+- **Night (4.5.2).** The budget carries the sunset taper; once night is
+  declared (the arrays' voltage under `dusk_v` — on the recorded days 35-70
+  min after they stopped producing, by which time the budget has usually
+  brought the boat home) the island ends: there is nothing to harvest. No
+  backoff, since dawn must not wait on it. A suspend that runs into the night
+  ends on shore instead of resuming the island.
 - **The only probe.** An array reports *limited* on shore by day: the
   dbus-recbms boost lifts the MPPTs' target, at most every 30 min. It ends the
   moment the rules are met (and the boat leaves), or once no array is limited
