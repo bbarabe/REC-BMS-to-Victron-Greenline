@@ -97,7 +97,7 @@ import signal
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "4.2.0"
+VERSION = "4.2.1"
 BUSITEM = "com.victronenergy.BusItem"
 
 log = logging.getLogger("dbus-recbms")
@@ -1603,7 +1603,7 @@ class RecBmsDriver:
 
         safe = {
             "cvl": c.safe_cvl, "voltage": c.safe_voltage, "current": 0.0,
-            "temperature": 20.0, "soc": c.safe_soc,
+            "temperature": 20.0,
             "minCellV": 3.375, "maxCellV": 3.375, "minCellT": 20.0,
             "maxCellT": 20.0,
         }
@@ -1618,8 +1618,14 @@ class RecBmsDriver:
                 return bms[key]
             return safe.get(key)
 
-        # 0x355 bytes 4-5 carry SOC at 0.01% resolution — prefer it
-        soc = bms["socHiRes"] if bms.get("socHiRes") is not None else v("soc")
+        # 0x355 bytes 4-5 carry SOC at 0.01% resolution — prefer it. Never a
+        # substitute (v4.2.1): the tick after a restart runs before the first
+        # 0x355 frame, and the 50 % placeholder it used to publish tripped
+        # Solar Priority's SOC-drift backstop (boat, 2026-09-18 02:10Z: "->
+        # SHORE (SOC 50.0% (entry 54.8%))"). None until the BMS has said;
+        # the last figure it sent stands through a fallback.
+        soc = bms["socHiRes"] if bms.get("socHiRes") is not None else bms.get("soc")
+        soc = float(soc) if soc is not None else None
 
         # ---- CVL control: slider (or sustain) + weekly equalization ----
         slider = float(self.settings["chargeslider"] or c.slider_default)
@@ -1694,10 +1700,10 @@ class RecBmsDriver:
         cell_min_t, cell_max_t = v("minCellT"), v("maxCellT")
 
         installed = bms.get("installedAh") or c.installed_ah
-        remaining = soc / 100.0 * installed
+        remaining = soc / 100.0 * installed if soc is not None else None
 
         ttg = None
-        if live and amps < -0.5:
+        if live and amps < -0.5 and remaining is not None:
             ttg = min(864000, int(remaining / -amps * 3600))
 
         # Time to full from ~60s-smoothed current (raw 0.1A steps make the
@@ -1706,7 +1712,7 @@ class RecBmsDriver:
             self.current_ema = amps if self.current_ema is None else \
                 self.current_ema + (amps - self.current_ema) / 60.0
         ttf = None
-        if live and self.current_ema is not None and self.current_ema > 0.05:
+        if live and self.current_ema is not None and self.current_ema > 0.05 and remaining is not None:
             ttf = int((installed - remaining) / self.current_ema * 3600)
 
         s = self._pub
@@ -1774,7 +1780,7 @@ class RecBmsDriver:
         s["/Soc"] = _q(soc, c.soc_step)
         s["/Soh"] = bms.get("soh")
         s["/Capacity"] = _q(remaining, c.ah_step)
-        s["/ConsumedAmphours"] = _q(remaining - installed, c.ah_step)  # BMV convention: negative
+        s["/ConsumedAmphours"] = _q(remaining - installed, c.ah_step) if remaining is not None else None  # BMV convention: negative
         s["/InstalledCapacity"] = installed
         s["/TimeToGo"] = _q(ttg, c.time_step)
 
@@ -1782,7 +1788,7 @@ class RecBmsDriver:
         s["/Alarms/HighVoltage"] = (2 if cell_max > 4.25 else 1 if cell_max > 4.20 else 0) if live else 0
         s["/Alarms/LowTemperature"] = (2 if cell_min_t < 0 else 1 if cell_min_t < 5 else 0) if live else 0
         s["/Alarms/HighTemperature"] = (2 if cell_max_t > 50 else 1 if cell_max_t > 45 else 0) if live else 0
-        s["/Alarms/LowSoc"] = 2 if soc < 10 else 1 if soc < 20 else 0
+        s["/Alarms/LowSoc"] = 0 if soc is None else 2 if soc < 10 else 1 if soc < 20 else 0
         s["/Alarms/HighChargeCurrent"] = (1 if bms.get("modulesBlockingCharge") else 0) if live else 0
         s["/Alarms/HighDischargeCurrent"] = (1 if bms.get("modulesBlockingDischarge") else 0) if live else 0
         delta = cell_max - cell_min

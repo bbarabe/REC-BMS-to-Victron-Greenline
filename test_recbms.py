@@ -355,6 +355,19 @@ check("driver: a stalled clock integrates five seconds of it, not the hour",
       abs(b["/History/ChargedEnergy"] - c_in - 0.010) < 0.0015, str(b["/History/ChargedEnergy"]))
 drv.bms.update({"current": 0.0})
 
+print("\n=== dbus-recbms: no substitute SOC (4.2.1) ===")
+T[0] += 1; M[0] += 1
+saved = {k: drv.bms.pop(k) for k in ("soc", "socHiRes")}
+drv.bms.update({"_lastUpdate": M[0]})
+drv._tick()
+check("live, but no 0x355 yet: /Soc empty, no capacity, no low-SOC alarm -- never the 50 % placeholder",
+      b["/Soc"] is None and b["/Capacity"] is None and b["/ConsumedAmphours"] is None and b["/Alarms/LowSoc"] == 0,
+      "%s %s" % (b["/Soc"], b["/Capacity"]))
+T[0] += 1; M[0] += 1
+drv.bms.update(saved); drv.bms.update({"_lastUpdate": M[0]})
+drv._tick()
+check("... and the real figure once the BMS has said", b["/Soc"] == saved["socHiRes"], "%s vs %s" % (b["/Soc"], saved["socHiRes"]))
+
 print("\n=== dbus-recbms: sustain ratchet (regression) ===")
 F = R.SUSTAIN_FLOOR
 r = R.sustain_ratchet(F, 90.0, 92.0, 80.0, 40, 100)
