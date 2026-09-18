@@ -212,13 +212,13 @@ d, m = driver(types_=(0, 3), active=1)
 tick(d)
 d._write_prefer(d._ms(), 0)
 check("a toggle this firmware does not publish is never written blind", [w for w in m.writes if w[1] == PRE] == [])
-# end to end: a dark array for DUSK_MS, Solar Priority on -> charge now
+# end to end: a dark array (charger off) for NIGHT_MS, Solar Priority on -> charge now
 d, m = driver(types_=(0, 3), active=1)
 m.add(MPPT, 278, {"/Pv/V": 0.3, "/Yield/Power": 0.0, "/MppOperationMode": 0})
 d._device_added(MPPT, 278)
 m.push(VEBUS, PRE, 1)
 d.inp.enabled = True
-tick(d, 310)
+tick(d, 610)
 check("the engine's night reaches the Quattro through the driver",
       d.sw["/SolarPriority/Daylight"] == 0 and d.sw["/SolarPriority/PreferRenewable"] == 0
       and (VEBUS, PRE, 0) in m.writes, "%s %s" % (d.sw["/SolarPriority/Daylight"], [w for w in m.writes if w[1] == PRE]))
