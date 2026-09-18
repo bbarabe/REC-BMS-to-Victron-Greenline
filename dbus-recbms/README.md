@@ -561,12 +561,29 @@ no safety override and the Quattro's toggle left to the owner; going back also
 needs `solar_gain_pct = 0` in dbus-recbms, because the 4.3 harvest logic
 assumes the MPPTs at the target and the Quattro below it.
 
-- **Day and night** come from the brightest array's voltage (`dawn_v` 60 V for
-  10 min, under `dusk_v` 50 V for 5 min; ten recorded days gave one dawn and
-  one dusk each). Dusk sets the Quattro to *charge now*, dawn to *prefer
-  solar*; by day *charge now* is only a safety under `safety_soc` 25 %. The
-  toggle is written on a difference, at most once a minute, never when it
-  cannot be read as 0/1, and left alone while Solar Priority is off.
+- **Day and night** (4.6.0) come from each array's voltage *and* current. An
+  array's open-circuit voltage is a log-irradiance meter (~8 V per decade on
+  these arrays: +17..20 V over the bank parked in sun, ~+10 V at 1 %), but the
+  charger loads the array whenever it can and the loaded voltage says nothing
+  (09-17: 400 W at 63 V at 17:00, 2 W at 64 V at 19:20), so a voltage
+  threshold alone ran 35-70 min late at dusk and 75 min early at dawn. Per
+  array: *sun* when the PV voltage stands `day_margin_v` (14 V) over the bank
+  or the array makes `day_w` (150 W); *twilight* when it makes under `night_w`
+  (50 W) with less margin (loaded, or just started and not tracking yet);
+  *dark* when its charger is off. Day once any array shows sun for `day_ms`
+  (10 min), night once every array shows twilight or dark for `night_ms`
+  (10 min). On the recorded days: dusk 40-55 min earlier than before, dawn
+  when the arrays cover the DC loads instead of at 1 W (a cold morning's Voc
+  runs ~5 % higher, so day then comes at ~50 W rather than 150 W — still when
+  the DC loads are covered), and a dull sky can make a night in the middle
+  of the day — harmlessly, since its watts still reach the bank above the
+  floor, the floor never raises the bank, and the island needs far more sun
+  than that. The tracker's sweeps to Voc only ever delay night, by at most
+  the 10 min after the last one. Dusk sets the Quattro
+  to *charge now*, dawn to *prefer solar*; by day *charge now* is only a
+  safety under `safety_soc` 25 %. The toggle is written on a difference, at
+  most once a minute, never when it cannot be read as 0/1, and left alone
+  while Solar Priority is off.
 - **Shore holds, never raises.** On shore under the target the dbus-recbms
   floor is requested (it pins min(present SOC, slider)) unless it is day *and*
   the Quattro reads prefer solar — so a night, a toggle that did not take, or
@@ -589,14 +606,10 @@ assumes the MPPTs at the target and the Quattro below it.
   `hold_deficit_pct` (0.5 % of the bank, ~400 Wh) the engine returns, with a
   backoff. Nothing is exempt from it. Suspend, faults, MIN_SOC and the SOC
   drift backstop are unchanged.
-- **Dusk and night (4.5.2, 4.5.3).** The budget carries the sunset taper.
-  The island ends once the arrays have made under `dark_w` (50 W) for
-  `dark_ms` (10 min) with no array reading *limited* (a throttled array says
-  nothing about the sun), and in any case once night is declared (the arrays'
-  voltage under `dusk_v` — on the recorded days 35-70 min after they stopped
-  producing). Neither earns a backoff, since dawn must not wait on it. A
-  suspend that runs into the night ends on shore instead of resuming the
-  island.
+- **Night (4.5.2).** The budget carries the sunset taper; once night is
+  declared the island ends — there is nothing to harvest. No backoff, since
+  dawn must not wait on it. A suspend that runs into the night ends on shore
+  instead of resuming the island.
 - **The only probe.** An array reports *limited* on shore by day: the
   dbus-recbms boost lifts the MPPTs' target, at most every 30 min. It ends the
   moment the rules are met (and the boat leaves), or once no array is limited

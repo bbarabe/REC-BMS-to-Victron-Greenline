@@ -205,7 +205,7 @@ SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priorit
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 2 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5)
-check("engine version bumped", SP.ENGINE_VERSION == "4.5.4")
+check("engine version bumped", SP.ENGINE_VERSION == "4.6.0")
 Val = SP.Val
 
 
@@ -391,8 +391,8 @@ check("discharge done at night: HOLD takes over and brings the boat home (nothin
       s.state == "shore" and s.out.hold and s.transitions[-1] == "-> SHORE (night)",
       "%s %s" % (s.state, s.transitions[-1:]))
 s = Sim()
-s.tick(1, soc=90, target=70, batt_v=60.3, cvl=60.3, voc=70.0)
-s.tick(335, pv=0.0, m=0)
+s.tick(1, soc=90, target=70, batt_v=60.3, cvl=60.3, voc=80.0)
+s.tick(335, pv=0.0, m=1)                     # arrays parked in sun (Voc +20 V over the bank)
 s.tick(300, batt=-600.0)
 s.tick(1, soc=70.4)
 s.tick(20)
@@ -426,15 +426,29 @@ check("emergency SOC -> shore + lockout", s.state == "shore" and s.eng.st["locko
 # ================================================================ engine 4.4
 print("\n=== solar priority engine: HOLD rules (4.4) ===")
 t0 = dict(SP.ENGINE_DEFAULTS)
+A = SP.array_light
+# what one array says (mode, PV volts, watts, bank volts) -- the boat's own numbers
+check("parked in sun: 75 V over a 56 V bank at 2 W is SUN (09-16 17:30, arrays shut by the target)", A(1, 75.0, 2.0, 56.0, t0) == "sun")
+check("loaded in sun: 63 V at 400 W is SUN (09-17 17:00)", A(1, 63.4, 400.0, 56.0, t0) == "sun")
+check("dusk: 64 V at 2 W is TWILIGHT (09-17 19:20)", A(2, 64.2, 2.0, 56.0, t0) == "twilight")
+check("dawn, charger just started: 66 V at 0 W is TWILIGHT, not tracked yet (09-17 06:45)", A(1, 66.3, 0.0, 56.0, t0) == "twilight")
+check("dawn: 72 V at 56 W is SUN by the margin (09-17 08:05, arrays cover the DC loads)", A(2, 72.3, 56.0, 56.0, t0) == "sun")
+check("charger off is DARK whatever the voltage", A(0, 43.0, 0.0, 56.0, t0) == "dark" and A(0, None, None, None, t0) == "dark")
+check("dull sky: 63 V at 100 W says nothing (between night_w and day_w)", A(2, 63.0, 100.0, 56.0, t0) is None)
+check("no reading says nothing", A(2, None, 10.0, 56.0, t0) is None and A(None, 63.0, None, 56.0, t0) is None)
 st = {"daylight": None, "lightSince": 0, "darkSince": 0}
 D = SP.daylight_update
-edges = [D(st, 1000 * k, 70.0, t0) for k in range(1, 700)]
-check("dawn: once, after DAWN_MS of array voltage", edges.count("dawn") == 1 and edges.index("dawn") == 600 and st["daylight"] is True)
-check("a cloud (55 V) changes nothing", D(st, 800000, 55.0, t0) is None and st["daylight"] is True)
-check("a short dip under DUSK_V changes nothing", D(st, 801000, 40.0, t0) is None and D(st, 802000, 70.0, t0) is None and st["daylight"] is True)
-edges = [D(st, 900000 + 1000 * k, 12.0, t0) for k in range(400)]
-check("dusk: once, after DUSK_MS dark", edges.count("dusk") == 1 and edges.index("dusk") == 300 and st["daylight"] is False)
-check("no array reporting: day/night kept", D(st, 2000000, None, t0) is None and st["daylight"] is False)
+SUN, TWI, DARK = [(2, 70.0, 400.0)], [(2, 62.0, 5.0), (2, 61.0, 3.0)], [(0, 1.0, 0.0), (0, 1.0, 0.0)]
+edges = [D(st, 1000 * k, SUN, 56.0, t0) for k in range(1, 700)]
+check("dawn: once, after DAY_MS of sun", edges.count("dawn") == 1 and edges.index("dawn") == 600 and st["daylight"] is True)
+check("a cloud (100 W, modest margin) changes nothing", D(st, 800000, [(2, 63.0, 100.0)], 56.0, t0) is None and st["daylight"] is True)
+check("a short twilight reading changes nothing", D(st, 801000, TWI, 56.0, t0) is None and D(st, 802000, SUN, 56.0, t0) is None and st["daylight"] is True)
+check("one array in sun is day even with the other dark", D(st, 803000, [(0, 1.0, 0.0), (2, 70.0, 400.0)], 56.0, t0) is None and st["daylight"] is True)
+edges = [D(st, 900000 + 1000 * k, TWI, 56.0, t0) for k in range(700)]
+check("dusk: once, after NIGHT_MS of twilight on every array", edges.count("dusk") == 1 and edges.index("dusk") == 600 and st["daylight"] is False)
+edges = [D(st, 1700000 + 1000 * k, DARK, 56.0, t0) for k in range(700)]
+check("dark keeps the night", edges.count("dusk") == 0 and st["daylight"] is False)
+check("no array reporting: day/night kept", D(st, 3000000, [(None, None, None)], 56.0, t0) is None and D(st, 3001000, [], None, t0) is None and st["daylight"] is False)
 W = SP.prefer_wanted
 check("prefer: solar by day, charge now at night", W(True, False, True) == 1 and W(True, False, False) == 0)
 check("prefer: the safety charges now even by day", W(True, True, True) == 0)
@@ -482,7 +496,7 @@ s = Sim(); day(s, batt=600.0, dcl=None); s.tick(700)
 check("HOLD: no DC-load reading: still decides (on bank power and the inverter's draw)", s.state == "solar")
 
 # night, and the floor
-s = Sim(); day(s, batt=-50.0, voc=10.0, m=0, soc=49.6, pre=0); s.tick(320)
+s = Sim(); day(s, batt=-50.0, voc=10.0, m=0, soc=49.6, pre=0); s.tick(620)
 check("night: charge now wanted, no departure", s.out.daylight is False and s.prefers[-1] == 0 and s.state == "shore")
 check("night under the target: floor -- shore holds the bank, never raises it", s.sustain == 1)
 s.tick(5, pre=1)
@@ -541,34 +555,30 @@ wh = s.out.deficit_wh
 s.tick(15, load=250.0, batt=0.0)
 check("island: resumes, the deficit stands and shore time is not counted", s.state == "solar" and abs(s.out.deficit_wh - wh) < 1)
 
-# 4.5.3: dusk by output -- arrays under DARK_W for DARK_MS, none limited
+# 4.6.0: dusk by the arrays' voltage and current
 s = Sim(); day(s, batt=600.0); s.tick(700)
-s.tick(599, batt=-300.0, m=2, pv=40.0)
-check("island: 40 W for 10 min less a second: still out, the tag counts",
-      s.state == "solar" and "[dark 59" in s.out.status_text, s.out.status_text)
+s.tick(599, batt=-300.0, m=2, pv=40.0)          # tracking at 40 W, PV 3.4 V over the bank: twilight
+check("island: twilight for 10 min less a second: still out on the budget", s.state == "solar" and s.out.daylight is True)
 b0 = s.eng.st["backoffUntil"]
 s.tick(2)
-check("island: 40 W for 10 min with the arrays tracking -> shore (dusk by output), well before night is declared",
-      s.state == "shore" and s.out.daylight is True and s.transitions[-1].startswith("-> SHORE (dark: arrays 40W for 10 min"),
-      str(s.transitions[-1:]))
+check("island: twilight on every array for 10 min -> night -> shore",
+      s.state == "shore" and s.out.daylight is False and s.transitions[-1] == "-> SHORE (night)", str(s.transitions[-1:]))
 check("... without a backoff", s.eng.st["backoffUntil"] == b0)
 s = Sim(); day(s, batt=600.0); s.tick(700)
-s.tick(900, batt=-300.0, m=1, pv=40.0)
-check("island: 40 W but an array reads limited: says nothing about the sun -- the budget decides", s.state == "solar")
-s.tick(300, batt=-300.0, m=2, pv=40.0)
-check("... the timer runs from the moment no array is limited", s.state == "solar")
-s.tick(301, batt=-300.0, m=2, pv=40.0)
-check("... and ends the island 10 min later", s.state == "shore" and "dark" in s.transitions[-1], str(s.transitions[-1:]))
+s.tick(900, batt=-300.0, m=1, pv=2.0, voc=75.0)  # parked at 75 V: the Voc says sun, the target shut it
+check("island: arrays parked in sun at 2 W: still day -- the budget decides", s.state == "solar" and s.out.daylight is True)
+s.tick(601, batt=-300.0, m=1, pv=2.0, voc=62.0)  # the Voc falls to +5 V: twilight
+check("... the Voc falling to +5 V over the bank is dusk: shore 10 min later", s.state == "shore" and "night" in s.transitions[-1], str(s.transitions[-1:]))
 s = Sim(); day(s, batt=600.0); s.tick(700)
 s.tick(400, batt=-300.0, m=2, pv=40.0)
 s.tick(60, batt=100.0, m=2, pv=300.0)
-check("a cloud that lifts resets the dark timer", s.state == "solar" and "[dark" not in s.out.status_text, s.out.status_text)
+check("a cloud that lifts resets the twilight timer", s.state == "solar" and s.eng.st["darkSince"] == 0)
 s.tick(599, batt=-300.0, m=2, pv=40.0)
 check("... which starts again from zero", s.state == "solar")
 
 # 4.5.2: night ends the island; a suspend at night ends on shore
 s = Sim(); day(s, batt=600.0); s.tick(700)
-s.tick(299, batt=-300.0, m=0, voc=10.0, pv=0.0)
+s.tick(599, batt=-300.0, m=0, voc=10.0, pv=0.0)
 check("dusk: the budget carries the taper until night is declared", s.state == "solar" and s.out.daylight is True and s.out.deficit_wh > 0)
 b0 = s.eng.st["backoffUntil"]
 s.tick(2)
@@ -580,7 +590,7 @@ s = Sim(); day(s, batt=600.0); s.tick(700)
 s.tick(5, load=3000.0, lavg=250.0, batt=-3000.0)      # the 60 s mean is still the base
 check("island: 3 kW -> suspend (day)", s.state == "suspend" and s.cmd == 0)
 islands = sum(1 for _, c in s.cmds if c == 1)
-s.tick(310, voc=10.0, pv=0.0, load=3000.0, batt=0.0, lavg=3000.0)
+s.tick(610, voc=10.0, pv=0.0, load=3000.0, batt=0.0, lavg=3000.0)
 check("suspend that runs into the night: shore, no island to resume",
       s.state == "shore" and s.cmd == 0 and "night" in s.transitions[-1], str(s.transitions[-1:]))
 check("... which moved no relay (the suspend was on shore already)", sum(1 for _, c in s.cmds if c == 1) == islands)
@@ -596,8 +606,8 @@ check("... the bank within 0.05 V of the target: the flag counts, the probe runs
       len(s.boost_cmds) == 1 and s.boost_cmds[0][1] == s.t["BOOST_V"], str(s.boost_cmds))
 s = Sim(); day(s, batt=600.0); s.tick(700)
 s.tick(601, batt=-300.0, m=1, pv=40.0, batt_v=56.50)
-check("island at dusk: the Brow's flickering flag with the bank 0.12 V under the target does not hold the dark rule",
-      s.state == "shore" and "dark" in s.transitions[-1], str(s.transitions[-1:]))
+check("island at dusk: the Brow's flickering flag at 40 W and +3.5 V is twilight -- night, home",
+      s.state == "shore" and "night" in s.transitions[-1], str(s.transitions[-1:]))
 
 # the probe
 s = Sim(); day(s, batt=-20.0, m=1, soc=50.9); s.tick(340)
@@ -663,7 +673,7 @@ s.tick(6000, batt=-300.0)
 check("charge: the deficit budget brings it back", s.state == "shore" and "deficit:" in s.transitions[-1], str(s.transitions[-1:]))
 s = Sim(); day(s, soc=50.0, target=80, batt=300.0); s.tick(700)
 check("charge: 81 % of the need is not enough under the target -- no deliberate deficit while charging", s.state == "shore")
-s = Sim(); day(s, soc=50.0, target=80, batt=-50.0, voc=10.0, m=0, pre=0); s.tick(320)
+s = Sim(); day(s, soc=50.0, target=80, batt=-50.0, voc=10.0, m=0, pre=0); s.tick(620)
 check("charge at night: floor -- shore holds the bank, the sun does the charging", s.sustain == 1 and s.prefers[-1] == 0)
 s = Sim(); day(s, soc=30.0, target=80, batt=600.0); s.tick(700)
 check("charge under MIN_SOC: stays on shore, the sun still charges with no floor", s.state == "shore" and s.sustain == 0)
@@ -677,7 +687,7 @@ check("owner clicks Charge now by day: the toggle is left alone, no floor",
       and any(l.startswith("OWNER'S CHARGE NOW") for l in s.logs))
 s.tick(400, batt=2600.0, qdc=1500.0)              # the sun alone covers the need: 1150 W vs 433 W
 check("... and the boat stays on shore so the charger can work", s.state == "shore" and "[CHARGE NOW: owner]" in s.out.status_text, s.out.status_text)
-s.tick(320, voc=10.0, m=0, batt=2000.0, qdc=2000.0)
+s.tick(620, voc=10.0, m=0, batt=2000.0, qdc=2000.0)
 check("... through the night, still with no floor", s.out.daylight is False and s.sustain == 0 and s.eng.st["ownerCharge"])
 s.tick(2, soc=79.96)
 check("... until the bank is at the target: then the toggle is ours again", not s.eng.st["ownerCharge"] and s.prefers[-1] == 0)
