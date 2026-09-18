@@ -205,7 +205,7 @@ SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priorit
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 2 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5)
-check("engine version bumped", SP.ENGINE_VERSION == "4.5.3")
+check("engine version bumped", SP.ENGINE_VERSION == "4.5.4")
 Val = SP.Val
 
 
@@ -586,6 +586,18 @@ check("suspend that runs into the night: shore, no island to resume",
 check("... which moved no relay (the suspend was on shore already)", sum(1 for _, c in s.cmds if c == 1) == islands)
 s.tick(60, load=250.0, lavg=None)
 check("... and the load dropping afterwards resumes nothing", s.state == "shore" and s.cmd == 0)
+
+# what "limited" means (4.5.4): the flag counts only with the bank at the MPPTs' target
+s = Sim(); day(s, batt=-20.0, m=1, soc=50.9, batt_v=56.50, cvl=56.62); s.tick(640)
+check("limited flag with the bank 0.12 V under the target: not limited -- no probe, no tag",
+      s.boost_cmds == [] and "[limited]" not in s.out.status_text, "%s %s" % (s.boost_cmds, s.out.status_text))
+s.tick(60, batt_v=56.58)
+check("... the bank within 0.05 V of the target: the flag counts, the probe runs",
+      len(s.boost_cmds) == 1 and s.boost_cmds[0][1] == s.t["BOOST_V"], str(s.boost_cmds))
+s = Sim(); day(s, batt=600.0); s.tick(700)
+s.tick(601, batt=-300.0, m=1, pv=40.0, batt_v=56.50)
+check("island at dusk: the Brow's flickering flag with the bank 0.12 V under the target does not hold the dark rule",
+      s.state == "shore" and "dark" in s.transitions[-1], str(s.transitions[-1:]))
 
 # the probe
 s = Sim(); day(s, batt=-20.0, m=1, soc=50.9); s.tick(340)

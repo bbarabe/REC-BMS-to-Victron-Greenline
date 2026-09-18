@@ -46,7 +46,9 @@ What it does (see README.md "Solar Priority driver"):
     4.5.2: the island ends when night is declared (nothing to harvest), and
     a suspend at night ends on shore instead of resuming the island. 4.5.3:
     it also ends once the arrays make under DARK_W for DARK_MS with none
-    reading "limited" -- dusk by output.
+    reading "limited" -- dusk by output. 4.5.4: an array counts as limited
+    only with the bank within LIMITED_TOL_V of the MPPTs' target (the flag
+    alone flickers at dusk and stands 0.15 V under the target by day).
     HOLD_RULES = 0 leaves the 4.3 engine in charge of all of it.
 
 Differences from the flow (all deliberate):
@@ -86,7 +88,7 @@ import dbus.mainloop.glib
 from gi.repository import GLib
 
 VERSION = "4.3.1"
-ENGINE_VERSION = "4.5.3"
+ENGINE_VERSION = "4.5.4"
 BUSITEM = "com.victronenergy.BusItem"
 _CLOCK_BASE_MS = 10 ** 12      # see SolarPriorityDriver._ms
 
@@ -193,6 +195,14 @@ ENGINE_DEFAULTS = {
     # nothing about the sun). Dusk by output, well before the voltage
     # detector declares night; the deficit budget still carries the taper.
     "DARK_W": 50, "DARK_MS": 600000,
+    # 4.5.4 (owner, 2026-09-17 dusk): an MPPT's "voltage or current limited"
+    # flag is no proof the target is capping it -- the Brow flipped it every
+    # few seconds at 25-110 W with the bank 0.10-0.13 V under the target and
+    # the boat discharging, and by day the flag stood 97 % of the time from
+    # 0.15 V under the target with the output at the clear-day figure. The
+    # target caps an array only when the bank (shared voltage sense) is at
+    # it: "limited" counts only within LIMITED_TOL_V of the effective target.
+    "LIMITED_TOL_V": 0.05,
 }
 
 
@@ -754,7 +764,9 @@ class Engine:
             # slider moved into one-way): release its boost now
             st["holdProbe"] = 0
             boostMsg[0] = 0
-        limited = (m6 is not None and m6.v == 1) or (m7 is not None and m7.v == 1)
+        limitFlag = (m6 is not None and m6.v == 1) or (m7 is not None and m7.v == 1)
+        limited = (limitFlag and battV is not None and effCvl is not None
+                   and battV.v >= effCvl - t["LIMITED_TOL_V"])
         # The boat's need on the island is its DC loads plus what the Quattro
         # takes to invert the AC load; the sun, the DC loads and the MPPTs'
         # own losses carry across a transfer unchanged. So what reaches the

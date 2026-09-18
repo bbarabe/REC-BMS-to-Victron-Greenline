@@ -601,6 +601,15 @@ assumes the MPPTs at the target and the Quattro below it.
   dbus-recbms boost lifts the MPPTs' target, at most every 30 min. It ends the
   moment the rules are met (and the boat leaves), or once no array is limited
   and the output has been flat for 20 s, or at dbus-recbms's 120 s cap.
+- **What "limited" means (4.5.4).** An MPPT's *voltage or current limited*
+  flag alone is no proof the target is capping it: at dusk the Brow flipped it
+  every few seconds at 25-110 W with the bank 0.10-0.13 V under the target and
+  the boat discharging, and by day it stood 97 % of the time from 0.15 V under
+  the target with the output at the clear-day figure. Shared voltage sense is
+  on, so the chargers regulate on the bank's own voltage: the target caps an
+  array only when the bank is at it. An array therefore counts as limited only
+  with the bank within `limited_tol_v` (0.05 V) of the MPPTs' effective
+  target — for the probe, the dark rule's gate and the status tag alike.
 
 - **The owner's Charge now.** The toggle is the engine's to set at dawn and
   dusk, but once its own *prefer solar* has been seen to land, a toggle that
