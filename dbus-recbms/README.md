@@ -567,15 +567,20 @@ assumes the MPPTs at the target and the Quattro below it.
   charger loads the array whenever it can and the loaded voltage says nothing
   (09-17: 400 W at 63 V at 17:00, 2 W at 64 V at 19:20), so a voltage
   threshold alone ran 35-70 min late at dusk and 75 min early at dawn. Per
-  array: *sun* when the PV voltage stands `day_margin_v` (14 V) over the bank
-  or the array makes `day_w` (150 W); *twilight* when it makes under `night_w`
-  (50 W) with less margin (loaded, or just started and not tracking yet);
-  *dark* when its charger is off. Day once any array shows sun for `day_ms`
-  (10 min), night once every array shows twilight or dark for `night_ms`
-  (10 min). On the recorded days: dusk 40-55 min earlier than before, dawn
-  when the arrays cover the DC loads instead of at 1 W (a cold morning's Voc
-  runs ~5 % higher, so day then comes at ~50 W rather than 150 W — still when
-  the DC loads are covered), and a dull sky can make a night in the middle
+  array: *sun* when the PV voltage stands `day_margin_v` (14 V) over the bank,
+  or the array makes `day_w` (100 W; 150 W until 4.6.1), or (4.6.1) it makes
+  `night_w` while the bank stands at the MPPTs' target — held back, a charger
+  makes only what the boat takes, so its output is a floor on the light, not
+  a measure of it (09-18: the Quattro's night push had parked the bank 0.05 V
+  under the target and at 09:10 PDT both arrays stood throttled at 66 + 147 W,
+  +4..7 V over the bank — night by the 4.6.0 rules, two hours after sunrise);
+  *twilight* when it makes under `night_w` (50 W) with less margin (loaded, or
+  just started and not tracking yet); *dark* when its charger is off. Day once
+  any array shows sun for `day_ms` (10 min), night once every array shows
+  twilight or dark for `night_ms` (10 min). On the recorded days: dusk 40-55
+  min earlier than before, dawn when the arrays cover the DC loads instead of
+  at 1 W (a cold morning's Voc runs ~5 % higher, so day then comes at ~50 W
+  rather than 100 W — still when the DC loads are covered), and a dull sky can make a night in the middle
   of the day — harmlessly, since its watts still reach the bank above the
   floor, the floor never raises the bank, and the island needs far more sun
   than that. The tracker's sweeps to Voc only ever delay night, by at most

@@ -89,7 +89,7 @@ import dbus.mainloop.glib
 from gi.repository import GLib
 
 VERSION = "4.3.1"
-ENGINE_VERSION = "4.6.0"
+ENGINE_VERSION = "4.6.1"
 BUSITEM = "com.victronenergy.BusItem"
 _CLOCK_BASE_MS = 10 ** 12      # see SolarPriorityDriver._ms
 
@@ -193,15 +193,18 @@ ENGINE_DEFAULTS = {
     # 63 V at 17:00, 2 W at 64 V at 19:20 the same day). So: sun when the PV
     # voltage stands DAY_MARGIN_V over the bank (a parked or throttled array
     # in real light: Voc rises ~8 V per decade of irradiance on these
-    # arrays, +17..20 V in sun, ~+10 V at 1 %) OR the array makes DAY_W;
-    # twilight when it makes under NIGHT_W with less margin (loaded, or
-    # just started and not tracking yet); dark when the charger is off. Day
-    # once any array shows sun for DAY_MS, night once every array shows
-    # twilight or dark for NIGHT_MS. Recorded days: dusk 40-55 min before
-    # the old voltage rule, dawn when the arrays cover the DC loads instead
-    # of at 1 W, a dull morning stays night (its watts still reach the bank
-    # above the floor; the island needs far more than that anyway).
-    "DAY_MARGIN_V": 14, "DAY_W": 150, "NIGHT_W": 50, "DAY_MS": 600000, "NIGHT_MS": 600000,
+    # arrays, +17..20 V in sun, ~+10 V at 1 %) OR the array makes DAY_W OR
+    # (4.6.1) it makes NIGHT_W while the bank stands at its target -- a
+    # throttled charger makes only what the boat takes, so that is a floor
+    # on the light, not a measure; twilight when it makes under NIGHT_W with
+    # less margin (loaded, or just started and not tracking yet); dark when
+    # the charger is off. Day once any array shows sun for DAY_MS, night
+    # once every array shows twilight or dark for NIGHT_MS. Recorded days:
+    # dusk 40-55 min before the old voltage rule, dawn when the arrays cover
+    # the DC loads instead of at 1 W, a dull morning stays night (its watts
+    # still reach the bank above the floor; the island needs far more than
+    # that anyway). DAY_W 150 -> 100 with 4.6.1 (owner).
+    "DAY_MARGIN_V": 14, "DAY_W": 100, "NIGHT_W": 50, "DAY_MS": 600000, "NIGHT_MS": 600000,
     # Charge now by day only as a safety, under this SOC
     "SAFETY_SOC": 25, "SAFETY_EXIT_SOC": 27,
     # 4.5.4 (owner, 2026-09-17 dusk): an MPPT's "voltage or current limited"
@@ -337,11 +340,15 @@ def fresh_state(now, t):
     }
 
 
-def array_light(mode, pv_v, yield_w, batt_v, t):
+def array_light(mode, pv_v, yield_w, batt_v, t, at_target=False):
     """One array's word on the light (4.6.0): 'sun', 'twilight', 'dark', or
-    None when it says nothing (no reading, or 50..150 W at a modest margin).
+    None when it says nothing (no reading, or 50..100 W at a modest margin).
     mode is the MPPT's MppOperationMode (0 off, 1 limited, 2 tracking),
-    pv_v its PV voltage, yield_w its output, batt_v the bank's voltage."""
+    pv_v its PV voltage, yield_w its output, batt_v the bank's voltage,
+    at_target whether the bank stands at the MPPTs' target (4.6.1): a
+    charger held there makes only what the boat takes, so its output is a
+    floor on the light, not a measure of it -- NIGHT_W from a held-back
+    array is sun."""
     if mode is not None and mode == 0:
         return "dark"                       # cannot even hold the bank + 1 V
     if pv_v is None or yield_w is None or batt_v is None:
@@ -350,16 +357,19 @@ def array_light(mode, pv_v, yield_w, batt_v, t):
         return "sun"                        # high Voc parked/throttled, or real current
     if yield_w < t["NIGHT_W"]:
         return "twilight"                   # loaded (or just started) and nothing to give
+    if at_target and mode == 1:
+        return "sun"                        # held back and still covering the loads
     return None
 
 
-def daylight_update(st, now, arrays, batt_v, t):
+def daylight_update(st, now, arrays, batt_v, t, at_target=False):
     """Day or night from the arrays' voltage and current (array_light):
     True once any array has shown sun for DAY_MS, False once every reporting
     array has shown twilight or dark for NIGHT_MS, unchanged otherwise and
-    while no array reports. `arrays` is a list of (mode, pv_v, yield_w).
-    Returns 'dawn', 'dusk' or None."""
-    kinds = [k for k in (array_light(m, v, w, batt_v, t) for m, v, w in arrays) if k]
+    while no array reports. `arrays` is a list of (mode, pv_v, yield_w);
+    at_target says the bank stands at the MPPTs' target (their output is
+    then capped by the boat, not the light). Returns 'dawn', 'dusk' or None."""
+    kinds = [k for k in (array_light(m, v, w, batt_v, t, at_target) for m, v, w in arrays) if k]
     edge = None
     if not kinds:
         st["lightSince"] = st["darkSince"] = 0
@@ -726,7 +736,14 @@ class Engine:
         # ---- 4.4: day / night, the safety, HOLD, and what the island would cost ----
         arrays = [(m.v if m is not None else None, v.v if v is not None else None, y.v if y is not None else None)
                   for m, v, y in ((m6, voc6, y6), (m7, voc7, y7))]
-        edge = daylight_update(st, now, arrays, battV.v if battV is not None else None, t)
+        # the bank at the MPPTs' target (the 4.5.4 "limited" test) caps what
+        # they can show: 2026-09-18 the Quattro had parked the bank 0.05 V
+        # under the target overnight and at 09:10 PDT both arrays stood
+        # throttled at 66 + 147 W, +4..7 V over the bank -- night by the
+        # 4.6.0 rules with the sun up for two hours
+        atTarget = (battV is not None and effCvl is not None
+                    and battV.v >= effCvl - t["LIMITED_TOL_V"])
+        edge = daylight_update(st, now, arrays, battV.v if battV is not None else None, t, atTarget)
         if edge:
             self.log("%s (arrays: %s)" % (edge.upper(), ", ".join(
                 "%s %sW at %s over the bank" % (

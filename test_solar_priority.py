@@ -205,7 +205,7 @@ SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priorit
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 2 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5)
-check("engine version bumped", SP.ENGINE_VERSION == "4.6.0")
+check("engine version bumped", SP.ENGINE_VERSION == "4.6.1")
 Val = SP.Val
 
 
@@ -434,14 +434,23 @@ check("dusk: 64 V at 2 W is TWILIGHT (09-17 19:20)", A(2, 64.2, 2.0, 56.0, t0) =
 check("dawn, charger just started: 66 V at 0 W is TWILIGHT, not tracked yet (09-17 06:45)", A(1, 66.3, 0.0, 56.0, t0) == "twilight")
 check("dawn: 72 V at 56 W is SUN by the margin (09-17 08:05, arrays cover the DC loads)", A(2, 72.3, 56.0, 56.0, t0) == "sun")
 check("charger off is DARK whatever the voltage", A(0, 43.0, 0.0, 56.0, t0) == "dark" and A(0, None, None, None, t0) == "dark")
-check("dull sky: 63 V at 100 W says nothing (between night_w and day_w)", A(2, 63.0, 100.0, 56.0, t0) is None)
+check("dull sky: 63 V at 80 W says nothing (between night_w and day_w)", A(2, 63.0, 80.0, 56.0, t0) is None)
+check("100 W is day (4.6.1, owner: 150 -> 100)", A(2, 63.0, 100.0, 56.0, t0) == "sun")
+# 4.6.1: an array held at the target makes only what the boat takes (09-18 09:10 PDT:
+# the bank parked 0.05 V under the target by the Quattro's night push, both arrays
+# throttled at 66 + 147 W and +4..7 V over the bank, night by the 4.6.0 rules two
+# hours after sunrise)
+check("held at the target: the Brow's 52 W at +4.4 V is SUN", A(1, 60.4, 52.0, 55.99, t0, at_target=True) == "sun")
+check("... the same reading with the bank under the target says nothing", A(1, 60.4, 52.0, 55.99, t0) is None)
+check("... a TRACKING array at 52 W is not held back: says nothing", A(2, 60.4, 52.0, 55.99, t0, at_target=True) is None)
+check("... under night_w at the target is still twilight", A(1, 57.0, 30.0, 55.99, t0, at_target=True) == "twilight")
 check("no reading says nothing", A(2, None, 10.0, 56.0, t0) is None and A(None, 63.0, None, 56.0, t0) is None)
 st = {"daylight": None, "lightSince": 0, "darkSince": 0}
 D = SP.daylight_update
 SUN, TWI, DARK = [(2, 70.0, 400.0)], [(2, 62.0, 5.0), (2, 61.0, 3.0)], [(0, 1.0, 0.0), (0, 1.0, 0.0)]
 edges = [D(st, 1000 * k, SUN, 56.0, t0) for k in range(1, 700)]
 check("dawn: once, after DAY_MS of sun", edges.count("dawn") == 1 and edges.index("dawn") == 600 and st["daylight"] is True)
-check("a cloud (100 W, modest margin) changes nothing", D(st, 800000, [(2, 63.0, 100.0)], 56.0, t0) is None and st["daylight"] is True)
+check("a cloud (80 W, modest margin) changes nothing", D(st, 800000, [(2, 63.0, 80.0)], 56.0, t0) is None and st["daylight"] is True)
 check("a short twilight reading changes nothing", D(st, 801000, TWI, 56.0, t0) is None and D(st, 802000, SUN, 56.0, t0) is None and st["daylight"] is True)
 check("one array in sun is day even with the other dark", D(st, 803000, [(0, 1.0, 0.0), (2, 70.0, 400.0)], 56.0, t0) is None and st["daylight"] is True)
 edges = [D(st, 900000 + 1000 * k, TWI, 56.0, t0) for k in range(700)]
@@ -608,6 +617,17 @@ s = Sim(); day(s, batt=600.0); s.tick(700)
 s.tick(601, batt=-300.0, m=1, pv=40.0, batt_v=56.50)
 check("island at dusk: the Brow's flickering flag at 40 W and +3.5 V is twilight -- night, home",
       s.state == "shore" and "night" in s.transitions[-1], str(s.transitions[-1:]))
+
+# 4.6.1: the morning of 09-18 -- floor on, the Quattro parked the bank 0.05 V under
+# the MPPTs' target, both arrays throttled under day_w. Night for the 4.6.0 rules.
+s = Sim(); day(s, batt=-50.0, voc=10.0, m=0, soc=54.6, target=55, pre=0); s.tick(620)
+check("night first", s.out.daylight is False and s.sustain == 1)
+s.tick(610, batt=90.0, m=1, pv=66.0, voc=60.4, batt_v=56.57, qdc=0.0)
+check("dawn: a throttled array at 66 W, +4 V over a bank at the target, is day after day_ms",
+      s.out.daylight is True and any(l.startswith("DAWN (arrays: limited 66W at +3.8V") for l in s.logs), str([l for l in s.logs if "DAWN" in l]))
+s = Sim(); day(s, batt=-50.0, voc=10.0, m=0, soc=54.6, target=55, pre=0); s.tick(620)
+s.tick(610, batt=-20.0, m=1, pv=66.0, voc=60.4, batt_v=56.50, qdc=0.0)
+check("... the same array with the bank 0.12 V under the target: still night (not held back)", s.out.daylight is False)
 
 # the probe
 s = Sim(); day(s, batt=-20.0, m=1, soc=50.9); s.tick(340)
