@@ -205,7 +205,7 @@ SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priorit
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 2 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5)
-check("engine version bumped", SP.ENGINE_VERSION == "4.6.1")
+check("engine version bumped", SP.ENGINE_VERSION == "4.7.0")
 Val = SP.Val
 
 
@@ -486,13 +486,55 @@ s.tick(125, batt=200.0, qdc=-400.0)
 check("HOLD: prediction checked against the island 2 min on",
       any(l.startswith("prediction check: predicted batt +217W, observed +2") for l in s.logs), str(s.logs[-3:]))
 
-s = Sim(); day(s, batt=250.0); s.tick(700)
-check("HOLD: 300 W of sun under 75 % of a 433 W need: stays", s.state == "shore" and s.cmd == 0)
+# 4.7.0: the second way out is a ratio -- the deficit budget (0.5 % of 1440 Ah at 56.6 V = 408 Wh)
+# over the deficit the island would start with, in hours, against HOLD_CARRY_H (3)
+check("config: the carry rule replaces the 75 % fraction",
+      scfg.engine["HOLD_CARRY_H"] == 3 and "HOLD_FRAC" not in scfg.engine and scfg.engine["HOLD_NEED_AVG_MS"] == 900000)
+s = Sim(); day(s, batt=200.0, soc=50.3); s.tick(700)
+check("HOLD: a 183 W deficit would eat the budget in 2.2 h: stays, bank over the target or not",
+      s.state == "shore" and s.cmd == 0 and "carry 2.2h" in s.out.status_text, s.out.status_text)
 s = Sim(); day(s, batt=300.0, soc=50.1); s.tick(700)
-check("HOLD: 350 W is 81 % of the need, but the bank is only 0.1 over: stays", s.state == "shore")
+check("HOLD: an 83 W deficit the budget carries 4.9 h, but the bank is only 0.1 over: stays", s.state == "shore")
 s = Sim(); day(s, batt=300.0, soc=50.3); s.tick(700)
-check("HOLD: 81 % of the need with the bank 0.3 over: island, the band pays the rest",
-      s.state == "solar" and any("81% of it, bank over target" in tr for tr in s.transitions), str(s.transitions))
+check("HOLD: the budget carries the deficit 4.9 h with the bank 0.3 over: island, the band pays the rest",
+      s.state == "solar" and any("the budget carries the 83W deficit 4.9 h, bank over target" in tr for tr in s.transitions),
+      str(s.transitions))
+s = Sim(); day(s, batt=240.0, soc=50.3); s.tick(700)
+check("HOLD: 2.9 h of carry (143 W deficit): stays", s.state == "shore", s.out.status_text)
+s = Sim(); day(s, batt=250.0, soc=50.3); s.tick(700)
+check("HOLD: 3.1 h of carry (133 W deficit): leaves", s.state == "solar", str(s.transitions))
+s = Sim(HOLD_CARRY_H=2); day(s, batt=200.0, soc=50.3); s.tick(700)
+check("HOLD: hold_carry_h is the owner's number (2 h takes the 183 W deficit)", s.state == "solar", str(s.transitions))
+
+# 4.7.0: the need the leave rules judge is on the AC load's 15 min mean
+s = Sim(); day(s, batt=300.0, soc=50.3, load=1850.0); s.tick(150)     # the water heater, 2.5 min
+s.tick(560, load=250.0)
+check("need: a short heavy load is remembered for 15 min -- no departure on the dip after it",
+      s.state == "shore" and s.out.need_w > 700, "%s need %.0f" % (s.state, s.out.need_w))
+s.tick(290)
+check("need: ... still held with its last half minute in the window (2.9 h)", s.state == "shore", s.out.status_text)
+s.tick(100)
+check("need: ... and gone 15 min after it ended: leaves", s.state == "solar", s.out.status_text)
+s = Sim(); day(s, batt=430.0, soc=50.0); s.tick(604)
+s.tick(60, load=450.0)                                                # the fridge comes on as the day is declared
+check("need: the fridge coming on does not swing it (480 W of sun against a 15 min need of ~440 W: leaves)",
+      s.state == "solar" and any(tr.startswith("-> SOLAR (hold: solar 480W vs need 439W,") for tr in s.transitions), str(s.transitions))
+check("need: ... while the prediction it logs is on the load of the moment (-164 W)",
+      abs(s.eng.st["predW"] - (480 - (50 + 120 + 450 / 0.95))) < 3, str(s.eng.st["predW"]))
+
+# the morning of 2026-09-21 (the first day that started at the target): bank 0.6 over, arrays held back,
+# probes finding 200 W of a 437 W need at 09:24 PDT and 255 W of 380 W at 09:54 (75 % of it was 285 W: stayed)
+s = Sim(); day(s, soc=65.6, target=65, batt=-5.0, m=1, qdc=25.0, dcl=55.0, load=248.9, pv=55.0); s.tick(640)
+s.tick(60, batt=170.0, m=2)
+check("2026-09-21 09:24: 200 W of a 437 W need, the budget carries it 1.7 h: stays",
+      s.state == "shore" and any(l.startswith("hold probe done") and "solar 200W of need 437W" in l for l in s.logs), str(s.logs[-2:]))
+s = Sim(); day(s, soc=65.6, target=65, batt=-5.0, m=1, qdc=25.0, dcl=55.0, load=194.75, pv=55.0); s.tick(590)
+check("status: no carry figure while the arrays are held back (that 'solar' is not the sun)",
+      "[limited]" in s.out.status_text and "carry" not in s.out.status_text, s.out.status_text)
+s.tick(50)
+s.tick(60, batt=225.0, m=2)
+check("2026-09-21 09:54: 255 W of a 380 W need, the budget carries it 3.3 h: leaves an hour before it did",
+      s.state == "solar" and any("the budget carries the 125W deficit 3.3 h" in tr for tr in s.transitions), str(s.transitions))
 s = Sim(); day(s, batt=600.0, qdc=500.0); s.tick(700)
 check("HOLD: what the Quattro puts into the bank is not the sun's", s.state == "shore")
 s = Sim(); day(s, batt=4000.0, load=3000.0); s.tick(700)
@@ -643,10 +685,10 @@ s.tick(60, batt=150.0, m=2)
 check("probe: not limited, output flat, need not met -> released, stays",
       s.state == "shore" and s.boost_cmds[-1][1] == 0 and len(s.boost_cmds) == 2
       and any(l.startswith("hold probe done") for l in s.logs), str(s.boost_cmds))
-s.tick(1500, batt=-20.0, m=1)
-check("probe: not again inside 30 minutes", len(s.boost_cmds) == 2)
-s.tick(400)
-check("probe: again after 30 minutes", len(s.boost_cmds) == 3 and s.boost_cmds[-1][1] > 0)
+s.tick(700, batt=-20.0, m=1)
+check("probe: not again inside 15 minutes", len(s.boost_cmds) == 2)
+s.tick(200)
+check("probe: again after 15 minutes (4.7.0: was 30)", len(s.boost_cmds) == 3 and s.boost_cmds[-1][1] > 0)
 s = Sim(); day(s, batt=-20.0, m=1, soc=50.1); s.tick(640)
 for k in range(12):                                 # a tracker waking slowly: reads "tracking", output still rising
     s.tick(10, batt=20.0 + 25 * k, m=2)

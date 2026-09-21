@@ -597,10 +597,35 @@ assumes the MPPTs at the target and the Quattro below it.
   is simply measured. Need = DC loads + `inv_idle_w` + AC load / `inv_eff`
   (the Quattro's AC reading is no guide: inverting, it reports its DC draw,
   ~100 W over the same loads read on shore). Leave when the sun covers the
-  need, or `hold_frac` (75 %) of it with the bank `hold_mid_pct` (0.25 %) over
-  the target — 30 s confirmation, the usual cooldown, never under a
-  heater-class load. No trial on the island; the departure logs the math and
-  a *prediction check* two minutes on logs predicted vs observed bank power.
+  need, or — with the bank `hold_mid_pct` (0.25 %) over the target — when the
+  deficit budget below would carry the deficit the island starts with for
+  `hold_carry_h` hours (3) — 30 s confirmation, the usual cooldown, never
+  under a heater-class load. No trial on the island; the departure logs the
+  math and a *prediction check* two minutes on logs predicted vs observed bank
+  power.
+- **The carry rule (4.7.0).** Until 4.7.0 the second way out was "75 % of the
+  need". 2026-09-21 was the first day that *started* at the target: the gain
+  band was full by 09:00 PDT after 190 Wh (two thirds of its 0.09 V is charge
+  polarization, it is no 800 Wh buffer), and from then the arrays stood held
+  back at 25-160 W under 250-340 W of sun until the boat left at 10:54 — every
+  such morning would go the same way. The owner asked for a ratio ("the
+  deficit will eat the buffer in 2+ hours"). Replayed on the unthrottled
+  mornings of 09-19 and 09-20 and on the 21st's probes: the morning sun here
+  sits on a 2.5-3 h plateau at 55-75 % of the need (the Brow array is shaded
+  until ~11:40 PDT), so with 2 h the budget ran out 15 minutes before the sun
+  took over (a second relay pair for ~40 Wh more), while 3 h left 65-80 min
+  before the 75 % rule on two mornings (−380 Wh of shore, +560 Wh of sun on
+  the 20th) and with it on the third, each on one departure. The status line
+  shows the ratio, `solar 258W need 364W carry 3.8h`, whenever "solar" is the
+  sun (not while the arrays are held back between probes).
+- **The need is on a 15 min load mean (4.7.0).** On the 60 s mean the need
+  swung 344-475 W between probes as the fridge cycled, which alone kept the
+  boat on shore at 10:24 on the 21st. `hold_need_avg_ms` (15 min) steadies
+  what both leave rules judge, the status line and `/NeedW`; a short heavy
+  load is remembered that long (the water heater: +270 W for 15 min), which
+  delays a departure and never brings one forward. The prediction a departure
+  logs stays on the load of the moment, so the check two minutes on still
+  tunes `inv_idle_w` / `inv_eff`.
 - **Heater-class loads.** Since 4.5.1 suspend starts at `suspend_load_w`
   2500 W (was 1000): the water heater's 1.7 kW for two minutes is 57 Wh,
   which the deficit budget carries and the sun repays within minutes by day,
@@ -616,9 +641,14 @@ assumes the MPPTs at the target and the Quattro below it.
   dawn must not wait on it. A suspend that runs into the night ends on shore
   instead of resuming the island.
 - **The only probe.** An array reports *limited* on shore by day: the
-  dbus-recbms boost lifts the MPPTs' target, at most every 30 min. It ends the
-  moment the rules are met (and the boat leaves), or once no array is limited
-  and the output has been flat for 20 s, or at dbus-recbms's 120 s cap.
+  dbus-recbms boost lifts the MPPTs' target, at most every 15 min (4.7.0; 30
+  before). It ends the moment the rules are met (and the boat leaves), or once
+  no array is limited and the output has been flat for 20 s, or at
+  dbus-recbms's 120 s cap. With the band full the probe is the only moment
+  the leave rules see the sun — between probes "solar" is the held-back
+  25-55 W — so its interval is how late a departure can be. One costs a
+  minute, no relay and a few Wh that go into the bank (2026-09-21, 3 s
+  capture: tracking within 10 s, plateau 40 s in, done at 58 s).
 - **What "limited" means (4.5.4).** An MPPT's *voltage or current limited*
   flag alone is no proof the target is capping it: at dusk the Brow flipped it
   every few seconds at 25-110 W with the bank 0.10-0.13 V under the target and

@@ -49,7 +49,11 @@ What it does (see README.md "Solar Priority driver"):
     the MPPTs' target (the flag alone flickers at dusk and stands 0.15 V
     under the target by day). 4.6.0: night is what the arrays' voltage and
     current say (array_light), no longer the open-circuit voltage alone,
-    which ran 35-70 min late at dusk and 75 min early at dawn.
+    which ran 35-70 min late at dusk and 75 min early at dawn. 4.7.0: the
+    "75 % of it" above is now a ratio -- with the bank over the target the
+    boat leaves when the deficit budget would carry the present deficit for
+    HOLD_CARRY_H hours; the need both leave rules judge is on a 15 min load
+    mean; the probe runs every 15 min (it is the only look at a held-back sun).
     HOLD_RULES = 0 leaves the 4.3 engine in charge of all of it.
 
 Differences from the flow (all deliberate):
@@ -89,7 +93,7 @@ import dbus.mainloop.glib
 from gi.repository import GLib
 
 VERSION = "4.3.1"
-ENGINE_VERSION = "4.6.1"
+ENGINE_VERSION = "4.7.0"
 BUSITEM = "com.victronenergy.BusItem"
 _CLOCK_BASE_MS = 10 ** 12      # see SolarPriorityDriver._ms
 
@@ -163,10 +167,27 @@ ENGINE_DEFAULTS = {
     # is decided on the SOC and on measured power, not on voltages. 0 = the
     # 4.3 engine (probe / harvest / burn-down) runs there instead.
     "HOLD_RULES": 1,
-    # leave shore when the sun covers the boat's need, or covers HOLD_FRAC of
-    # it while the bank stands HOLD_MID_PCT over the target (the band pays
-    # the rest: early morning, evening, passing clouds)
-    "HOLD_MID_PCT": 0.25, "HOLD_FRAC": 0.75,
+    # leave shore when the sun covers the boat's need, or -- with the bank
+    # HOLD_MID_PCT over the target, so the band pays -- when the deficit
+    # budget below would carry the present deficit for HOLD_CARRY_H hours.
+    # 4.7.0 (owner, 2026-09-21: "a ratio ... the deficit will eat the buffer
+    # in 2+ hours"); it was "75 % of the need". The first day that STARTED at
+    # the target filled the band by 09:00 PDT with 190 Wh, and the arrays then
+    # stood held back at 25-160 W under 250-340 W of sun until 10:54. Replayed
+    # on the unthrottled mornings of 09-19 / 09-20 and on that day's probes:
+    # the morning sun sits on a 2.5-3 h plateau at 55-75 % of the need (the
+    # Brow array is shaded until ~11:40 PDT), so 2 h comes true to the minute
+    # and the budget runs out 15 min before the sun takes over (a second
+    # relay pair); 3 h left 65-80 min before the 75 % rule on two of the
+    # three mornings and with it on the third, each on one departure.
+    "HOLD_MID_PCT": 0.25, "HOLD_CARRY_H": 3,
+    # The need those rules judge is on the AC load's mean over this long
+    # (4.7.0): the 60 s mean swung the need 344..475 W between probes as the
+    # fridge cycled, and a departure is a bet on the next hours, which the
+    # budget integrates anyway. A short heavy load is remembered that long
+    # (the water heater: +270 W for 15 min) -- it delays a departure, it never
+    # brings one forward. The prediction check keeps the 60 s load.
+    "HOLD_NEED_AVG_MS": 900000,
     # return to shore once the island has drawn this share of the bank below
     # its best point since it left (an energy, as in the 3.x engine: deficit
     # adds, surplus repays, never under zero) -- 0.5 % of 1440 Ah is ~400 Wh
@@ -184,7 +205,11 @@ ENGINE_DEFAULTS = {
     # dbus-recbms boost, which caps it at 120 s and at the ceiling) at most
     # every PROBE_INTERVAL_MS; stop as soon as the rules are met (and leave),
     # or once no array is limited and the output has stopped rising.
-    "PROBE_INTERVAL_MS": 1800000, "PROBE_MIN_MS": 20000, "PROBE_FLAT_MS": 20000,
+    # 4.7.0 (owner): every 15 min, was 30. With the band full the probe is
+    # the only moment the leave rules see the sun, so the interval is how
+    # late a departure can be; one costs a minute, no relay, a few Wh that
+    # go into the bank (boat, 2026-09-21: plateau 40 s in, done at 58 s).
+    "PROBE_INTERVAL_MS": 900000, "PROBE_MIN_MS": 20000, "PROBE_FLAT_MS": 20000,
     "PROBE_READY_MS": 10000,
     # day / night from each array's voltage AND current (4.6.0, owner
     # 2026-09-17: "there has to be a relationship between V and I"). An
@@ -337,6 +362,7 @@ def fresh_state(now, t):
         "preferWanted": None, "preSeen": False, "ownerCharge": False,
         "predWin": [], "holdProbe": 0, "probeRef": None,
         "drawdownWh": 0.0, "drawdownTs": 0, "predW": None, "predCheckAt": 0,
+        "loadLong": [],     # 4.7.0: [minute, sum, n] buckets of the AC load
     }
 
 
@@ -819,21 +845,41 @@ class Engine:
         # deliver -- and that less the need is the bank power the island
         # will see. (The Quattro's AC reading is no guide: inverting, it
         # reports its DC draw, ~100 W over the same loads read on shore.)
+        # 4.7.0: the need the leave rules judge (needM) takes the AC load's
+        # mean over HOLD_NEED_AVG_MS, one sample a tick in minute buckets;
+        # the prediction a departure logs, and is checked against two
+        # minutes later, stays on the load of the moment.
+        lw = st["loadLong"]
+        if loadNow is not None:
+            minute = now - now % 60000
+            if lw and lw[-1][0] == minute:
+                lw[-1][1] += loadNow.v
+                lw[-1][2] += 1
+            else:
+                lw.append([minute, loadNow.v, 1])
+        while lw and lw[0][0] < now - t["HOLD_NEED_AVG_MS"]:
+            lw.pop(0)
         solarM = needM = predM = None
         if batt is not None and loadAvg is not None:
             inv = t["INV_IDLE_W"] + loadAvg.v / t["INV_EFF"]
+            loadLong = sum(b[1] for b in lw) / sum(b[2] for b in lw) if lw else loadAvg.v
+            invLong = t["INV_IDLE_W"] + loadLong / t["INV_EFF"]
             qd = inp.q_dc.v if (inp.q_dc is not None and vebusAlive) else 0.0
             dcl = max(0.0, inp.dc_sys.v) if inp.dc_sys is not None else 0.0
             pw = st["predWin"]
-            pw.append((now, batt.v - qd + dcl, dcl + inv))
+            pw.append((now, batt.v - qd + dcl, dcl + inv, dcl + invLong))
             while pw and pw[0][0] < now - t["EVAL_MS"]:
                 pw.pop(0)
             if len(pw) > 60:
                 del pw[:len(pw) - 60]
             if len(pw) >= 5:
                 solarM = sum(x[1] for x in pw) / len(pw)
-                needM = sum(x[2] for x in pw) / len(pw)
-                predM = solarM - needM
+                needM = sum(x[3] for x in pw) / len(pw)
+                predM = solarM - sum(x[2] for x in pw) / len(pw)
+        # the deficit budget (HOLD): what the island may draw below its best
+        # point before it comes home, and what the leave rule divides
+        bankAh = inp.bank_ah.v if inp.bank_ah is not None else t["BANK_AH"]
+        budgetWh = t["HOLD_DEFICIT_PCT"] / 100.0 * bankAh * (battV.v if battV is not None else 55.0)
 
         needW = 0.0
         if not enabled:
@@ -875,14 +921,18 @@ class Engine:
                 # By day the Quattro prefers solar, so everything the arrays
                 # make reaches the bank and is simply measured; the MPPTs'
                 # target stands a band over the Quattro's (dbus-recbms solar
-                # gain). Leave when the sun covers the need, or most of it
-                # with the bank over the target. No trial on the island: the
-                # deficit budget pays for a wrong call.
+                # gain). Leave when the sun covers the need, or -- the bank
+                # over the target -- when the budget would carry the deficit
+                # for HOLD_CARRY_H hours (4.7.0). No trial on the island:
+                # the deficit budget pays for a wrong call.
                 shoreMissing = (feed.v == 240 and sinceTrans > t["FEEDBACK_GRACE_MS"])
                 light = st["daylight"] is True
                 r1 = solarM is not None and solarM >= needM
-                r2 = (solarM is not None and soc.v >= tgt.v + t["HOLD_MID_PCT"]
-                      and solarM >= t["HOLD_FRAC"] * needM)
+                # hours the budget would carry the deficit the island starts with
+                carryH = (budgetWh / (needM - solarM)
+                          if (solarM is not None and solarM < needM) else None)
+                r2 = (carryH is not None and soc.v >= tgt.v + t["HOLD_MID_PCT"]
+                      and carryH >= t["HOLD_CARRY_H"])
                 go = (light and not shoreMissing and soc.v >= t["MIN_SOC"]
                       and loadNow.v < t["SUSPEND_LOAD_W"] and (r1 or r2)
                       and not st["ownerCharge"])
@@ -936,13 +986,18 @@ class Engine:
                     st["predW"] = predM
                     st["predCheckAt"] = now + t["PRED_CHECK_MS"]
                     enter_solar("hold: solar %.0fW vs need %.0fW%s, predicted batt %+.0fW, SOC %.2f%% / %.0f%%" % (
-                        solarM, needM, "" if r1 else " (%.0f%% of it, bank over target)" % (100 * solarM / needM),
+                        solarM, needM,
+                        "" if r1 else " (the budget carries the %.0fW deficit %.1f h, bank over target)" % (
+                            needM - solarM, carryH),
                         predM, soc.v, tgt.v), keep_backoff=True)
                 else:
                     status[0] = "red" if shoreMissing else "blue"
                     sx = "NO SHORE? | " if shoreMissing else "SHORE | "
                     if solarM is not None:
                         sx += "solar %.0fW need %.0fW" % (solarM, needM)
+                        if carryH is not None and not limited:
+                            # (held back, "solar" is not the sun: no ratio to show)
+                            sx += " carry %.1fh" % min(carryH, 99.9)
                     else:
                         sx += "measuring"
                     sx += " SOC %.2f%%" % soc.v
@@ -1259,8 +1314,7 @@ class Engine:
                 # so the bank does not leave shore above it.
                 budget = 0.0
                 if hold:
-                    ah = inp.bank_ah.v if inp.bank_ah is not None else t["BANK_AH"]
-                    budget = t["HOLD_DEFICIT_PCT"] / 100.0 * ah * (battV.v if battV is not None else 55.0)
+                    budget = budgetWh
                     if st["drawdownTs"]:
                         hours = min(max(0.0, now - st["drawdownTs"]), 5000) / 3600000.0
                         st["drawdownWh"] = max(0.0, st["drawdownWh"] - batt.v * hours)
