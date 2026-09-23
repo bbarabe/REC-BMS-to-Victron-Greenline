@@ -54,6 +54,9 @@ What it does (see README.md "Solar Priority driver"):
     boat leaves when the deficit budget would carry the present deficit for
     HOLD_CARRY_H hours; the need both leave rules judge is on a 15 min load
     mean; the probe runs every 15 min (it is the only look at a held-back sun).
+    4.8.0: while charging, after solar noon (GPS longitude + UTC), the island
+    comes home on CHARGE_PM_DEFICIT_PCT instead: no sun repays an afternoon
+    deficit, and the night floor keeps it.
     HOLD_RULES = 0 leaves the 4.3 engine in charge of all of it.
 
 Differences from the flow (all deliberate):
@@ -92,8 +95,8 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-VERSION = "4.3.1"
-ENGINE_VERSION = "4.7.0"
+VERSION = "4.4.0"
+ENGINE_VERSION = "4.8.0"
 BUSITEM = "com.victronenergy.BusItem"
 _CLOCK_BASE_MS = 10 ** 12      # see SolarPriorityDriver._ms
 
@@ -192,6 +195,18 @@ ENGINE_DEFAULTS = {
     # its best point since it left (an energy, as in the 3.x engine: deficit
     # adds, surplus repays, never under zero) -- 0.5 % of 1440 Ah is ~400 Wh
     "HOLD_DEFICIT_PCT": 0.5, "BANK_AH": 1440,
+    # 4.8.0 (owner, 2026-09-22: "in charging, be a little more aggressive
+    # switching back to shore in the early evening"): while CHARGING, after
+    # solar noon, the budget is this instead. A morning deficit is repaid by
+    # a rising sun; an afternoon one is not, and the night floor then keeps
+    # it: 09-18 and 09-19 stayed out until dusk (19:02 PDT) and gave back
+    # ~0.3 kWh, the last hour ~290 Wh with no sun; 09-22 ~0.4 kWh. On shore
+    # by day the sun goes to the bank and shore carries the AC load, so each
+    # of those hours cost the bank the Quattro's whole draw (~380 W). 0.15 %
+    # of 1440 Ah is ~120 Wh: a water-heater cycle (50-70 Wh) rides, a sunset
+    # does not. No GPS longitude keeps HOLD_DEFICIT_PCT all day; so does
+    # setting this to it.
+    "CHARGE_PM_DEFICIT_PCT": 0.15,
     # the boat's need on the island: DC loads + what the Quattro takes to
     # invert the AC load. 20 recorded transfers fit 90 W / 0.95, five at 15 s
     # resolution (2026-09-17) nearer 135 W; every departure logs predicted
@@ -310,6 +325,8 @@ class Inputs:
               # HOLD rules (4.4): DC loads, the Quattro's prefer-renewable
               # toggle as it reads, the bank's size
               "dc_sys", "pre", "bank_ah",
+              # 4.8.0: the GPS longitude, for solar time (any gps service)
+              "lon",
               # shore-input resolution only (the engine never reads these)
               "ac1_available", "ac2_available", "ac1_type", "ac2_type")
 
@@ -320,6 +337,7 @@ class Inputs:
         self.lead_fault = ""
         self.p_rated = 1800.0
         self.feed_shore = 0      # ActiveInput value meaning "shore present"
+        self.utc = None          # the wall clock, s (4.8.0: solar time only)
 
 
 class Outputs:
@@ -410,6 +428,16 @@ def daylight_update(st, now, arrays, batt_v, t, at_target=False):
         if now - st["darkSince"] >= t["NIGHT_MS"] and st["daylight"] is not False:
             st["daylight"], edge = False, "dusk"
     return edge
+
+
+def solar_afternoon(utc_s, lon):
+    """True from local solar noon to midnight, False before noon, None when
+    the clock or the longitude is unknown (4.8.0). Mean solar time: 15
+    degrees of longitude an hour; the equation of time (up to 16 min) is
+    left out -- the rule it gates acts hours after noon."""
+    if utc_s is None or lon is None:
+        return None
+    return (utc_s / 3600.0 + lon / 15.0) % 24.0 >= 12.0
 
 
 def prefer_wanted(enabled, safety, daylight, managed=True):
@@ -879,7 +907,10 @@ class Engine:
         # the deficit budget (HOLD): what the island may draw below its best
         # point before it comes home, and what the leave rule divides
         bankAh = inp.bank_ah.v if inp.bank_ah is not None else t["BANK_AH"]
-        budgetWh = t["HOLD_DEFICIT_PCT"] / 100.0 * bankAh * (battV.v if battV is not None else 55.0)
+        # 4.8.0: charging, after solar noon -- nothing repays it (the tunable)
+        pm = owc and bool(solar_afternoon(inp.utc, inp.lon.v if inp.lon is not None else None))
+        budgetWh = ((t["CHARGE_PM_DEFICIT_PCT"] if pm else t["HOLD_DEFICIT_PCT"]) / 100.0
+                    * bankAh * (battV.v if battV is not None else 55.0))
 
         needW = 0.0
         if not enabled:
@@ -1366,9 +1397,10 @@ class Engine:
                         status[0] = "blue"
                     elif st["drawdownWh"] >= budget:
                         escalateBackoff()
-                        toShore("deficit: %.0f Wh drawn below the island's best, budget %.0f Wh "
+                        toShore("deficit: %.0f Wh drawn below the island's best, budget %.0f Wh%s "
                                 "(batt %.0fW, PV %.0fW, load %.0fW)" % (
-                                    st["drawdownWh"], budget, batt.v, pvNow, loadNow.v))
+                                    st["drawdownWh"], budget, " (charging, afternoon)" if pm else "",
+                                    batt.v, pvNow, loadNow.v))
                         status[0] = "blue"
                     else:
                         status[0] = "yellow" if st["drawdownWh"] >= budget / 2 else "green"
@@ -1581,6 +1613,10 @@ INPUT_MAP = {
     ("system", "/Dc/System/Power"):       ("dc_sys", _rng(-5000, 20000)),
     ("vebus", "/Dc/0/PreferRenewableEnergy"): ("pre", lambda v: v in (0, 1, 2)),
     ("battery", "/InstalledCapacity"):    ("bank_ah", _rng(10, 10000)),
+    # 4.8.0: solar time for the afternoon budget. Any gps service, taken only
+    # while its /Fix is 1 (a 0 before the fix would be Greenwich); the last
+    # longitude stands through a lost fix.
+    ("gps", "/Position/Longitude"):       ("lon", _rng(-180, 180)),
     # shore-input resolution. This Quattro firmware publishes
     # /Ac/State/AcIn1Available and AcIn2Available (read 2026-09-14); one
     # without them leaves the fields None -- unknown, never "absent".
@@ -1644,6 +1680,7 @@ class SolarPriorityDriver:
                 tree.setdefault("com.victronenergy." + cls, {})[p] = dummy
         for cls in ("solarcharger", "vebus", "battery"):
             tree["com.victronenergy." + cls]["/DeviceInstance"] = dummy
+        tree["com.victronenergy.gps"]["/Fix"] = dummy     # gates the longitude
         self.monitor = DbusMonitor(tree, valueChangedCallback=self._value_changed,
                                    deviceAddedCallback=self._device_added,
                                    deviceRemovedCallback=self._device_removed)
@@ -1951,6 +1988,8 @@ class SolarPriorityDriver:
             return
         if not math.isfinite(v) or not valid(v):
             return
+        if field == "lon" and self.monitor.get_value(service, "/Fix") != 1:
+            return
         setattr(self.inp, field, Val(v, now))
         if field == "load_now":
             # Time-based 60 s rolling window (flow: "Store AC Load")
@@ -1978,6 +2017,10 @@ class SolarPriorityDriver:
         if path == "/RecBms/LeadFault":
             self._store_fault(service, changes.get("Value"))
             return
+        if path == "/Fix":
+            # a position that arrived before its fix, and has not moved since
+            path = "/Position/Longitude"
+            changes = {"Value": self.monitor.get_value(service, path)}
         self._store(service, path, changes.get("Value"), now)
 
     def _seed_inputs(self):
@@ -2105,6 +2148,7 @@ class SolarPriorityDriver:
             s["/SolarPriority/StatusFill"] = "grey"
             return
 
+        self.inp.utc = time.time()
         try:
             out = self.engine.tick(now, self.inp)
         except Exception:

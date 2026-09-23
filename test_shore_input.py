@@ -229,6 +229,31 @@ tick(d, 2)
 check("Solar Priority off: the toggle is left alone",
       d.sw["/SolarPriority/PreferRenewable"] is None and [w for w in m.writes if w[1] == PRE] == [])
 
+GPS = "com.victronenergy.gps.socketcan_can0_vi0_uc1267922"
+d, m = driver(types_=(0, 3), active=1)
+check("4.8.0: the driver watches every gps service's longitude and fix",
+      {"/Position/Longitude", "/Fix"} <= set(m.tree.get("com.victronenergy.gps", {})))
+m.add(GPS, 0, {"/Position/Longitude": None, "/Fix": 0})
+m.push(GPS, "/Position/Longitude", 0.0)
+check("... a longitude without a fix is not taken (0 would be Greenwich)", d.inp.lon is None)
+m.push(GPS, "/Fix", 1)
+m.push(GPS, "/Position/Longitude", -122.39)
+tick(d)
+check("... which reaches the engine, and the wall clock with it",
+      d.inp.lon is not None and d.inp.lon.v == -122.39 and d.inp.utc == SP.time.time(),
+      "%s %s" % (d.inp.lon and d.inp.lon.v, d.inp.utc))
+m.push(GPS, "/Position/Longitude", None)
+m.push(GPS, "/Fix", 0)
+m.push(GPS, "/Position/Longitude", 0.0)
+tick(d)
+check("... a lost fix keeps the last longitude", d.inp.lon.v == -122.39)
+d, m = driver(types_=(0, 3), active=1)
+m.add(GPS, 0, {"/Position/Longitude": None, "/Fix": 0})
+m.push(GPS, "/Position/Longitude", -122.39)
+m.push(GPS, "/Fix", 1)
+check("... a position that came before its fix is taken when the fix comes",
+      d.inp.lon is not None and d.inp.lon.v == -122.39)
+
 M0 = M[0]
 d, m = driver(types_=(0, 3), active=1)
 t0 = d._ms()

@@ -636,6 +636,19 @@ assumes the MPPTs at the target and the Quattro below it.
   `hold_deficit_pct` (0.5 % of the bank, ~400 Wh) the engine returns, with a
   backoff. Nothing is exempt from it. Suspend, faults, MIN_SOC and the SOC
   drift backstop are unchanged.
+- **The afternoon budget while charging (4.8.0).** In a one-way charge, from
+  local solar noon the budget is `charge_pm_deficit_pct` (0.15 %, ~120 Wh)
+  instead. A morning deficit is repaid by a rising sun; an afternoon one is
+  not, and the night floor then keeps it. On 09-18 and 09-19 the island ran
+  until dusk and gave back ~0.3 kWh (the last hour ~290 Wh with no sun), on
+  09-22 ~0.4 kWh. On shore by day the sun goes to the bank and shore carries
+  the AC load, so every such hour cost the bank the Quattro's whole draw
+  (~380 W) to save ~280 W of shore. 120 Wh rides a water-heater cycle
+  (50-70 Wh), not a sunset: a clear charging evening comes home about an
+  hour before dusk, and that return replaces the dusk one. Solar time is the
+  mean solar time of the GPS longitude (any `gps` service with a fix; the
+  last longitude stands through a lost fix) on the UTC clock; with no
+  longitude the 0.5 % holds all day. HOLD at the target is unchanged.
 - **Night (4.5.2).** The budget carries the sunset taper; once night is
   declared the island ends — there is nothing to harvest. No backoff, since
   dawn must not wait on it. A suspend that runs into the night ends on shore

@@ -205,7 +205,7 @@ SP = load(os.path.join(REPO, "dbus-recbms", "solar_priority.py"), "solar_priorit
 scfg = SP.Config(os.path.join(REPO, "dbus-recbms", "solar_priority.ini"))
 check("config: one-way tunables", scfg.engine["ONEWAY_ENTER_PCT"] == 2 and
       scfg.engine["ONEWAY_EXIT_PCT"] == 0.5)
-check("engine version bumped", SP.ENGINE_VERSION == "4.7.0")
+check("engine version bumped", SP.ENGINE_VERSION == "4.8.0")
 Val = SP.Val
 
 
@@ -223,7 +223,9 @@ class Sim:
         self.inp.enabled = True
         self.inp.feed_shore = 0
         self.v = dict(soc=60.0, batt=0.0, load=300.0, pv=500.0, m=2, voc=60.0,
-                      batt_v=56.6, cvl=56.62, target=None, qdc=None, dcl=None, pre=None)
+                      batt_v=56.6, cvl=56.62, target=None, qdc=None, dcl=None, pre=None,
+                      lon=None)
+        self.now0, self.utc0 = self.now, None     # utc0: the wall clock at now0 (4.8.0)
         self.cmd, self.sustain = 0, 0
         self.cmds, self.sustains, self.boosts = [], [], []
         self.boost_cmds, self.boost_until, self.prefers = [], 0, []
@@ -256,6 +258,8 @@ class Sim:
             inp.q_dc = Val(v["qdc"], n) if v["qdc"] is not None else None
             inp.dc_sys = Val(v["dcl"], n) if v["dcl"] is not None else None
             inp.pre = Val(v["pre"], n) if v["pre"] is not None else None
+            inp.lon = Val(v["lon"], n) if v["lon"] is not None else None
+            inp.utc = None if self.utc0 is None else self.utc0 + (n - self.now0) / 1000.0
             # dbus-recbms: a boost runs until released or for 120 s
             inp.boost_active = Val(1 if n < self.boost_until else 0, n)
             out = self.eng.tick(n, inp)
@@ -763,6 +767,73 @@ check("clicked while on the island: back to shore for the charger", s.state == "
 s = Sim(); day(s, soc=50.0, target=80, batt=100.0, pre=0); s.tick(700)
 check("a dawn write that never landed is not the owner: floor kept, prefer solar still wanted",
       not s.eng.st["ownerCharge"] and s.sustain == 1 and s.prefers[-1] == 1)
+
+# ---- 4.8.0: charging, after solar noon, the island comes home on a small budget ----
+print("\n=== solar priority engine: the afternoon budget while charging (4.8.0) ===")
+import calendar
+LON = -122.39                                             # mean solar noon 20:09:36 UTC
+PM = calendar.timegm((2026, 9, 22, 21, 0, 0, 0, 0, 0))    # 12:50 solar
+AM = calendar.timegm((2026, 9, 22, 17, 0, 0, 0, 0, 0))    # 08:50 solar
+utc = lambda h, mi, d=22: calendar.timegm((2026, 9, d, h, mi, 0, 0, 0, 0))
+check("solar time: afternoon from 20:09:36 UTC at 122.39 W",
+      SP.solar_afternoon(utc(20, 10), LON) is True and SP.solar_afternoon(utc(20, 9), LON) is False)
+check("... until local solar midnight (08:09 UTC next day)",
+      SP.solar_afternoon(utc(8, 0, 23), LON) is True and SP.solar_afternoon(utc(9, 0, 23), LON) is False)
+check("... east of Greenwich too (150 E: noon at 02:00 UTC)",
+      SP.solar_afternoon(utc(2, 0), 150.0) is True and SP.solar_afternoon(utc(1, 59), 150.0) is False)
+check("... unknown without a clock or a longitude",
+      SP.solar_afternoon(None, LON) is None and SP.solar_afternoon(PM, None) is None)
+
+
+def charging(utc0, lon=LON, **tun):
+    """charging 50 -> 80 %, out on the island by 700 s"""
+    c = Sim(**tun)
+    c.utc0 = utc0
+    day(c, soc=50.0, target=80, batt=600.0, lon=lon)
+    c.tick(700)
+    return c
+
+
+s = charging(PM)
+check("charging, afternoon: leaves shore on the sun as before", s.state == "solar" and s.oneway == "charge", s.state)
+s.tick(120, load=1700.0, batt=-1700.0)
+check("... a water-heater cycle (57 Wh) rides on the afternoon budget",
+      s.state == "solar" and abs(s.out.deficit_wh - 57) < 2, "%s %.0f" % (s.state, s.out.deficit_wh))
+s.tick(600, load=250.0, batt=600.0)
+s.tick(1400, batt=-300.0)
+check("... 117 Wh drawn: still out, the status shows the 122 Wh budget",
+      s.state == "solar" and "[deficit 117/122 Wh]" in s.out.status_text, s.out.status_text)
+s.tick(100, batt=-300.0)
+check("... home at 122 Wh (0.15 % of the bank), not 408",
+      s.state == "shore" and s.transitions[-1].startswith("-> SHORE (deficit: 122 Wh")
+      and "budget 122 Wh (charging, afternoon)" in s.transitions[-1], str(s.transitions[-1:]))
+s = charging(AM)
+s.tick(1500, batt=-300.0)
+check("charging, morning: the same drain rides on the 0.5 % budget -- a rising sun repays it",
+      s.state == "solar" and "/408 Wh]" in s.out.status_text, s.out.status_text)
+s = Sim()
+s.utc0 = PM
+day(s, batt=600.0, lon=LON)
+s.tick(700)
+s.tick(1500, batt=-300.0)
+check("HOLD at the target, afternoon: the band keeps its 0.5 % (the rule is for charging)",
+      s.state == "solar" and s.oneway is None and "/408 Wh]" in s.out.status_text, s.out.status_text)
+s = charging(PM, lon=None)
+s.tick(1500, batt=-300.0)
+check("charging, afternoon, no GPS longitude: 0.5 % all day", s.state == "solar" and "/408 Wh]" in s.out.status_text)
+s = charging(None)
+s.tick(1500, batt=-300.0)
+check("charging, no wall clock: 0.5 % all day", s.state == "solar")
+s = charging(PM, CHARGE_PM_DEFICIT_PCT=0.5)
+s.tick(1500, batt=-300.0)
+check("charge_pm_deficit_pct = hold_deficit_pct: one budget all day", s.state == "solar")
+s = charging(utc(19, 30))                                 # out by 11:32 solar
+s.tick(1500, batt=-300.0)
+check("a morning deficit of 125 Wh rides until solar noon ...",
+      s.state == "solar" and abs(s.out.deficit_wh - 125) < 2, "%s %.0f" % (s.state, s.out.deficit_wh))
+s.tick(300, batt=-300.0)
+check("... which brings it home: no sun repays it now",
+      s.state == "shore" and "(charging, afternoon)" in s.transitions[-1], str(s.transitions[-1:]))
 
 print("\n%d passed, %d failed" % (len(ok), len(fail)))
 for f in fail:
